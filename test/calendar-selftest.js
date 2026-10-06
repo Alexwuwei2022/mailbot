@@ -2422,6 +2422,61 @@ await test('定时分析：到点会真的执行；即使失败也要占住这�
   }
 });
 
+await test('HTTP：备份 导出 → 检查 → 导入 全链路，且跨源一律拒绝', async () => {
+  const fs = await import('node:fs');
+  const { startServer } = await import('../server/index.js');
+  const { readZip } = await import('../server/lib/zip.js');
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  const H = { 'content-type': 'application/json' };
+  try {
+    // 1) 导出：应是标准 zip，且默认不含密钥
+    const res = await fetch(`${url}/api/backup/export`, { headers: H });
+    assertEqual(res.status, 200, '导出应成功');
+    assertIncludes(res.headers.get('content-type') || '', 'application/zip', '应是 zip');
+    const zip = Buffer.from(await res.arrayBuffer());
+    assertEqual(zip.subarray(0, 2).toString(), 'PK', '内容应是 zip（PK 魔数）');
+    const names = readZip(zip).map((f) => f.name);
+    assert(names.includes('manifest.json'), '包内应有 manifest.json');
+    assert(!names.includes('.env'), '默认导出不应含 .env');
+    assert(!names.some((n) => n.startsWith('raw/')), '默认导出不应含邮件原文');
+
+    // 2) 检查：不落盘，只回清单
+    const inspect = await fetch(`${url}/api/backup/inspect`, { method: 'POST', headers: { 'content-type': 'application/zip' }, body: zip });
+    assertEqual(inspect.status, 200, '检查应成功');
+    const info = await inspect.json();
+    assertEqual(info.manifest.format, 'mailbot-backup', '应识别格式');
+    assert(Array.isArray(info.restorable) && info.restorable.length > 0, '应列出可恢复文件');
+
+    // 3) 导入（带 confirm）
+    const imp = await fetch(`${url}/api/backup/import?confirm=1`, { method: 'POST', headers: { 'content-type': 'application/zip' }, body: zip });
+    assertEqual(imp.status, 200, '导入应成功');
+    const out = await imp.json();
+    assert(out.restored.length > 0, '应报告恢复了哪些文件');
+    assert(out.safetyBackup, '导入前应自动留下退路');
+    assert(fs.existsSync(out.safetyBackup), '退路文件应真的存在');
+
+    // 4) 自动备份列表里能看到它
+    const list = await (await fetch(`${url}/api/backup/list`, { headers: H })).json();
+    assert(list.backups.length >= 1, '应能列出自动备份');
+
+    // 5) 没有 confirm 时拒绝
+    const noConfirm = await fetch(`${url}/api/backup/import`, { method: 'POST', headers: { 'content-type': 'application/zip' }, body: zip });
+    assertEqual(noConfirm.status, 428, '未确认应返回 428');
+
+    // 6) 跨源必须被拒——导出能带出全部数据（可含密钥），绝不能由第三方页面触发
+    const evilExport = await fetch(`${url}/api/backup/export`, { headers: { ...H, origin: 'https://evil.example.com' } });
+    assertEqual(evilExport.status, 403, '跨源导出应被拒绝');
+    const evilImport = await fetch(`${url}/api/backup/import?confirm=1`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/zip', origin: 'https://evil.example.com' },
+      body: zip,
+    });
+    assertEqual(evilImport.status, 403, '跨源导入应被拒绝');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await google.close();

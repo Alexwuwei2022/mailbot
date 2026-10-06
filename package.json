@@ -2,7 +2,26 @@
   "name": "mailbot",
   "version": "1.0.0",
   "private": true,
-  "description": "邮箱与日历数字人：IMAP/SMTP 分析邮件并起草回复，Google 日历对话建日程与日程分析",
+  "description": "轻效 | Ease & Effect —— 企业邮箱 + Google 日历数字人：IMAP/SMTP 分析邮件并起草回复，日历对话建日程、邮件转日程与回顾分析",
+  "license": "MIT",
+  "author": "Alexwuwei2022",
+  "homepage": "https://github.com/Alexwuwei2022/mailbot#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Alexwuwei2022/mailbot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Alexwuwei2022/mailbot/issues"
+  },
+  "keywords": [
+    "email",
+    "imap",
+    "smtp",
+    "google-calendar",
+    "llm",
+    "productivity",
+    "zero-dependency"
+  ],
   "type": "module",
   "engines": {
     "node": ">=20"

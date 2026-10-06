@@ -2,8 +2,24 @@
  * 通用工具：日志、错误、时间、JSON 提取、限流并发、重试。
  */
 
+import fs from 'node:fs';
+
 export const APP_NAME = 'mailbot';
-export const APP_VERSION = '1.0.0';
+
+/**
+ * 版本号**从 package.json 读**，不再硬编码。
+ *
+ * 硬编码会漂移：改了 package.json 却忘了改这里，界面显示的版本就是假的——
+ * 而"报问题时对方能说清自己跑的是哪个版本"正是版本号存在的唯一意义。
+ */
+export const APP_VERSION = (() => {
+  try {
+    const url = new URL('../../package.json', import.meta.url);
+    return JSON.parse(fs.readFileSync(url, 'utf8')).version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
 
 /* ------------------------------------------------------------------ 日志 */
 

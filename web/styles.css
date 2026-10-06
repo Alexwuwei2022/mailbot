@@ -914,6 +914,53 @@ body {
   gap: 6px;
 }
 
+/* ------------------------------------------------------------ 关于（版本信息） */
+
+.about-grid {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.about-row {
+  display: grid;
+  grid-template-columns: 84px minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 10px;
+  align-items: center;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.about-row:first-child {
+  border-top: 0;
+}
+
+.about-label {
+  font-weight: 560;
+}
+
+.about-value {
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+
+.about-hint {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 720px) {
+  .about-row {
+    grid-template-columns: 76px minmax(0, 1fr);
+  }
+  .about-hint {
+    display: none;
+  }
+}
+
 /* ------------------------------------------------------------ 存储占用表 */
 
 .storage-table {

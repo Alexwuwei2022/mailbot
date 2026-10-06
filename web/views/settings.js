@@ -1,7 +1,7 @@
 /** 设置页：邮箱实例（服务器/端口/账号/授权码独立配置）、行为策略、大模型、自检。 */
 
 import { api, getToken, setToken } from '../api.js';
-import { confirmDialog, fmtFull, h, mount, toast, toastError } from '../dom.js';
+import { confirmDialog, fmtBytes, fmtFull, h, mount, toast, toastError } from '../dom.js';
 import { renderInto, viewState } from '../view-state.js';
 
 const STATUS_ICON = { ok: '✅', warn: '⚠️', error: '❌', skipped: '➖', running: '⏳' };
@@ -17,12 +17,20 @@ export function renderSettings(root, app) {
     llmPresets: [],
     secretSources: null,
     calendarStatus: null,
+    /** /api/meta：版本、数据目录、Node 版本（「关于」区块用） */
+    meta: null,
     /** 定时任务状态（定时器在不在跑、上次结果） */
     schedule: null,
     runningSchedule: false,
     /** 存储占用（原文/孤儿/简报/台账/状态） */
     storage: null,
     cleaning: false,
+    /** 备份导出选项与状态 */
+    exportSecrets: false,
+    exportRaw: false,
+    exporting: false,
+    /** 导入前的自动备份列表（可回滚） */
+    safetyBackups: [],
     /** 上次保存后的配置快照，用于判断是否有未保存改动 */
     savedSnapshot: null,
     activeInstance: null,
@@ -403,6 +411,152 @@ export function renderSettings(root, app) {
             '留空则发给你自己的发件身份',
           ),
           scheduleStatusLine(),
+        ),
+      ),
+
+      /* ---------------- 备份与恢复 ---------------- */
+      h(
+        'section',
+        { class: 'block' },
+        h(
+          'div',
+          { class: 'block-head' },
+          h('h3', { text: '备份与恢复' }),
+          h('span', { class: 'muted small', text: '换电脑 / 重装 / 以防万一' }),
+        ),
+        h(
+          'div',
+          { class: 'pad' },
+          h(
+            'p',
+            { class: 'muted small block-lead' },
+            '`data/` 里是**不可再生**的东西：几百封邮件的分析结论、草稿、简报、操作台账。' +
+              '导出的压缩包**默认不含密钥**（授权码 / API Key / Google 令牌 / .env），可以放心放到网盘。',
+          ),
+          h(
+            'div',
+            { class: 'row-actions' },
+            h(
+              'button',
+              {
+                class: 'btn btn-primary',
+                disabled: state.exporting,
+                onclick: (ev) => exportBackup(ev.currentTarget),
+              },
+              state.exporting ? '导出中…' : '导出备份',
+            ),
+            h(
+              'label',
+              { class: 'form-check' },
+              h('input', {
+                type: 'checkbox',
+                checked: state.exportSecrets === true,
+                onchange: (e) => {
+                  state.exportSecrets = e.target.checked;
+                  paint();
+                },
+              }),
+              '包含密钥',
+            ),
+            h(
+              'label',
+              { class: 'form-check' },
+              h('input', {
+                type: 'checkbox',
+                checked: state.exportRaw === true,
+                onchange: (e) => {
+                  state.exportRaw = e.target.checked;
+                  paint();
+                },
+              }),
+              '包含邮件原文（体积大）',
+            ),
+          ),
+          state.exportSecrets
+            ? h(
+                'p',
+                { class: 'error small mt-2' },
+                '⚠️ 勾选「包含密钥」后：压缩包里会有你的邮箱授权码、API Key 与 Google 令牌（明文）。' +
+                  '**请勿通过聊天工具或邮件发出去**，用完请及时删除。',
+              )
+            : null,
+          state.exportRaw
+            ? h('p', { class: 'muted small mt-2' }, '包含原文会让压缩包大很多（几百 MB 也可能），导出会慢一些。')
+            : null,
+
+          h('hr', { class: 'sep' }),
+
+          h('p', { class: 'muted small' }, '**恢复**：选择之前导出的 zip。程序会先显示里面有什么、缺什么，确认后才覆盖；覆盖前还会自动把当前数据再存一份。'),
+          h(
+            'div',
+            { class: 'row-actions' },
+            h('input', {
+              type: 'file',
+              accept: '.zip,application/zip',
+              class: 'input',
+              onchange: (e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                if (file) inspectAndImport(file);
+              },
+            }),
+            h('button', { class: 'btn btn-small', onclick: loadBackups }, '刷新自动备份列表'),
+          ),
+          (state.safetyBackups || []).length
+            ? h(
+                'div',
+                { class: 'storage-table mt-2' },
+                ...state.safetyBackups.map((b) =>
+                  h(
+                    'div',
+                    { class: 'storage-row' },
+                    h('span', { class: 'storage-label', text: '自动备份' }),
+                    h('span', { class: 'storage-count', text: fmtBytes(b.size) }),
+                    h('span', { class: 'storage-size', text: b.at.slice(5, 16).replace('T', ' ') }),
+                    h('span', { class: 'muted small storage-hint', text: b.name }),
+                  ),
+                ),
+              )
+            : null,
+        ),
+      ),
+
+      /* ---------------- 关于 ---------------- */
+      h(
+        'section',
+        { class: 'block' },
+        h('div', { class: 'block-head' }, h('h3', { text: '关于' })),
+        h(
+          'div',
+          { class: 'pad' },
+          h(
+            'div',
+            { class: 'about-grid' },
+            aboutRow('版本', state.meta?.version || '—', '报问题时请附上这个版本号'),
+            aboutRow('Node', state.meta?.node || '—', '要求 ≥ 20'),
+            aboutRow('数据目录', state.meta?.dataDir || '—', '所有数据只在这台机器上；备份请用下面的「备份与恢复」'),
+            aboutRow('许可', 'MIT', '可自由使用、修改、分发'),
+          ),
+          h(
+            'div',
+            { class: 'row-actions mt-3' },
+            h(
+              'a',
+              { class: 'btn btn-small', href: 'https://github.com/Alexwuwei2022/mailbot', target: '_blank', rel: 'noreferrer' },
+              '项目主页 / 问题反馈',
+            ),
+            h(
+              'a',
+              { class: 'btn btn-small', href: 'https://github.com/Alexwuwei2022/mailbot/blob/main/docs/快速上手.md', target: '_blank', rel: 'noreferrer' },
+              '快速上手（5 分钟）',
+            ),
+          ),
+          h(
+            'p',
+            { class: 'muted small mt-2' },
+            '**如何更新**：重新下载最新代码覆盖（**不要覆盖 `data/`** 与 `.env`），重启服务即可；' +
+              '数据结构升级会在启动时自动迁移并在日志里写明。',
+          ),
         ),
       ),
 
@@ -827,7 +981,111 @@ export function renderSettings(root, app) {
 
   /* ---------------------------------------------------------- 控件 */
 
-  /** 存储占用明细表（原文 / 孤儿 / 简报 / 台账 / 状态）。 */
+  /**
+ * 导出备份。
+ *
+ * 走 fetch + Blob 而不是直接跳链接：**访问令牌在请求头里**，
+ * 普通链接带不上（配了令牌就会 401）；而且这样能显示"导出中…"。
+ */
+async function exportBackup(btn) {
+  const label = btn?.textContent || '';
+  state.exporting = true;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '导出中…';
+  }
+  try {
+    const { blob, filename } = await api.exportBackup({ secrets: state.exportSecrets === true, raw: state.exportRaw === true });
+    const url = URL.createObjectURL(blob);
+    const a = h('a', { href: url, download: filename });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    toast(`已导出 ${filename}（${fmtBytes(blob.size)}）`, 'success', 8000);
+    if (state.exportSecrets) toast('提醒：这个包里有明文密钥，用完请及时删除', 'error', 12_000);
+  } catch (err) {
+    toastError(err);
+  } finally {
+    state.exporting = false;
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
+    paint();
+  }
+}
+
+/** 先检查备份内容，让用户看清"里面有什么、缺什么"，再确认导入。 */
+async function inspectAndImport(file) {
+  if (!file) return;
+  try {
+    const info = await api.inspectBackup(file);
+    const m = info.manifest;
+    const lines = [
+      `备份时间：${fmtFull(new Date(m.createdAt))}`,
+      `程序版本：${m.appVersion}${m.schemaVersion ? `　数据结构 v${m.schemaVersion}` : ''}`,
+      `包含：分析 ${m.counts?.analyses ?? '—'} 条 · 草稿 ${m.counts?.drafts ?? '—'} 条 · 简报 ${m.counts?.reports ?? 0} 份${m.counts?.raw ? ` · 邮件原文 ${m.counts.raw} 封` : ''}`,
+      m.includeSecrets ? '含密钥：是（会一并覆盖配置）' : '含密钥：否（**保留你当前的授权码 / API Key**）',
+    ];
+    if (m.excluded?.length) lines.push(`不含：${m.excluded.join('；')}`);
+    if (info.needsSecrets?.length) lines.push(`导入后需要你补填：${info.needsSecrets.join('、')}`);
+    if (info.willMigrate) lines.push(`数据结构会从 v${m.schemaVersion} 自动迁移到当前版本`);
+    if (info.skipped?.length) lines.push(`将跳过 ${info.skipped.length} 个不认识的文件`);
+
+    const ok = await confirmDialog({
+      title: '导入这个备份？',
+      message: h(
+        'div',
+        {},
+        h('p', { text: `文件：${file.name}（${fmtBytes(file.size)}）` }),
+        ...lines.map((t) => h('p', { class: 'muted small', text: t })),
+        h('p', { class: 'error small', text: '当前数据会被**覆盖**（程序会先自动把当前数据再备份一份，可回滚）。' }),
+      ),
+      confirmText: '确认导入',
+      danger: true,
+    });
+    if (!ok) return;
+    const out = await api.importBackup(file);
+    toast(`${out.message}${out.safetyBackup ? '（旧数据已自动备份）' : ''}`, 'success', 10_000);
+    // 数据全变了：让所有视图重新取数，并重载配置
+    app.invalidateAll?.();
+    state.fetched = false;
+    state.config = null;
+    state.storage = null;
+    state.meta = null;
+    // 重新进入设置页（用一个全新的视图状态，避免残留旧配置）
+    if (app.viewStates) delete app.viewStates.settings;
+    renderSettings(root, app);
+    app.refreshCounts?.();
+  } catch (err) {
+    toastError(err);
+  }
+}
+
+/** 拉取"导入前自动备份"列表（可用于回滚）。 */
+async function loadBackups() {
+  try {
+    const out = await api.backups();
+    state.safetyBackups = out.backups || [];
+  } catch {
+    state.safetyBackups = [];
+  }
+  paint();
+}
+
+/** 「关于」里的一行：标签 / 值 / 说明。 */
+function aboutRow(label, value, hint) {
+  return h(
+    'div',
+    { class: 'about-row' },
+    h('span', { class: 'about-label', text: label }),
+    h('span', { class: 'about-value', text: String(value) }),
+    h('span', { class: 'muted small about-hint', text: hint }),
+  );
+}
+
+/** 存储占用明细表（原文 / 孤儿 / 简报 / 台账 / 状态）。 */
 function storageTable() {
   const s = state.storage;
   if (!s) {
@@ -1215,6 +1473,8 @@ function field(label, control, hint) {
     try {
       const [cfgRes, metaRes] = await Promise.all([api.getConfig(), api.meta()]);
       state.config = cfgRes.config;
+      // /api/meta 已经返回版本、数据目录、Node 版本，「关于」区块直接用它
+      state.meta = metaRes;
       // 旧版本保存的 config.json 可能没有这些后加的字段，补上默认值，
       // 否则输入框初值会是 undefined、保存时又把它当成「没改」而漏掉
       if (state.config.calendar) state.config.calendar.proxy = state.config.calendar.proxy || '';

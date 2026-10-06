@@ -17,8 +17,8 @@ import { AppError, fnv1a, log, newId, safeJson } from '../lib/util.js';
  * 有版本号就必须有**迁移函数**，否则升级后老用户的数据要么缺字段、
  * 要么被静默丢掉。`migrateState` 负责把任意历史版本补齐到当前版本。
  */
-const STATE_VERSION = 2;
-/** 供自检断言"迁移到的就是当前版本"，避免测试里再抄一遍数字 */
+export const STATE_VERSION = 2;
+/** 兼容旧测试里的名字；生产代码请直接用 STATE_VERSION。 */
 export const STATE_VERSION_FOR_TEST = STATE_VERSION;
 /** 分析记录上限的默认值（实际以 `retention.maxAnalyses` 为准，见 maxAnalysesLimit） */
 const MAX_ANALYSES_DEFAULT = 3000;

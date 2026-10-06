@@ -33,6 +33,9 @@ export const AUDIT_ACTIONS = {
   'calendar.draft.cleanup': { label: '清理已发送草稿的附件', group: '邮件' },
   /** 删除原文归档是不可逆的数据损失，值得留痕："我的原文是什么时候没的" */
   'storage.cleanup': { label: '清理归档原文', group: '数据' },
+  /** 导出/导入备份：前者涉及"数据（可能含密钥）被搬走"，后者会覆盖数据 */
+  'backup.export': { label: '导出备份', group: '数据' },
+  'backup.import': { label: '导入备份', group: '数据' },
 };
 
 function auditPath() {

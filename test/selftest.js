@@ -2801,6 +2801,150 @@ await test('存储：分析记录上限可配置（旧版本写死 3000）', asy
   }
 });
 
+/* -------------------------------------------------- 20. 备份与恢复 */
+
+await test('ZIP：自写读写能往返（含中文名、空文件、二进制），且损坏能被发现', async () => {
+  const { createZip, readZip, crc32, isSafeEntryName } = await import('../server/lib/zip.js');
+  // CRC32 对标准向量，确保不是"自己和自己一致"的假通过
+  assertEqual(crc32(Buffer.from('abc')).toString(16), '352441c2', 'CRC32 应与标准值一致');
+
+  const entries = [
+    { name: 'manifest.json', data: '{"a":1}' },
+    { name: 'reports/日报 2026-10-06.md', data: '# 简报\n'.repeat(100) },
+    { name: 'empty.txt', data: '' },
+    { name: 'bin.dat', data: Buffer.from([0, 1, 2, 250, 255]) },
+  ];
+  const zip = createZip(entries);
+  const back = readZip(zip);
+  assertEqual(back.length, entries.length, '条目数应一致');
+  // 名字可能被排序，按名字取回逐个比内容
+  for (const e of entries) {
+    const got = back.find((x) => x.name === e.name);
+    assert(got, `应能读回「${e.name}」`);
+    assertEqual(got.data.toString('binary'), Buffer.from(e.data).toString('binary'), `「${e.name}」内容应一致`);
+  }
+  // 压缩确实生效（100 行重复文本应明显变小）
+  assert(zip.length < Buffer.byteLength(entries[1].data), '重复文本应被压缩');
+
+  // 损坏检测：翻转数据区一个字节必须报错，而不是静默给出坏数据
+  const broken = Buffer.from(zip);
+  broken[45] ^= 0xff;
+  let code = null;
+  try {
+    readZip(broken);
+  } catch (err) {
+    code = err.message;
+  }
+  assert(code, '数据损坏必须被发现');
+  // 非 zip / 截断
+  for (const bad of [Buffer.from('这不是 zip'.repeat(20)), zip.subarray(0, 30)]) {
+    let msg = null;
+    try {
+      readZip(bad);
+    } catch (err) {
+      msg = err.message;
+    }
+    assert(msg, '非 zip 或截断内容应报错');
+  }
+  // zip-slip 防护（导入的是外部文件，必须假设它恶意）
+  assertEqual(isSafeEntryName('../evil'), false, '上级目录应被拒');
+  assertEqual(isSafeEntryName('/abs'), false, '绝对路径应被拒');
+  assertEqual(isSafeEntryName('C:\\x'), false, 'Windows 绝对路径应被拒');
+  assertEqual(isSafeEntryName('ok/name.txt'), true, '正常文件名应通过');
+});
+
+await test('备份：导出默认抹掉密钥、可选用包含；导入保留本机密钥并自动留退路', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { getPaths, loadConfig } = await import('../server/config/index.js');
+  const backup = await import('../server/lib/backup.js');
+  const { readZip } = await import('../server/lib/zip.js');
+  const p = getPaths();
+
+  // 当前（本机）配置里放几个"密钥"，并确保磁盘上的 config.json 里有它们
+  const config = getConfig();
+  const backupConfig = JSON.parse(JSON.stringify(config));
+  const diskFile = p.configFile;
+  const diskBefore = fs.existsSync(diskFile) ? fs.readFileSync(diskFile, 'utf8') : null;
+  try {
+    const onDisk = diskBefore ? JSON.parse(diskBefore) : { instances: [], llm: {}, web: {}, calendar: { google: {} } };
+    onDisk.instances = (onDisk.instances?.length ? onDisk.instances : config.instances).map((i) => ({
+      ...i,
+      imap: { ...(i.imap || {}), authPass: 'DISK-IMAP-SECRET' },
+      smtp: { ...(i.smtp || {}), authPass: 'DISK-SMTP-SECRET' },
+    }));
+    onDisk.llm = { ...(onDisk.llm || {}), apiKey: 'DISK-LLM-SECRET' };
+    onDisk.calendar = { ...(onDisk.calendar || {}), google: { clientSecret: 'DISK-GOOGLE-SECRET' } };
+    fs.mkdirSync(path.dirname(diskFile), { recursive: true });
+    fs.writeFileSync(diskFile, JSON.stringify(onDisk, null, 2));
+    loadConfig({ force: true });
+
+    // 1) 默认导出：密钥必须被抹掉
+    const plain = backup.buildBackup({ now: new Date() });
+    const plainFiles = readZip(plain.buffer);
+    const plainCfg = JSON.parse(plainFiles.find((f) => f.name === 'config.json').data.toString('utf8'));
+    assertEqual(plainCfg.instances[0].imap.authPass, '', '默认导出不得包含邮箱授权码');
+    assertEqual(plainCfg.llm.apiKey, '', '默认导出不得包含 API Key');
+    assertEqual(plainCfg.calendar.google.clientSecret, '', '默认导出不得包含 Google 密钥');
+    assert(!plainFiles.some((f) => f.name === '.env'), '默认导出不得包含 .env');
+    assert(!plainFiles.some((f) => f.name.startsWith('raw/')), '默认导出不得包含邮件原文');
+    assert(plain.manifest.excluded.length >= 2, 'manifest 必须如实列出"没有包含什么"');
+    assert(plainFiles.some((f) => f.name === 'README.txt'), '包内应有 README 说明');
+    assert(plainFiles.some((f) => f.name === 'manifest.json'), '包内应有 manifest');
+
+    // 2) 显式包含：这次才有
+    const withSecrets = backup.buildBackup({ includeSecrets: true, now: new Date() });
+    const wsCfg = JSON.parse(readZip(withSecrets.buffer).find((f) => f.name === 'config.json').data.toString('utf8'));
+    assertEqual(wsCfg.llm.apiKey, 'DISK-LLM-SECRET', '显式要求时应包含密钥');
+
+    // 3) 检查（不落盘）：能读懂清单
+    const info = backup.inspectBackup(plain.buffer);
+    assertEqual(info.manifest.format, 'mailbot-backup', '应识别为本程序的备份');
+    assert(info.restorable.includes('state.json'), '应认出 state.json 可恢复');
+
+    // 4) 导入：覆盖数据、**保留本机密钥**、并留下退路
+    const stateBefore = fs.readFileSync(p.stateFile, 'utf8');
+    const out = backup.importBackup(plain.buffer, { confirm: true, now: new Date() });
+    assert(out.restored.includes('state.json'), '应恢复了 state.json');
+    assert(out.safetyBackup, '导入前必须自动备份当前数据（可回滚）');
+    assert(fs.existsSync(out.safetyBackup), '退路文件应真的存在');
+    // 关键：备份里密钥是空的，导入后磁盘上必须仍是本机原来的值
+    const afterCfg = JSON.parse(fs.readFileSync(p.configFile, 'utf8'));
+    const diskAuth = afterCfg.instances?.[0]?.imap?.authPass;
+    assert(diskAuth === 'DISK-IMAP-SECRET', `导入后应保留本机密钥（实际 ${JSON.stringify(diskAuth)}）`);
+    assertEqual(afterCfg.llm?.apiKey, 'DISK-LLM-SECRET', 'API Key 也应保留本机值');
+
+    // 5) 没有 confirm 时必须拒绝
+    let code = null;
+    try {
+      backup.importBackup(plain.buffer, {});
+    } catch (err) {
+      code = err.code;
+    }
+    assertEqual(code, 'CONFIRM_REQUIRED', '导入必须显式确认');
+
+    // 6) 不是本程序的包要明确报错，而不是"恢复"出一堆垃圾
+    const alien = (await import('../server/lib/zip.js')).createZip([{ name: 'hello.txt', data: 'x' }]);
+    let alienCode = null;
+    try {
+      backup.inspectBackup(alien);
+    } catch (err) {
+      alienCode = err.code;
+    }
+    assertEqual(alienCode, 'BACKUP_BAD_FORMAT', '外来 zip 应被拒');
+
+    // 还原现场
+    fs.writeFileSync(p.stateFile, stateBefore);
+    if (diskBefore === null) fs.rmSync(p.configFile, { force: true });
+    else fs.writeFileSync(p.configFile, diskBefore);
+    loadConfig({ force: true });
+    (await import('../server/store/state.js')).resetStateCache();
+    (await import('../server/store/state.js')).loadState({ force: true });
+  } finally {
+    Object.assign(config, backupConfig);
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await imap.close();

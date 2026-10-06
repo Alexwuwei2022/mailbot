@@ -57,6 +57,45 @@ async function request(method, path, body, options = {}) {
   return payload;
 }
 
+/**
+ * 下载二进制（备份 zip）。用 Blob 而不是跳链接：访问令牌在请求头里，
+ * 普通链接带不上（配了令牌就会 401）。
+ */
+async function downloadBlob(path) {
+  const res = await fetch(path, { headers: authHeaders() });
+  if (!res.ok) {
+    let message = `请求失败（HTTP ${res.status}）`;
+    try {
+      const data = await res.json();
+      message = data?.message || message;
+    } catch {
+      /* 非 JSON 就用默认文案 */
+    }
+    throw new ApiError(message, 'DOWNLOAD_FAILED', res.status);
+  }
+  const disposition = res.headers.get('content-disposition') || '';
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+  const plain = /filename="([^"]+)"/i.exec(disposition);
+  const filename = star ? decodeURIComponent(star[1]) : plain ? plain[1] : 'backup.zip';
+  return { blob: await res.blob(), filename };
+}
+
+/** 以二进制请求体上传一个文件（备份 zip），返回 JSON。 */
+async function uploadZip(path, file) {
+  const res = await fetch(path, {
+    method: 'POST',
+    headers: authHeaders({ 'content-type': 'application/zip' }),
+    body: file,
+  });
+  const type = res.headers.get('content-type') || '';
+  const payload = type.includes('application/json') ? await res.json().catch(() => null) : await res.text();
+  if (!res.ok) {
+    const message = (payload && payload.message) || `请求失败（HTTP ${res.status}）`;
+    throw new ApiError(message, payload?.code || 'HTTP_ERROR', res.status, payload?.detail);
+  }
+  return payload;
+}
+
 export const api = {
   meta: () => request('GET', '/api/meta'),
   status: () => request('GET', '/api/status'),
@@ -81,6 +120,16 @@ export const api = {
   /** 存储占用体检 + 归档清理（清理不可逆，接口侧强制 confirm） */
   storage: () => request('GET', '/api/storage'),
   storageCleanup: (payload) => request('POST', '/api/storage/cleanup', { confirm: true, ...payload }),
+
+  /**
+   * 备份：导出（拿 Blob 自己触发下载）、检查、导入、自动备份列表。
+   *
+   * 导出/导入不能用 `request()`：前者返回 zip（不是 JSON），后者要发**二进制**请求体。
+   */
+  exportBackup: (options = {}) => downloadBlob(`/api/backup/export${query({ secrets: options.secrets ? 1 : 0, raw: options.raw ? 1 : 0 })}`),
+  inspectBackup: (file) => uploadZip('/api/backup/inspect', file),
+  importBackup: (file) => uploadZip('/api/backup/import?confirm=1', file),
+  backups: () => request('GET', '/api/backup/list'),
 
   /** 待办闭环：给「需要你处理」里的邮件打状态（本地状态，不写外部系统） */
   taskSetStatus: (key, payload) => request('POST', `/api/tasks/${encodeURIComponent(key)}`, payload),

@@ -58,6 +58,7 @@ import {
 import { deleteEvent as deleteGoogleEvent, listCalendars as listGoogleCalendars, testConnection as testGoogleConnection } from './calendar/google-api.js';
 import { groupEventTopics } from './calendar/topics.js';
 import { AUDIT_ACTIONS, auditFile, auditStats, appendAudit, listAudit } from './store/audit.js';
+import { buildBackup, importBackup, inspectBackup, listSafetyBackups } from './lib/backup.js';
 import { runCalendarReview } from './calendar/review-run.js';
 import { REVIEW_PRESETS } from './calendar/time.js';
 import {
@@ -77,6 +78,13 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = path.resolve(__dirname, '../web');
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
+/**
+ * 备份导入的体积上限。
+ *
+ * 比普通请求体大得多（备份里可能有上百 MB 的邮件原文），但**仍要设上限**：
+ * 读进内存的是整个压缩包，不设限就等于给了对方一个"把我内存吃满"的入口。
+ */
+const MAX_BACKUP_BYTES = 256 * 1024 * 1024;
 
 /* ------------------------------------------------------------ 工具 */
 
@@ -407,6 +415,8 @@ async function handleApi(req, res, url, actualPort) {
     return sendJson(res, 200, {
       ok: true,
       version: APP_VERSION,
+      /** 运行环境版本：报问题时"你用的什么 Node"是最常被问到的一句 */
+      node: process.version,
       dataDir: p.dataDir,
       defaultInstanceId: config.defaultInstanceId,
       /** 展示时区：界面所有时间都按它渲染，避免浏览器时区与邮箱时区不一致 */
@@ -556,6 +566,65 @@ async function handleApi(req, res, url, actualPort) {
       stats: auditStats(),
       actions: AUDIT_ACTIONS,
     });
+  }
+
+  /* ---- 备份与恢复 ---- */
+
+  /**
+   * 导出备份（zip）。
+   *
+   * 默认**不含密钥、不含邮件原文**：凭据散落在压缩包里是最容易出事的一类泄漏，
+   * 而原文动辄上百 MB。要连它们一起搬的人显式传参。
+   */
+  if (route === 'GET /api/backup/export') {
+    const includeSecrets = url.searchParams.get('secrets') === '1';
+    const includeRaw = url.searchParams.get('raw') === '1';
+    const out = buildBackup({ includeSecrets, includeRaw });
+    appendAudit('backup.export', {
+      target: out.filename,
+      source: includeSecrets ? '界面导出（含密钥）' : '界面导出',
+      extra: { bytes: out.buffer.length, includeSecrets, includeRaw, counts: out.manifest.counts },
+    });
+    res.writeHead(200, {
+      'content-type': 'application/zip',
+      'content-disposition': `attachment; filename="${out.filename}"; filename*=UTF-8''${encodeURIComponent(out.filename)}`,
+      'content-length': out.buffer.length,
+      'cache-control': 'no-store',
+    });
+    return res.end(out.buffer);
+  }
+
+  /** 检查备份包内容（**不落盘**）：先让用户看清里面有什么、缺什么，再决定是否导入。 */
+  if (route === 'POST /api/backup/inspect') {
+    const body = await readRawBody(req, MAX_BACKUP_BYTES);
+    return sendJson(res, 200, { ok: true, ...inspectBackup(body) });
+  }
+
+  /**
+   * 导入备份（会**覆盖当前数据**）。
+   *
+   * 三重保护：①接口要求 `confirm=true`；②导入前自动把当前数据备份到 `data/backups/`；
+   * ③只按白名单落盘。并且密钥取"备份里有就用备份的、没有就保留磁盘上现有的"。
+   */
+  if (route === 'POST /api/backup/import') {
+    const body = await readRawBody(req, MAX_BACKUP_BYTES);
+    const out = importBackup(body, { confirm: url.searchParams.get('confirm') === '1' });
+    appendAudit('backup.import', {
+      target: out.manifest?.createdAt ? `来自 ${out.manifest.createdAt} 的备份` : '备份导入',
+      source: '界面导入',
+      extra: {
+        restored: out.restored,
+        skipped: out.skipped,
+        safetyBackup: out.safetyBackup ? path.basename(out.safetyBackup) : null,
+        includeSecrets: !!out.manifest?.includeSecrets,
+      },
+    });
+    return sendJson(res, 200, { ok: true, ...out, message: `已恢复 ${out.restored.length} 个文件` });
+  }
+
+  /** 导入前的自动备份列表（可回滚）。 */
+  if (route === 'GET /api/backup/list') {
+    return sendJson(res, 200, { ok: true, backups: listSafetyBackups() });
   }
 
   /** 存储占用体检（含"孤儿归档"：没有任何分析记录指向的原文）。 */
@@ -1277,8 +1346,17 @@ export function createServer({ rootDir } = {}) {
 
       if (url.pathname.startsWith('/api/')) {
         // 同源校验：仅对可能产生副作用或泄露凭据的接口收紧
+        /*
+         * 同源校验：对可能产生副作用或泄露凭据的接口收紧。
+         *
+         * `/api/backup/export` 是 GET，但它**能导出全部数据（含密钥）**，
+         * 所以必须一并纳入——第三方页面即使读不到响应，也不该能触发它下载。
+         */
         const needsSameOrigin =
-          req.method !== 'GET' || url.pathname === '/api/config' || url.pathname === '/api/calendar/status';
+          req.method !== 'GET' ||
+          url.pathname === '/api/config' ||
+          url.pathname === '/api/calendar/status' ||
+          url.pathname === '/api/backup/export';
         if (needsSameOrigin && !isSameOrigin(req, config)) {
           sendJson(res, 403, {
             ok: false,
