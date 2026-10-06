@@ -42,6 +42,12 @@ worthNoting：**不需要你回复**，但有明确时限或需要用户亲自�
 - 口径是「**不去办会误事**」。拿不准就填 false——
   宁可少提醒，也不要把「需留意」变成第二个收件箱。
 - 与 needsReply 的关系：需要回复的邮件由 needsReply 表达，这里填 false 即可。
+project：这封邮件属于哪个**项目/事项**，用于把同一件事的邮件、日程、跟催串成一条时间线。
+- 用**短标签**（2-8 个字），例如「华东区投标」「官网改版」「Q4 预算」。
+- **必须复用输入里出现过的标签**（如果有）：同一件事在不同邮件里必须写成**完全一样**的字，
+  否则时间线会碎成一地。输入里已经给出「已知项目标签」列表，能对上就照抄。
+- 确实是日常事务、不属于任何项目时填空字符串 ""——**不要硬编一个标签**，
+  碎标签越多，时间线越没用。
 
 为控制成本，summary 请写 1-2 句中文要点（不超过 120 字），actions 最多列 3 条可执行事项。
 若邮件正文为英文等非中文，summary 仍用中文写。
@@ -57,6 +63,7 @@ ${INJECTION_GUARD}
       "priority": "high",
       "needsReply": true,
       "worthNoting": false,
+      "project": "华东区投标",
       "summary": "客户要求在本周五前确认合同附件二的付款条款。",
       "actions": ["核对付款条款", "本周五前回复确认"],
       "language": "zh",
@@ -133,10 +140,19 @@ function mailLine(mail, index) {
     .join('\n');
 }
 
-export function buildClassifyPrompt(mails, windowHours) {
+export function buildClassifyPrompt(mails, windowHours, knownProjects = []) {
+  /*
+   * 把**已知项目标签**明确列出来，是防止时间线碎成一地的关键：
+   * 模型每次都可能把同一件事换个说法（华东区投标 / 华东投标 / 投标项目），
+   * 而"能对上就照抄"这条指令配合这份列表，能把标签收敛住。
+   */
+  const known = (Array.isArray(knownProjects) ? knownProjects : []).filter(Boolean).slice(0, 40);
   const header =
     `以下是最近 ${windowHours} 小时内收件箱中的 ${mails.length} 封邮件，编号 #1 起。` +
-    `请逐封分析并按要求输出 JSON。\n`;
+    `请逐封分析并按要求输出 JSON。\n` +
+    (known.length
+      ? `\n已知项目标签（属于其中同一件事的，project 必须**照抄**这里的字）：\n${known.map((p) => `- ${p}`).join('\n')}\n`
+      : '');
   const body = mails.map((mail, i) => mailLine(mail, i + 1)).join('\n\n---\n\n');
   return `${header}\n${body}`;
 }

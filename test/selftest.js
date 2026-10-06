@@ -3331,6 +3331,35 @@ await test('跟催：状态闭环与 store 语义（恢复不删记录、终态�
   store.replaceFollowUps({});
 });
 
+/* -------------------------------------------------- 23. 项目标签（时间线的数据前提） */
+
+await test('项目标签：分类提示词给出字段与"照抄已知标签"的口径，且标签归一化能挡住脏值', async () => {
+  const { CLASSIFY_SYSTEM, buildClassifyPrompt } = await import('../server/llm/prompts.js');
+  const { tidyProject } = await import('../server/ai/analyze.js');
+
+  // schema 必须真的要求这个字段，否则时间线没有数据来源
+  assert(/"project"/.test(CLASSIFY_SYSTEM), '分类 schema 里必须有 project 字段');
+  assert(/照抄/.test(CLASSIFY_SYSTEM), '必须明确要求复用已知标签（否则时间线会碎成一地）');
+  assertIncludes(CLASSIFY_SYSTEM, '不要硬编一个标签', '必须允许"不属于任何项目"');
+
+  // 已知标签要喂进提示词；没有标签时不能出现那一节
+  const mails = [{ date: '2026-10-06', from: { address: 'a@b.com' }, subject: '投标答疑', body: '请确认', to: [], cc: [] }];
+  const withKnown = buildClassifyPrompt(mails, 24, ['华东区投标', '官网改版']);
+  assertIncludes(withKnown, '已知项目标签');
+  assertIncludes(withKnown, '华东区投标');
+  assert(!buildClassifyPrompt(mails, 24, []).includes('已知项目标签'), '没有已知标签时不该出现空的那一节');
+  assert(!buildClassifyPrompt(mails, 24).includes('已知项目标签'), '不传参数也不能报错（向后兼容）');
+
+  // 归一化：脏标签必须被挡掉，否则时间线全是碎片
+  assertEqual(tidyProject('华东区投标'), '华东区投标', '正常标签保留');
+  assertEqual(tidyProject('  Q4 预算 '), 'Q4预算', '去空格');
+  assertEqual(tidyProject('【官网改版】'), '官网改版', '去掉包裹的括号');
+  assertEqual(tidyProject('这是一个特别长的项目名称超过十六个字了'), '', '过长的整句必须丢弃');
+  assertEqual(tidyProject('邮件'), '', '通用词没有区分度，等于没归类');
+  assertEqual(tidyProject('通知'), '', '同上');
+  assertEqual(tidyProject(''), '', '空值就是"不属于任何项目"');
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await imap.close();

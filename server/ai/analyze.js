@@ -95,6 +95,17 @@ function normalizeClassificationBatch(items, batch, model) {
      * 历史记录没有这个字段 → undefined → 当作 false（不改变旧数据的行为）。
      */
     const worthNoting = type === 'spam' || needsReply ? false : item.worthNoting === true;
+    /*
+     * 项目标签：用于把同一件事的邮件、日程、跟催串成时间线。
+     *
+     * 三道归一化都是必要的：
+     *   - 去空格 + 限长（模型偶尔会写一整句）；
+     *   - 垃圾/营销/验证码一律归空——它们不属于任何项目，
+     *     给它们编标签只会把时间线冲垮；
+     *   - 只留一个短标签，不做同义词合并（那需要用户确认，放在 /api/projects 里做）。
+     */
+    const projectRaw = typeof item.project === 'string' ? item.project.trim().replace(/\s+/g, '') : '';
+    const project = type === 'spam' ? '' : tidyProject(projectRaw);
     return {
       folder: mail.folder,
       uid: mail.uid,
@@ -103,6 +114,7 @@ function normalizeClassificationBatch(items, batch, model) {
       priority,
       needsReply: type === 'spam' ? false : needsReply,
       worthNoting,
+      project,
       summary: typeof item.summary === 'string' ? item.summary.trim() : '',
       actions: Array.isArray(item.actions) ? item.actions.filter((a) => typeof a === 'string' && a.trim()).slice(0, 5) : [],
       language: typeof item.language === 'string' ? item.language : null,
@@ -112,6 +124,24 @@ function normalizeClassificationBatch(items, batch, model) {
       failed: false,
     };
   });
+}
+
+/**
+ * 项目标签归一化。
+ *
+ * 长度上限与"明显不是项目"的排除都在这里做：标签一旦脏了，
+ * 时间线就会变成一堆只有一封邮件的碎片，比没有时间线更糟。
+ */
+export function tidyProject(value, max = 16) {
+  const p = String(value || '')
+    .replace(/\s+/g, '')
+    .replace(/^[\[【（(]+|[\]】）)]+$/g, '')
+    .trim();
+  if (!p) return '';
+  if (p.length > max) return '';
+  // 通用词当标签没有区分度（"邮件""通知""工作"），等于没归类
+  if (/^(邮件|通知|公告|提醒|其他|其它|工作|事务|日常|无|none|null|n\/a)$/i.test(p)) return '';
+  return p;
 }
 
 function fallbackClassification(mail, err) {
@@ -124,6 +154,7 @@ function fallbackClassification(mail, err) {
     needsReply: false,
     // 记录形状必须与正常路径一致：漏了这个字段会让下游拿到 undefined
     worthNoting: false,
+    project: '',
     summary: '',
     actions: [],
     language: null,
