@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   test:
-    name: test (${{ matrix.os }} / node ${{ matrix.node }})
+    name: test (${{ matrix.os }} / node ${{ matrix.node }}${{ matrix.tz && format(' / TZ={0}', matrix.tz) || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -37,6 +37,21 @@ jobs:
           # 顺手验一下更新的 LTS，防止将来升级 Node 时才炸
           - os: ubuntu-latest
             node: '22'
+          # ---------------------------------------------------------------
+          # 进程时区 ≠ 配置时区（Asia/Shanghai）的守卫。
+          #
+          # 这一类 bug 极其阴险：本机时区恰好等于配置时区时**永远测不出来**，
+          # 换了机器（或 CI 的 UTC）就静默算错一天。真实案例：全天事件的结束日期
+          # 因为外层 localDateString 漏传 timeZone 而回退到进程时区，
+          # Windows 本地通过、Ubuntu 失败。
+          # 这里刻意用一个**负偏移**时区，Ubuntu 默认的 UTC 覆盖不到这种情况。
+          # ---------------------------------------------------------------
+          - os: ubuntu-latest
+            node: '20'
+            tz: America/New_York
+    env:
+      # 空值时 Node 用系统时区（ubuntu 是 UTC、windows 是 runner 本地时区）
+      TZ: ${{ matrix.tz }}
 
     steps:
       - uses: actions/checkout@v4

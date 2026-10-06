@@ -45,13 +45,28 @@ function pad(n) {
   return String(n).padStart(2, '0');
 }
 
+/**
+ * 时区**必填**。
+ *
+ * 这里刻意不写成可选参数：`partsInZone(date, undefined)` 会**回退到进程本地时区**，
+ * 于是"机器时区恰好等于配置时区"时一切正常，换个时区（或 CI 跑在 UTC 上）就静默算错一天。
+ * 真实案例：`localDateString(addDays(d, 1, tz))` 把 timeZone 只传给了内层的 addDays，
+ * 外层的 localDateString 没收到 → 在 UTC 的 CI 上"全天事件结束日"算成了与开始日同一天
+ * （Windows 本地因为时区正好是 +08 而一直通过）。
+ *
+ * 兜底用**配置时区**而不是进程时区，宁可依赖配置也不要依赖"碰巧"。
+ */
+function zoneOrDefault(timeZone) {
+  return timeZone || getConfig().calendar.timeZone;
+}
+
 function localString(date, timeZone) {
-  const p = partsInZone(date, timeZone);
+  const p = partsInZone(date, zoneOrDefault(timeZone));
   return `${p.year}-${pad(p.month)}-${pad(p.day)} ${pad(p.hour)}:${pad(p.minute)}`;
 }
 
 function localDateString(date, timeZone) {
-  const p = partsInZone(date, timeZone);
+  const p = partsInZone(date, zoneOrDefault(timeZone));
   return `${p.year}-${pad(p.month)}-${pad(p.day)}`;
 }
 
@@ -85,8 +100,11 @@ export function resolveEventDraft(raw, { timeZone, defaults = {} } = {}) {
         allDayStart = localDateString(parsed.date, timeZone);
         // 全天事件的结束日期是「次日」（日历排他语义）
         const endParsed = input.allDayEnd ? parseCalendarTime(input.allDayEnd, timeZone) : null;
-        allDayEnd = endParsed ? localDateString(endParsed.date, timeZone) : localDateString(addDays(parsed.date, 1, timeZone));
-        if (allDayEnd <= allDayStart) allDayEnd = localDateString(addDays(parsed.date, 1, timeZone));
+        // ⚠️ 外层的 localDateString 也必须收到 timeZone（漏了会按进程时区算，见 zoneOrDefault 的注释）
+        allDayEnd = endParsed
+          ? localDateString(endParsed.date, timeZone)
+          : localDateString(addDays(parsed.date, 1, timeZone), timeZone);
+        if (allDayEnd <= allDayStart) allDayEnd = localDateString(addDays(parsed.date, 1, timeZone), timeZone);
       }
     }
   } else {
@@ -138,7 +156,8 @@ export function resolveEventDraft(raw, { timeZone, defaults = {} } = {}) {
 
 /** 把事件转成界面/模型都好用的展示形态（本地时间字符串）。 */
 export function presentEvent(event, timeZone) {
-  const tz = timeZone || event.timeZone;
+  // 兜底链刻意加上配置时区：绝不落到「进程本地时区」（那会让显示随机器而变）
+  const tz = timeZone || event.timeZone || getConfig().calendar.timeZone;
   if (event.allDay) {
     return {
       id: event.id || null,
