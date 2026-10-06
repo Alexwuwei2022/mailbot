@@ -977,6 +977,18 @@ body {
   }
 }
 
+/* ------------------------------------------------------------ 项目时间线 */
+
+.timeline { position: relative; padding-left: 8px; }
+.tl-row { display: grid; grid-template-columns: 116px 26px minmax(0, 1fr); gap: 8px; align-items: start; padding: 8px 0; border-bottom: 1px dashed var(--border); }
+.tl-row:last-child { border-bottom: 0; }
+.tl-time { padding-top: 2px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.tl-dot { text-align: center; font-size: 14px; line-height: 1.4; }
+.tl-title { font-weight: 560; font-size: 13.5px; word-break: break-word; }
+.tl-meta { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 3px; }
+.tl-detail { margin-top: 3px; white-space: pre-wrap; }
+@media (max-width: 720px) { .tl-row { grid-template-columns: 84px 20px minmax(0, 1fr); } }
+
 /* ------------------------------------------------------------ 登录页 */
 
 .login-wrap {

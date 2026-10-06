@@ -167,6 +167,11 @@ export const api = {
   /** 数据去向（按当前配置推导）与仅本地模式开关（走 saveConfig 的 llm.localOnly） */
   egress: () => request('GET', '/api/egress'),
 
+  /** 项目与时间线 */
+  projects: () => request('GET', '/api/projects'),
+  timeline: (project) => request('GET', `/api/timeline${query({ project: project || '' })}`),
+  renameProject: (from, to) => request('POST', '/api/projects/rename', { from, to, confirm: true }),
+
   /** 跟催：列表 / 扫描（会调模型，接口侧要求 confirm）/ 改状态 */
   followups: (params) => request('GET', `/api/followups${query(params || {})}`),
   followUpsScan: () => request('POST', '/api/followups/scan', { confirm: true }),

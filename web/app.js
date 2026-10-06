@@ -11,6 +11,7 @@ import { renderCalendar } from './views/calendar.js';
 import { renderKnowledge } from './views/knowledge.js';
 import { renderFollowUps } from './views/followups.js';
 import { renderLogin } from './views/login.js';
+import { renderTimeline } from './views/timeline.js';
 import { renderRecords } from './views/records.js';
 import { renderSetup } from './views/setup.js';
 import { renderSettings } from './views/settings.js';
@@ -22,6 +23,7 @@ const VIEWS = [
   { id: 'calendar', label: '日历' },
   { id: 'knowledge', label: '知识库' },
   { id: 'followups', label: '跟催' },
+  { id: 'timeline', label: '时间线' },
   { id: 'records', label: '运行与记录' },
   { id: 'setup', label: '开始使用' },
   { id: 'settings', label: '设置' },
@@ -93,6 +95,7 @@ const app = {
       calendar: renderCalendar,
       knowledge: renderKnowledge,
       followups: renderFollowUps,
+      timeline: renderTimeline,
       records: renderRecords,
       setup: renderSetup,
       settings: renderSettings,
