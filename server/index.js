@@ -1907,7 +1907,7 @@ export async function startServer({ rootDir, port, host } = {}) {
    */
   let tls = null;
   try {
-    tls = resolveTls({ config, dataDir: getPaths().dataDir, rootDir: getPaths().rootDir });
+    tls = await resolveTls({ config, dataDir: getPaths().dataDir, rootDir: getPaths().rootDir });
   } catch (err) {
     throw new AppError(`HTTPS 启动失败：${err.message}`, { code: 'TLS_SETUP_FAILED' });
   }

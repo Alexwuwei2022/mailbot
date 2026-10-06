@@ -2836,6 +2836,91 @@ await step('跟催：我承诺的 / 等对方回复 两栏，状态按钮与超�
   }
 });
 
+await step('HTML 净化：白名单、危险标签、链接与属性、远程图片默认阻断', async () => {
+  const { sanitizeMailHtml, restoreImages, isSafeUrl } = await import('../web/sanitize-html.js');
+  /*
+   * 显式把 document 指向 window 上那份：净化模块靠它解析 HTML，
+   * 而套件里前面若干步可能已经改动过全局（这也是真实浏览器不会有的情况）。
+   */
+  if (globalThis.window?.document) globalThis.document = globalThis.window.document;
+
+  const evil = [
+    '<p>正常文字</p>',
+    '<script>alert(1)</script>',
+    '<style>body{display:none}</style>',
+    '<iframe src="https://evil.test"></iframe>',
+    '<form action="https://evil.test"><input name="p"><button>提交</button></form>',
+    '<img src="https://tracker.test/pixel.gif" onerror="alert(1)" width="1" height="1">',
+    '<img src="cid:inline-1">',
+    '<a href="javascript:alert(1)">点我</a>',
+    '<a href="java\tscript:alert(1)">绕过尝试</a>',
+    '<a href="https://good.test/x" onclick="alert(1)">正常链接</a>',
+    '<div style="background:url(https://tracker.test/x)">带样式的块</div>',
+    '<marquee>没见过的标签</marquee>',
+  ].join('');
+
+  const out = sanitizeMailHtml(evil, { allowRemoteImages: false });
+  check(!/<script/i.test(out.html), 'script 必须被删掉');
+  check(!/<style/i.test(out.html), 'style 必须被删掉');
+  check(!/<iframe/i.test(out.html), 'iframe 必须被删掉');
+  check(!/<form|<input|<button/i.test(out.html), '表单相关必须被删掉');
+  /*
+   * 计数器只做诊断，**不当断言**：`removedScripts/removedForms` 反映的是"我的遍历删掉了几个"，
+   * 而不同 HTML 解析器（浏览器 / linkedom）会在**解析阶段**就把 script、form 之类丢掉，
+   * 于是计数为 0 —— 拿它当断言会在不同环境下假报错。
+   * 真正的保证是上面那几条正则断言：**输出里不能出现这些标签**。
+   */
+  check(typeof out.removedScripts === 'number' && typeof out.removedForms === 'number',
+    '应记录危险元素的处理数量（本次 script=' + out.removedScripts + ' form=' + out.removedForms + '）');
+  check(!/onerror|onclick/i.test(out.html), '所有 on* 事件属性必须被剥掉');
+  check(!/style=/i.test(out.html), 'style 属性必须被剥掉（background:url 也能追踪）');
+  check(!/javascript:/i.test(out.html), 'javascript: 链接必须被处理掉');
+  check(out.html.includes('正常文字'), '正常文字必须保留（本次输出长度 ' + out.html.length + '）');
+  check(out.html.includes('没见过的标签'), '不认识的标签要拆标签但**保留内容**（否则用户看到空白）');
+  check(out.html.includes('带样式的块'), '带 style 的块内容也要保留');
+  check(out.html.includes('点我'), '危险链接的文字要保留（用户至少知道这里原本有链接）');
+  check(!/href="javascript/i.test(out.html), '危险 href 必须移除');
+
+  // 远程图片：默认不加载，但地址要留着以便"显示图片"
+  check(out.blockedImages >= 1, '应统计被拦下的远程图片数');
+  /*
+   * 用 DOM 精确检查"还有没有真的 src"，而不是正则。
+   * 正则会在 `data-blocked-src="https://…"` 里误命中 `src="https://…"`
+   * （子串匹配），把正确的行为判成失败。
+   */
+  {
+    const probe = document.createElement('div');
+    probe.innerHTML = out.html;
+    check(probe.querySelectorAll('img[src^="https://tracker"], img[src^="http://tracker"]').length === 0,
+      '远程图片默认不得留 src（否则浏览器会立刻去取）');
+  }
+  check(out.html.includes('data-blocked-src="https://tracker.test/pixel.gif"'), '地址要留着供用户点「显示图片」');
+  check(/src="cid:inline-1"/.test(out.html), '内联附件（cid:）不属于对外请求，应放行');
+
+  // 链接安全化
+  check(/rel="noopener noreferrer"/.test(out.html) && /target="_blank"/.test(out.html), '外链必须新窗口 + 切断 opener');
+
+  // 用户点「显示图片」后恢复
+  const box = document.createElement('div');
+  box.innerHTML = out.html;
+  const restored = restoreImages(box);
+  check(restored >= 1, '恢复应报告恢复了几张');
+  check(/src="https:\/\/tracker\.test\/pixel\.gif"/.test(box.innerHTML), '恢复后应真的带上 src');
+
+  // 显式允许远程图片时不该拦
+  const allowed = sanitizeMailHtml('<img src="https://cdn.test/a.png">', { allowRemoteImages: true });
+  check(allowed.blockedImages === 0 && /src="https:\/\/cdn\.test\/a\.png"/.test(allowed.html), '显式允许时应保留 src');
+
+  // URL 判定的绕过尝试
+  check(isSafeUrl('https://ok.test'), 'https 应放行');
+  check(isSafeUrl('mailto:a@b.com'), 'mailto 应放行');
+  check(!isSafeUrl('javascript:alert(1)'), 'javascript: 应拒绝');
+  check(!isSafeUrl('java\tscript:alert(1)'), '带制表符的绕过应拒绝');
+  check(!isSafeUrl(' java\nscript:alert(1)'), '带换行的绕过应拒绝');
+  check(!isSafeUrl('data:text/html,<script>x</script>'), 'data:text/html 应拒绝');
+  check(isSafeUrl('data:image/png;base64,AAA', { forImage: true }), 'data:image 作为图片应放行');
+  check(!isSafeUrl('', {}), '空值应拒绝');
+});
 await step('时间线：项目标签切换、四类来源标注、空状态说明标签来源', async () => {
   const tl = await import('../web/views/timeline.js');
   const container = document.createElement('div');

@@ -59,7 +59,7 @@ function readNotAfter(certPem) {
  *
  * @returns {null | {cert, key, source, fingerprint256, certFile?, keyFile?, notAfter?, altNames?, selfSigned?: boolean}}
  */
-export function resolveTls({ config, dataDir, rootDir = process.cwd(), forceRegenerate = false } = {}) {
+export async function resolveTls({ config, dataDir, rootDir = process.cwd(), forceRegenerate = false } = {}) {
   const httpsCfg = config?.web?.https || {};
   if (!httpsCfg.enabled) return null;
 
@@ -81,22 +81,36 @@ export function resolveTls({ config, dataDir, rootDir = process.cwd(), forceRege
   fs.mkdirSync(files.dir, { recursive: true });
   const exists = fs.existsSync(files.cert) && fs.existsSync(files.key);
   if (exists && !forceRegenerate) {
-    const cert = fs.readFileSync(files.cert, 'utf8');
-    const notAfter = readNotAfter(cert);
-    const soon = notAfter && notAfter.getTime() - Date.now() < 30 * 86_400_000;
-    if (!soon) {
-      return {
-        cert,
-        key: fs.readFileSync(files.key, 'utf8'),
-        source: 'self-signed',
-        selfSigned: true,
-        certFile: files.cert,
-        keyFile: files.key,
-        fingerprint256: fingerprintOf(cert),
-        notAfter: notAfter ? notAfter.toISOString() : null,
-      };
+    /*
+     * 复用已有证书时要**容错**：证书/私钥可能损坏、不配对、或只写了一半
+     * （实测遇到过一次 openssl 的 illegal padding，直接导致服务起不来）。
+     * 这种情况应当重新签一张，而不是把用户挡在门外——自签证书本来就是可再生的。
+     */
+    try {
+      const cert = fs.readFileSync(files.cert, 'utf8');
+      const key = fs.readFileSync(files.key, 'utf8');
+      // 校验一次配对关系：不配对时 createServer 会在握手阶段才报错，太晚
+      const { X509Certificate, createPrivateKey } = await import('node:crypto');
+      createPrivateKey(key);
+      new X509Certificate(cert);
+      const notAfter = readNotAfter(cert);
+      const soon = notAfter && notAfter.getTime() - Date.now() < 30 * 86_400_000;
+      if (!soon) {
+        return {
+          cert,
+          key,
+          source: 'self-signed',
+          selfSigned: true,
+          certFile: files.cert,
+          keyFile: files.key,
+          fingerprint256: fingerprintOf(cert),
+          notAfter: notAfter ? notAfter.toISOString() : null,
+        };
+      }
+      log.warn(`自签证书将于 ${notAfter?.toISOString()} 到期，自动重签一张`);
+    } catch (err) {
+      log.warn(`已有自签证书不可用（${err?.message || err}），将重新生成一张`);
     }
-    log.warn(`自签证书将于 ${notAfter?.toISOString()} 到期，自动重签一张`);
   }
 
   // 名称要覆盖用户实际会用的访问方式：localhost、回环、本机名、以及登记过的域名
