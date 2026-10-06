@@ -4,6 +4,7 @@ import { api, subscribeProgress } from './api.js';
 import { attachmentButton, copyButton, fmtAddress, fmtBytes, fmtFull, h, mount, openModal, setDisplayTimeZone, toast, toastError } from './dom.js';
 import { THEMES, applyTheme, effectiveTheme, initTheme } from './theme.js';
 import { invalidate, invalidateAll } from './view-state.js';
+import { renderMailHtml, restoreImages } from './sanitize-html.js';
 import { renderOverview } from './views/overview.js';
 import { renderDrafts } from './views/drafts.js';
 import { renderSearch } from './views/search.js';
@@ -420,6 +421,69 @@ const app = {
  * @param {object} app
  * @param {string} [initialTab] 'analysis' | 'original'
  */
+/**
+ * 正文块：纯文本，或（有 HTML 时）带切换与「显示图片」的容器。
+ *
+ * 净化只在**渲染的那一刻**做一次；切回纯文本不重新解析。
+ */
+function makeBodyBlock(bodyInfo, plainBlock) {
+  const html = typeof bodyInfo?.html === 'string' ? bodyInfo.html : '';
+  if (!html.trim()) return plainBlock;
+
+  const content = h('div', {}, plainBlock);
+  let mode = 'text';
+  let lastBlocked = 0;
+  let showImagesBtn = null;
+
+  const htmlBtn = h('button', { class: 'btn btn-small', onclick: () => switchTo('html') }, '渲染 HTML');
+  const textBtn = h('button', { class: 'btn btn-small', onclick: () => switchTo('text') }, '纯文本');
+
+  function paintButtons() {
+    htmlBtn.classList.toggle('active', mode === 'html');
+    textBtn.classList.toggle('active', mode === 'text');
+    if (showImagesBtn) showImagesBtn.remove();
+    showImagesBtn = null;
+    if (mode === 'html' && lastBlocked > 0) {
+      showImagesBtn = h(
+        'button',
+        {
+          class: 'btn btn-small',
+          onclick: () => {
+            const n = restoreImages(content);
+            lastBlocked = 0;
+            paintButtons();
+            if (n) app.toast?.('已显示 ' + n + ' 张远程图片（对方可能因此知道你打开了这封邮件）', 'warn');
+          },
+        },
+        '显示图片（已拦 ' + lastBlocked + ' 张）',
+      );
+      toolbar.append(showImagesBtn);
+    }
+  }
+
+  function switchTo(next) {
+    mode = next;
+    if (next === 'html') {
+      const result = renderMailHtml(content, html, { allowRemoteImages: false });
+      lastBlocked = result.blockedImages;
+    } else {
+      content.replaceChildren(plainBlock);
+      lastBlocked = 0;
+    }
+    paintButtons();
+  }
+
+  const toolbar = h(
+    'div',
+    { class: 'mail-body-toolbar' },
+    h('span', { class: 'muted small', text: '正文格式：' }),
+    textBtn,
+    htmlBtn,
+  );
+  paintButtons();
+  return h('div', { class: 'mail-body-wrap' }, toolbar, content);
+}
+
 function showMailModal(detail, fallback, app, initialTab = 'analysis') {
   const analysis = detail.analysis || null;
   const bodyInfo = detail.body || null;
@@ -578,7 +642,17 @@ function showMailModal(detail, fallback, app, initialTab = 'analysis') {
       );
     }
 
-    const textBlock = h('pre', { class: 'mail-body-text', text: bodyInfo.text || '（正文为空）' });
+    /*
+     * 正文：有 HTML 版本时给一个「渲染 HTML / 纯文本」切换。
+     *
+     * 为什么默认**不**直接渲染 HTML：
+     *   ① HTML 是外部输入，渲染前必须过白名单净化（见 web/sanitize-html.js）；
+     *   ② 纯文本更"可信"——不受样式干扰，能看到原始换行；
+     *   ③ 罪魁祸首是远程图片：一渲染就可能替对方确认"我打开过"。
+     *      所以渲染后若拦下了图片，明确告诉用户拦了几张，由他决定要不要加载。
+     */
+    const plainBlock = h('pre', { class: 'mail-body-text', text: bodyInfo.text || '（正文为空）' });
+    const textBlock = makeBodyBlock(bodyInfo, plainBlock);
     const quotedBlock = bodyInfo.quoted
       ? h(
           'details',

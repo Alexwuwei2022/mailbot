@@ -977,6 +977,18 @@ body {
   }
 }
 
+/* ------------------------------------------------------------ 邮件正文（HTML 渲染） */
+
+.mail-body-wrap { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.mail-body-toolbar { display: flex; align-items: center; gap: 8px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: color-mix(in srgb, currentColor 4%, transparent); }
+.mail-body-wrap .mail-body-text { margin: 0; padding: 12px; max-height: 60vh; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+/* 渲染后的 HTML 正文：约束宽度与图片，避免超宽内容把弹窗撑破 */
+.mail-body-wrap > div:last-child { padding: 12px; max-height: 60vh; overflow: auto; line-height: 1.7; word-break: break-word; }
+.mail-body-wrap > div:last-child img { max-width: 100%; height: auto; }
+.mail-body-wrap > div:last-child table { max-width: 100%; border-collapse: collapse; }
+.mail-body-wrap > div:last-child td, .mail-body-wrap > div:last-child th { border: 1px solid var(--border); padding: 4px 8px; }
+.mail-body-wrap .btn.active { border-color: var(--accent); color: var(--accent); }
+
 /* ------------------------------------------------------------ 项目时间线 */
 
 .timeline { position: relative; padding-left: 8px; }
