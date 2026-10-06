@@ -2887,6 +2887,47 @@ await step('设置页字段统一：长说明收进「?」提示，短说明仍�
     // ⑤ 每个字段都应带标签行（统一结构），不能有的走 .form-field、有的走 .field
     const legacy = box.querySelectorAll('.form-field').length;
     checkEqual(legacy, 0, '设置页不该再有旧结构的字段（实际 ' + legacy + ' 个）');
+
+    /*
+     * ⑥ 文案里的 Markdown 粗体必须渲染成真粗体。
+     * 之前渲染层不解析 **重点**，星号被原样显示出来（用户看到的是"代码残留"）。
+     */
+    /*
+     * 失败时把残留位置报出来：光说"有星号"没法修，
+     * 要能看出是哪条路径漏了（text: / 子节点 / 直接赋值）。
+     */
+    {
+      const offenders = [];
+      const walk = (node) => {
+        for (const child of node.childNodes) {
+          if (child.nodeType === 3) {
+            /*
+           * 只找**成对的粗体标记** **文字**。
+           * 不能一见到 ** 就报错：密钥掩码就是「显示为 ***，不改动则保留」，
+           * 那是正常内容，把它当残留会误报。
+           */
+          if (/\*\*[^*]+\*\*/.test(child.textContent)) {
+              offenders.push((child.parentElement?.tagName || '?') + '.' + (child.parentElement?.className || '') + ' :: ' + child.textContent.trim().slice(0, 60));
+            }
+          } else walk(child);
+        }
+      };
+      walk(box);
+      checkEqual(offenders.length, 0, '页面上不该残留可见的 ** 星号；残留：' + offenders.slice(0, 3).join(' ｜ '));
+    }
+    check(box.querySelectorAll('strong').length >= 3, '应有文案被渲染成真正的粗体（实际 ' + box.querySelectorAll('strong').length + ' 处）');
+
+    // ⑦ 分区目录：按实际渲染出的区块生成，且每一项都能找到对应区块
+    const toc = box.querySelector('.settings-toc');
+    check(!!toc, '设置页应有分区目录');
+    const chips = [...toc.querySelectorAll('.toc-chip')];
+    check(chips.length >= 4, '目录条目数应与区块数相符（实际 ' + chips.length + '）');
+    const titles = [...box.querySelectorAll('section.block > .block-head h3')].map((x) => x.textContent.trim());
+    checkEqual(chips.map((c) => c.textContent.trim()).join('|'), titles.join('|'), '目录条目应与区块标题一一对应');
+    const allLinked = chips.every((_, i) => box.querySelector('#settings-sec-' + i));
+    check(allLinked, '每个目录项都应有对应的区块锚点');
+    // 点击不该抛错（linkedom 没有 scrollIntoView，代码里做了防御）
+    chips[0].dispatchEvent(new window.Event('click', { bubbles: true }));
   } finally {
     box.remove();
   }

@@ -2,6 +2,49 @@
 
 import { authHeaders } from './api.js';
 
+/**
+ * 富文本：把文案里的 `**重点**` 渲染成真正的粗体。
+ *
+ * 背景：界面上大量说明文案是用 Markdown 习惯写的（`**重启服务**才生效`），
+ * 但渲染层不解析它 → 星号被**原样显示**出来，看上去像代码残留。
+ * 与其去改几百个调用点，不如在唯一的渲染原语 `h()` 里支持它一次。
+ *
+ * 三个刻意的不转换：
+ *   ① `pre` / `code` / `textarea`：那些地方的文字必须**逐字原样**（邮件正文、引用、代码）；
+ *   ② 没有成对星号的字符串：原样输出（避免把 `a*b` 这类内容吃掉）；
+ *   ③ `title` 等属性：属性里的星号是数据，不参与排版。
+ */
+const RICH_TEXT_SKIP = new Set(['pre', 'code', 'textarea', 'script', 'style']);
+
+/**
+ * 把一段文案切成节点数组：`**重点**` 变粗体，其余原样。
+ *
+ * `text:` 属性和**作为子节点传入的字符串**都走这里——
+ * 只处理前者会漏掉一半调用点（`h('span', {}, '文案 **粗**')` 就是后者）。
+ */
+function richNodes(text) {
+  const str = String(text ?? '');
+  if (!str.includes('**')) return [document.createTextNode(str)];
+  const parts = str.split(/\*\*([^*]+)\*\*/g);
+  if (parts.length === 1) return [document.createTextNode(str)];
+  const nodes = [];
+  // split 带捕获组：偶数下标是普通文字，奇数下标是要加粗的内容
+  parts.forEach((part, index) => {
+    if (!part) return;
+    nodes.push(index % 2 === 1 ? h('strong', { text: part }) : document.createTextNode(part));
+  });
+  return nodes;
+}
+
+function setRichText(el, tag, value) {
+  const text = String(value ?? '');
+  if (RICH_TEXT_SKIP.has(String(tag).toLowerCase())) {
+    el.textContent = text;
+    return;
+  }
+  el.append(...richNodes(text));
+}
+
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
   for (const [key, value] of Object.entries(attrs || {})) {
@@ -15,7 +58,7 @@ export function h(tag, attrs = {}, ...children) {
       // 设置页「未保存」提示就是靠包装 oninput 实现的。
       el[key.toLowerCase()] = value;
     } else if (key === 'html') el.innerHTML = value;
-    else if (key === 'text') el.textContent = value;
+    else if (key === 'text') setRichText(el, tag, value);
     else {
       el.setAttribute(key, value === true ? '' : String(value));
       // 表单控件的 value/checked 是「属性 → 属性(property)」单向同步的：
@@ -30,9 +73,13 @@ export function h(tag, attrs = {}, ...children) {
 }
 
 export function append(parent, children) {
+  // pre/code/textarea 里的文字必须逐字原样（邮件正文、引用、代码）
+  const literal = RICH_TEXT_SKIP.has(String(parent?.tagName || '').toLowerCase());
   for (const child of children.flat(4)) {
     if (child === null || child === undefined || child === false || child === true) continue;
-    parent.append(child instanceof Node ? child : document.createTextNode(String(child)));
+    if (child instanceof Node) parent.append(child);
+    else if (literal) parent.append(document.createTextNode(String(child)));
+    else parent.append(...richNodes(child));
   }
   return parent;
 }

@@ -59,7 +59,10 @@ export function renderSettings(root, app) {
   const container = h('div', { class: 'view view-settings' });
   mount(root, container);
 
-  const paint = () => renderInto(container, app, 'settings', paintInner, () => renderSettings(root, app));
+  const paint = () => {
+    renderInto(container, app, 'settings', paintInner, () => renderSettings(root, app));
+    buildToc(container);
+  };
 
   const paintInner = () => {
     if (state.loading) {
@@ -1635,6 +1638,56 @@ function field(label, control, hint) {
     control,
     fieldHint(hint),
   );
+}
+
+/**
+ * 分区目录：按**实际渲染出来的区块**生成，而不是硬编码一份清单。
+ *
+ * 这样做的理由很实在：设置页有十来个区块，硬编码的目录一旦和页面不同步
+ * （改标题、加区块、按条件隐藏），用户点了却滚到别处——比没有目录更糟。
+ * 扫描 DOM 生成的目录永远和页面一致。
+ *
+ * 区块少于 4 个时不出目录：那种规模下目录本身才是噪音。
+ */
+function buildToc(container) {
+  container.querySelector('.settings-toc')?.remove();
+
+  const blocks = [...container.querySelectorAll('section.block')];
+  const items = [];
+  blocks.forEach((block, index) => {
+    const title = block.querySelector('.block-head h3')?.textContent?.trim();
+    if (!title) return;
+    const id = `settings-sec-${index}`;
+    block.id = id;
+    items.push({ id, title });
+  });
+  if (items.length < 4) return;
+
+  const chips = items.map((it) =>
+    h(
+      'button',
+      {
+        class: 'toc-chip',
+        type: 'button',
+        onclick: () => {
+          // scrollIntoView 在测试环境（linkedom）里不存在，缺了也不该让点击炸掉
+          container.querySelector(`#${it.id}`)?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+        },
+      },
+      it.title,
+    ),
+  );
+
+  const nav = h(
+    'nav',
+    { class: 'settings-toc', 'aria-label': '设置分区' },
+    h('span', { class: 'toc-label', text: '分区' }),
+    h('div', { class: 'toc-chips' }, ...chips),
+  );
+
+  const head = container.querySelector('.page-head');
+  if (head && head.nextSibling) container.insertBefore(nav, head.nextSibling);
+  else container.append(nav);
 }
 
 /**
