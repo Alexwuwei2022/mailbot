@@ -1099,6 +1099,10 @@ body {
   user-select: all;
 }
 
+/* 设置页：限制正文宽度。14 寸全屏（约 1440 逻辑宽）下不拉通到 1400px，
+   否则一行太长反而难读；窄屏则自然占满。 */
+.view-settings { max-width: 1120px; margin-inline: auto; }
+
 /* ------------------------------------------------------------ 密钥存储 */
 
 .kv-row {
@@ -1252,14 +1256,40 @@ body {
   overflow: hidden;
 }
 
+/*
+ * 这一行既是「存储占用」那样的四列表格，也是「数据去向 / 访问与安全 / 密钥存储」
+ * 那种"标签 + 标题 + 长描述"的信息行。
+ *
+ * 原先是**固定四列网格**（88/76/78/1fr）：只放 3 个子元素时，长描述正好落进那个
+ * 78px 的窄列 → 每行十来个字一折、行高暴涨、整块卡片占掉大半屏。
+ *
+ * 改成可换行的弹性行：短元素自占宽度，描述**占满剩余宽度**、不够时换到第二行。
+ * 这样两类内容都对：四列表格仍是四列，信息行的描述能通栏排。
+ */
 .storage-row {
-  display: grid;
-  grid-template-columns: 88px 76px 78px minmax(0, 1fr);
-  gap: 10px;
-  align-items: center;
-  padding: 8px 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding: 9px 14px;
   border-top: 1px solid var(--border);
   font-size: 12.5px;
+}
+
+.storage-row > .tag,
+.storage-row > .storage-label,
+.storage-row > .storage-count,
+.storage-row > .storage-size {
+  flex: 0 0 auto;
+}
+
+/* 描述：吃掉剩余宽度；低于 320px 时整行换到下一行（信息行就变成两行式） */
+.storage-row > .storage-hint {
+  flex: 1 1 320px;
+  min-width: 0;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.7;
 }
 
 .storage-row:first-child {
