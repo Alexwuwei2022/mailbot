@@ -13,11 +13,33 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AppError, clampNumber, log } from '../lib/util.js';
 import { DEFAULTS } from './defaults.js';
+import {
+  applyToConfig,
+  autoDecision,
+  clearVault,
+  collectFromConfig,
+  decodeVault,
+  encodeVault,
+  listBackends,
+  readVault,
+  resetVaultCache,
+  resolveMode,
+  SECRET_SLOTS,
+  stripFromConfig,
+  writeVault,
+} from '../lib/secrets.js';
 
 const SECRET_FIELDS = new Set(['authPass', 'apiKey', 'authToken', 'clientSecret']);
 
 let cached = null;
 let cachedRoot = null;
+/**
+ * 由 `.env` **文件**载入的环境变量名。
+ *
+ * 为什么要区分：真实的环境变量是用户在别处显式设的（比如容器编排），
+ * 我们无权去动；而 `.env` 文件是程序自己的配置文件，迁移密钥时才允许清空它。
+ */
+const envFromFile = new Set();
 let overlay = {};
 
 /* ------------------------------------------------------------ 路径解析 */
@@ -87,8 +109,7 @@ export function loadDotEnv(rootDir) {
     log.warn(`读取 .env 失败：${err.message}`);
     return;
   }
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim();
+  for (const line of text.split(/\r?\n/)) {    const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
     const eq = trimmed.indexOf('=');
     if (eq < 0) continue;
@@ -101,7 +122,11 @@ export function loadDotEnv(rootDir) {
       value = value.slice(1, -1);
     }
     // 真实环境变量优先级更高，不覆盖
-    if (process.env[key] === undefined) process.env[key] = value;
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+      // 记下来源：只有"确实由 .env 文件提供"的键，迁移时才允许清空
+      envFromFile.add(key);
+    }
   }
 }
 
@@ -383,11 +408,50 @@ export function loadConfig({ rootDir, force = false } = {}) {
 
   const merged = normalize(deepMerge(fileConfig, overlay));
   applyEnv(merged);
+  /*
+   * 密钥保管：把钥匙串里的密钥补进来。
+   *
+   * 顺序与优先级刻意如此：`.env` 先应用，钥匙串**只填空着的字段**，于是优先级为
+   *   .env（显式设置，真值判断）> config.json / 钥匙串
+   * 也就是说：
+   *   - 迁移之后 config.json 里是空的 → 钥匙串的值填进来 ✓
+   *   - 你手动往 config.json 里贴了密钥 → 以你手写的为准（不做"偷偷搬走"这种事）
+   *   - 读钥匙串失败 → 只记警告并继续（**绝不能因为钥匙串读不出来就让程序起不来**）
+   */
+  vaultState = applyVault(merged);
   const finalConfig = normalize(merged);
 
   cached = finalConfig;
   cachedRoot = root;
   return finalConfig;
+}
+
+/**
+ * 上一次加载时钥匙串的状态（供界面与自检展示）。
+ * 失败要被**看见**，而不是静默当成"没配密钥"——那会让用户以为密钥丢了。
+ */
+let vaultState = { mode: 'config', backend: 'config', ok: true, applied: 0, error: null };
+
+export function vaultStatus() {
+  return { ...vaultState };
+}
+
+/** 读钥匙串并补进配置（同步，进程内缓存）。 */
+function applyVault(config) {
+  const mode = config.vault?.mode || 'config';
+  if (mode === 'config') return { mode, backend: 'config', ok: true, applied: 0, error: null };
+  const res = readVault(mode, { dataDir: dataDirOf(config, cachedRoot || resolveRoot()) });
+  if (!res.ok) {
+    log.warn(`密钥保管读取失败（本次未注入密钥，你的密钥没有被删除）：${res.error}`);
+    return { mode, backend: res.backend || null, ok: false, applied: 0, error: res.error };
+  }
+  const decoded = decodeVault(res.data);
+  if (!decoded.ok) {
+    log.warn(`密钥保管内容无法解析：${decoded.error}`);
+    return { mode, backend: res.backend, ok: false, applied: 0, error: decoded.error };
+  }
+  const { applied } = applyToConfig(config, decoded.secrets);
+  return { mode, backend: res.backend, ok: true, applied, stored: Object.keys(decoded.secrets).length };
 }
 
 export function getConfig() {
@@ -476,6 +540,32 @@ export function saveConfig(patch = {}) {
   };
   const cleaned = stripMaskedSecrets(patch, existing, fallback);
   const next = deepMerge(existing, cleaned);
+
+  /*
+   * 密钥保管：把密钥抽进保管库，配置文件里只留空。
+   *
+   * 两条铁律：
+   *   1. **写成功才抹掉明文**。写不进去就照旧明文落盘（并记警告）——
+   *      "保管库没写成、明文又抹了"等于直接把用户的密钥弄丢。
+   *   2. **不搬运来自环境变量的密钥**。`.env` / 真实环境变量里的值是用户刻意放在那里的，
+   *      一次保存就把它们抄进保管库（或抄进 config.json）都不对。
+   */
+  const secretsMode = current.vault?.mode || 'config';
+  if (secretsMode !== 'config') {
+    const resolved = resolveMode(secretsMode);
+    // 保存配置时两类环境变量来源都排除：那是用户刻意放在环境里的，不该被"顺手搬走"
+    const skip = envProvidedSlots();
+    const secrets = collectFromConfig(next, { exclude: skip });
+    if (Object.keys(secrets).length) {
+      const res = writeVault(resolved, { dataDir: dataDirOf(current, root) }, encodeVault(secrets));
+      if (res.ok) {
+        stripFromConfig(next);
+      } else {
+        log.warn(`密钥写不进保管库（${res.error}）；本次仍以明文写入配置文件，密钥没有丢`);
+      }
+    }
+  }
+
   atomicWriteJson(p.configFile, next);
   cached = null;
   const reloaded = loadConfig({ force: true });
@@ -577,6 +667,285 @@ export function secretSources() {
     llmKeyFromEnv: !!(process.env.DEEPSEEK_API_KEY || process.env.MAILBOT_LLM_API_KEY),
     googleSecretFromEnv: !!(process.env.GOOGLE_CLIENT_SECRET || process.env.MAILBOT_GOOGLE_CLIENT_SECRET),
   };
+}
+
+/* ------------------------------------------------------------ 密钥保管（系统钥匙串） */
+
+/** `.env` 里提供了值的键 → 对应的密钥槽位（用于"这个密钥来自 .env"与避免抄写） */
+const ENV_SECRET_SLOTS = {
+  imap: ['MAILBOT_IMAP_PASS'],
+  smtp: ['MAILBOT_SMTP_PASS'],
+  llm: ['DEEPSEEK_API_KEY', 'MAILBOT_LLM_API_KEY'],
+  web: ['MAILBOT_WEB_TOKEN'],
+  google: ['GOOGLE_CLIENT_SECRET', 'MAILBOT_GOOGLE_CLIENT_SECRET'],
+};
+
+/**
+ * 当前由环境变量提供值的密钥槽位。
+ *
+ * 两种来源必须分开对待：
+ *   - `onlyFile: true`  → 只算 `.env` **文件**提供的。那是我们自己的配置文件，
+ *     迁移时应当把它的值搬进保管库并把那一行清空（否则明文还留在文件里，等于没搬）。
+ *   - `onlyFile: false` → 连真实环境变量一起算。那是用户在别处显式设的（容器/系统环境），
+ *     程序无权也不该去动。**迁移与保存都不能把这类值抄进保管库或 config.json**：
+ *     环境变量优先级最高，抄一份只会让同一密钥存在两处，还让人以为"已经搬走了"。
+ */
+function envProvidedSlots({ onlyFile = false } = {}) {
+  const out = new Set();
+  for (const [slot, keys] of Object.entries(ENV_SECRET_SLOTS)) {
+    const hit = keys.some((k) => {
+      if (!process.env[k]) return false;
+      return onlyFile ? envFromFile.has(k) : true;
+    });
+    if (hit) out.add(slot);
+  }
+  return out;
+}
+
+function readDiskConfig(file) {
+  try {
+    return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** 读一次保管库里的密钥表（同步、带缓存）。 */
+function vaultSecrets(config, root) {
+  const mode = config?.vault?.mode || 'config';
+  const resolved = resolveMode(mode);
+  if (resolved === 'config') return { resolved, secrets: {}, error: null };
+  const res = readVault(mode, { dataDir: dataDirOf(config, root) });
+  if (!res.ok) return { resolved, secrets: {}, error: res.error };
+  const decoded = decodeVault(res.data);
+  return { resolved, secrets: decoded.ok ? decoded.secrets : {}, error: decoded.ok ? null : decoded.error };
+}
+
+/**
+ * 密钥现状报告：每一个密钥**现在到底在哪**。
+ *
+ * 这个函数存在的意义就是"别让用户猜"。密钥这种东西，
+ * 界面必须能回答"它存在哪、是不是明文、换了电脑会怎样"。
+ */
+export function secretsReport() {
+  const config = getConfig();
+  const root = cachedRoot || resolveRoot();
+  const p = pathsFor(config, root);
+  const disk = readDiskConfig(p.configFile);
+  const mode = config.vault?.mode || 'config';
+  const decision = autoDecision();
+  const { resolved, secrets: inVault, error } = vaultSecrets(config, root);
+  const envSlots = envProvidedSlots();
+  const instances = Array.isArray(config.instances) ? config.instances : [];
+
+  const locOf = (slotKey, instanceId) => {
+    if (envSlots.has(slotKey)) {
+      const fromFile = ENV_SECRET_SLOTS[slotKey].some((k) => envFromFile.has(k));
+      return fromFile ? 'envFile' : 'envReal';
+    }
+    if (instanceId) {
+      const diskInst = (disk.instances || []).find((i) => i.id === instanceId);
+      if (diskInst?.[slotKey]?.authPass) return 'config';
+    } else if (disk[slotKey]?.apiKey || disk[slotKey]?.authToken || disk.calendar?.google?.clientSecret) {
+      return 'config';
+    }
+    if (inVault[`${slotKey}:${instanceId || 'default'}`] || inVault[slotKey]) return 'vault';
+    return 'none';
+  };
+
+  const items = [];
+  for (const inst of instances) {
+    for (const slotKey of ['imap', 'smtp']) {
+      const slot = SECRET_SLOTS.find((s) => s.key === slotKey);
+      const value = slotKey === 'imap' ? inst.imap?.authPass : inst.smtp?.authPass;
+      items.push({
+        key: `${slotKey}:${inst.id || 'default'}`,
+        label: `${slot.label}${instances.length > 1 ? `（${inst.label || inst.id}）` : ''}`,
+        location: locOf(slotKey, inst.id || 'default'),
+        set: !!value,
+      });
+    }
+  }
+  for (const slot of SECRET_SLOTS) {
+    if (slot.external || slot.key === 'imap' || slot.key === 'smtp') continue;
+    const value = slot.get(config);
+    items.push({ key: slot.key, label: slot.label, location: locOf(slot.key), set: !!value });
+  }
+
+  const plaintext = items.filter((i) => i.set && (i.location === 'config' || i.location === 'envFile' || i.location === 'envReal'));
+  return {
+    mode,
+    resolved,
+    /** auto 模式下是否发生了"加密 → 未加密"的降级 */
+    degraded: mode === 'auto' ? decision.degraded : false,
+    degradeReason: mode === 'auto' ? decision.reason : null,
+    backends: listBackends(),
+    currentBackend: listBackends().find((b) => b.id === resolved) || null,
+    vaultOk: !error,
+    vaultError: error,
+    vaultCount: Object.keys(inVault).length,
+    /** 上一次加载时钥匙串的注入情况 */
+    lastLoad: vaultStatus(),
+    items,
+    plaintextCount: plaintext.length,
+    /** 还没纳入保管的敏感文件（如实列出，不含糊） */
+    notCovered: fs.existsSync(path.join(p.dataDir, 'google-token.json'))
+      ? ['Google 刷新令牌仍存在 data/google-token.json（文件权限 600，尚未纳入保管库）']
+      : [],
+  };
+}
+
+/**
+ * 把明文密钥迁进保管库。
+ *
+ * 顺序是刻意的，**任何一步失败都不会留下半个状态**：
+ *   ①收集 → ②写保管库 → ③**读回逐项比对** → ④比对通过才动配置文件（清空 + 写 mode + 清 .env 的值）
+ * 步骤 ①②③ 失败时配置文件**一个字节都没改**；④之后才真正"搬走"。
+ */
+export function migrateSecrets({ mode = 'auto' } = {}) {
+  const config = getConfig();
+  const root = cachedRoot || resolveRoot();
+  const p = pathsFor(config, root);
+  const resolved = resolveMode(mode);
+  if (resolved === 'config') {
+    throw new AppError('请选择一个具体的保管后端（如 dpapi / keychain / libsecret / file）', {
+      code: 'SECRETS_BAD_BACKEND',
+      status: 400,
+    });
+  }
+  const backend = listBackends().find((b) => b.id === resolved);
+  if (!backend?.available) {
+    throw new AppError(`该保管后端在本机不可用：${backend?.label || resolved}`, { code: 'SECRETS_BACKEND_UNAVAILABLE', status: 400 });
+  }
+
+  // ① 收集"当前真正在用"的密钥。
+  //    排除**真实环境变量**提供的（那是用户在别处设的，改不了它，抄一份只会重复）；
+  //    但 `.env` 文件提供的要收进来——把它搬走、并把那一行清空，才是迁移的意义。
+  const fileEnvSlots = envProvidedSlots({ onlyFile: true });
+  const realEnvOnly = new Set([...envProvidedSlots()].filter((s) => !fileEnvSlots.has(s)));
+  const secrets = collectFromConfig(config, { exclude: realEnvOnly });
+  if (!Object.keys(secrets).length) {
+    throw new AppError('没有可迁移的密钥（授权码 / API Key 都还没填）', { code: 'SECRETS_NOTHING_TO_MIGRATE', status: 400 });
+  }
+
+  // ② 写入保管库（失败即中止，不动任何文件）
+  const dataDir = dataDirOf(config, root);
+  const written = writeVault(resolved, { dataDir }, encodeVault(secrets));
+  if (!written.ok) {
+    throw new AppError(`写入保管库失败，未改动任何配置：${written.error}`, { code: 'SECRETS_WRITE_FAILED', status: 500 });
+  }
+
+  // ③ 读回逐项比对——不比对就等于没验证，"搬过去打不开"是最糟的结果
+  resetVaultCache();
+  const readBack = readVault(resolved, { dataDir, force: true });
+  if (!readBack.ok) {
+    clearVault(resolved, { dataDir });
+    throw new AppError(`保管库写进去了却读不回来，已回滚：${readBack.error}`, { code: 'SECRETS_VERIFY_FAILED', status: 500 });
+  }
+  const decoded = decodeVault(readBack.data);
+  const mismatch = Object.keys(secrets).filter((k) => decoded.secrets?.[k] !== secrets[k]);
+  if (!decoded.ok || mismatch.length) {
+    clearVault(resolved, { dataDir });
+    throw new AppError(`保管库内容校验不一致（${mismatch.join('、') || decoded.error}），已回滚，密钥仍在原处`, {
+      code: 'SECRETS_VERIFY_FAILED',
+      status: 500,
+    });
+  }
+
+  // ④ 校验通过，这才开始"搬走"
+  const diskBefore = fs.existsSync(p.configFile) ? fs.readFileSync(p.configFile, 'utf8') : null;
+  try {
+    const next = { ...readDiskConfig(p.configFile) };
+    next.vault = { ...(next.vault || {}), mode: resolved };
+    stripFromConfig(next);
+    // 顺带把 .env 里那些**确实由文件提供**的密钥清空（键名保留，加注释说明为什么是空的）
+    const envResult = blankEnvSecrets(root, envFromFile);
+    atomicWriteJson(p.configFile, next);
+    resetVaultCache();
+    cached = null;
+    loadConfig({ force: true, rootDir: root });
+    onConfigReload?.();
+    return {
+      ok: true,
+      backend: resolved,
+      migrated: Object.keys(secrets).length,
+      items: Object.keys(secrets),
+      envCleared: envResult.cleared,
+      message: `已把 ${Object.keys(secrets).length} 项密钥迁到「${backend.label}」`,
+    };
+  } catch (err) {
+    // 走到这一步才可能"改了一半"：尽力把配置文件还原，保管库里的副本保留（多一份总比少一份好）
+    if (diskBefore !== null) {
+      try {
+        fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+      } catch {
+        /* 尽力而为 */
+      }
+    }
+    throw err;
+  }
+}
+
+/** 从保管库搬回明文（"我不想用它了"的退路）。 */
+export function revertSecrets() {
+  const config = getConfig();
+  const root = cachedRoot || resolveRoot();
+  const p = pathsFor(config, root);
+  const mode = config.vault?.mode || 'config';
+  const resolved = resolveMode(mode);
+  if (resolved === 'config') {
+    throw new AppError('当前密钥本来就在配置文件里，无需迁回', { code: 'SECRETS_ALREADY_PLAIN', status: 400 });
+  }
+  const dataDir = dataDirOf(config, root);
+  const { secrets } = vaultSecrets(config, root);
+  if (!Object.keys(secrets).length) {
+    throw new AppError('保管库里没有密钥，无需迁回', { code: 'SECRETS_EMPTY_VAULT', status: 400 });
+  }
+  // 先写回明文（成功后才清保管库，否则"两边都没有"就真丢了）
+  const next = { ...readDiskConfig(p.configFile) };
+  next.vault = { ...(next.vault || {}), mode: 'config' };
+  applyToConfig(next, secrets);
+  atomicWriteJson(p.configFile, next);
+  clearVault(resolved, { dataDir });
+  resetVaultCache();
+  cached = null;
+  loadConfig({ force: true, rootDir: root });
+  onConfigReload?.();
+  return {
+    ok: true,
+    restored: Object.keys(secrets).length,
+    message: `已把 ${Object.keys(secrets).length} 项密钥写回配置文件（明文），并清空了保管库`,
+    warning: '现在密钥又是明文了：请勿把 config.json 放进网盘 / 提交到代码仓库',
+  };
+}
+
+/**
+ * 把 `.env` 里由文件提供的密钥值清空（键名保留），并加一行说明。
+ * 只动值，不删键——删了键下次用户就看不出这里曾经能填密钥。
+ */
+function blankEnvSecrets(root, keys) {
+  const file = path.join(root, '.env');
+  const cleared = [];
+  if (!fs.existsSync(file)) return { cleared };
+  let text = fs.readFileSync(file, 'utf8');
+  for (const key of keys) {
+    const re = new RegExp(`^(${key}\\s*=).*$`, 'm');
+    if (!re.test(text)) continue;
+    text = text.replace(re, '$1');
+    cleared.push(key);
+  }
+  if (cleared.length) {
+    if (!/密钥已迁移到系统保管库/.test(text)) {
+      text = `${text.replace(/\s*$/, '\n')}\n# 下面这些密钥的值已迁移到系统保管库（见程序「设置 → 密钥存储」），此处留空即可\n`;
+    }
+    fs.writeFileSync(file, text, 'utf8');
+    // 让当前进程也别再用旧值：删掉从 .env 载入的那些
+    for (const key of cleared) {
+      delete process.env[key];
+      envFromFile.delete(key);
+    }
+  }
+  return { cleared };
 }
 
 /* ------------------------------------------------------------ 校验 */

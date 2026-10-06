@@ -36,6 +36,9 @@ export const AUDIT_ACTIONS = {
   /** 导出/导入备份：前者涉及"数据（可能含密钥）被搬走"，后者会覆盖数据 */
   'backup.export': { label: '导出备份', group: '数据' },
   'backup.import': { label: '导入备份', group: '数据' },
+  /** 密钥搬家：把明文搬进系统保管库、或搬回明文 */
+  'secrets.migrate': { label: '密钥迁入保管库', group: '数据' },
+  'secrets.revert': { label: '密钥迁回明文', group: '数据' },
 };
 
 function auditPath() {

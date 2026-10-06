@@ -16,8 +16,11 @@ import {
   listInstances,
   loadConfig,
   maskConfig,
+  migrateSecrets,
+  revertSecrets,
   saveConfig,
   secretSources,
+  secretsReport,
 } from './config/index.js';
 import { LLM_PRESETS, PRESETS } from './config/defaults.js';
 import { AppError, APP_VERSION, hoursAgo, log, safeJson, toErrorPayload } from './lib/util.js';
@@ -566,6 +569,47 @@ async function handleApi(req, res, url, actualPort) {
       stats: auditStats(),
       actions: AUDIT_ACTIONS,
     });
+  }
+
+  /* ---- 密钥存储（系统钥匙串） ---- */
+
+  /** 密钥现状：每一项**现在在哪**、是不是明文、有没有降级。 */
+  if (route === 'GET /api/secrets') {
+    return sendJson(res, 200, { ok: true, ...secretsReport() });
+  }
+
+  /**
+   * 把明文密钥迁到保管库。
+   *
+   * 会真正改动配置文件（把密钥清空），所以要求确认；
+   * 内部还会"先写保管库 → 读回逐项比对 → 比对通过才动文件"，失败不留半个状态。
+   */
+  if (route === 'POST /api/secrets/migrate') {
+    const body = await readJsonBody(req);
+    if (body.confirm !== true) {
+      throw new AppError('迁移会把配置文件里的密钥搬走并清空：请传入 confirm=true。', {
+        code: 'CONFIRM_REQUIRED',
+        status: 428,
+      });
+    }
+    const result = migrateSecrets({ mode: String(body.mode || 'auto') });
+    appendAudit('secrets.migrate', {
+      target: result.backend,
+      source: '设置页',
+      extra: { migrated: result.migrated, envCleared: result.envCleared },
+    });
+    return sendJson(res, 200, { ok: true, ...result, status: secretsReport() });
+  }
+
+  /** 从保管库搬回明文（用户不想用了的退路）。 */
+  if (route === 'POST /api/secrets/revert') {
+    const body = await readJsonBody(req);
+    if (body.confirm !== true) {
+      throw new AppError('迁回会让密钥重新以明文保存：请传入 confirm=true。', { code: 'CONFIRM_REQUIRED', status: 428 });
+    }
+    const result = revertSecrets();
+    appendAudit('secrets.revert', { target: 'config.json', source: '设置页', extra: { restored: result.restored } });
+    return sendJson(res, 200, { ok: true, ...result, status: secretsReport() });
   }
 
   /* ---- 备份与恢复 ---- */

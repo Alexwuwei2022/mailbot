@@ -214,6 +214,12 @@ export function buildBackup({ includeSecrets = false, includeRaw = false, now = 
     /** 备份里**没有**的东西：让用户一眼看到代价 */
     excluded: [
       ...(includeSecrets ? [] : ['密钥（邮箱授权码 / 大模型 API Key / Google 令牌 / .env）']),
+      ...(config.vault?.mode && config.vault.mode !== 'config'
+        ? [
+            '系统保管库里的密钥（即使勾选"包含密钥"也不含：它的密文与这台机器绑定，' +
+              '拷到别的电脑解不开，换机后需要重新填一次授权码）',
+          ]
+        : []),
       ...(includeRaw ? [] : ['邮件原文归档（data/raw）']),
       '草稿附件文件（data/attachments，发送成功后本来就会被清理）',
     ],

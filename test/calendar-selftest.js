@@ -44,8 +44,10 @@ async function test(name, fn) {
     passed += 1;
     console.log(`  ✓ ${name}`);
   } catch (err) {
-    failures.push({ name, message: err?.stack || String(err) });
-    console.log(`  ✗ ${name}\n      ${err?.message || err}`);
+    // `fetch` 只说 "fetch failed"，真正原因在 cause 里（详见 fresh-install.js 的同类注释）
+    const cause = err?.cause ? ` ← ${err.cause.code || err.cause.name || ''} ${err.cause.message || err.cause}` : '';
+    failures.push({ name, message: (err?.stack || String(err)) + cause });
+    console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}`);
   }
 }
 function assert(cond, msg) {

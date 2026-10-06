@@ -240,6 +240,29 @@ export const DEFAULTS = {
   },
 
   /**
+   * 密钥保管（授权码 / API Key / 令牌放在哪里）。
+   *
+   * 名字叫 `vault`（保管库）而不是 `secrets`：这个配置节**自己不含任何密钥**，
+   * 只说明密钥该放哪。叫 secrets 会让读配置的人以为密钥就在里面。
+   *
+   * 默认 `config` = 维持原样（明文写在 `config.json` / `.env` 里），
+   * 这样升级上来的老用户行为完全不变——**"密钥搬到哪去了"这种事不能默认偷偷改变**。
+   * 想用系统钥匙串，请在「设置 → 密钥存储」里显式迁移。
+   *
+   * mode 取值：
+   *   config      明文留在配置文件（默认，向后兼容）
+   *   auto        用本机可用的最佳加密后端（Windows DPAPI / macOS 钥匙串 / Linux Secret Service）；
+   *               都没有时才退到**未加密**的本地文件，且该降级会在界面上明确说出来
+   *   dpapi       Windows 凭据保护（DPAPI，CurrentUser 作用域）
+   *   keychain    macOS 钥匙串
+   *   libsecret   Linux Secret Service（GNOME Keyring / KWallet）
+   *   file        未加密的本地文件 data/secrets.json（仅 600 权限）
+   */
+  vault: {
+    mode: 'config',
+  },
+
+  /**
    * 数据保留策略。
    *
    * 默认**什么都不自动删**（原文永久保留、分析上限沿用旧版的 3000）——

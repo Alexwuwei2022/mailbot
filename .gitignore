@@ -26,6 +26,9 @@ data/
 
 # 其它可能落盘的令牌/备份
 *.token.json
+# 密钥保管库（系统钥匙串的密文 / 未加密的降级文件）：绝不能进仓库
+*.dpapi
+secrets.json
 *.broken-*
 *.tmp
 *.bak

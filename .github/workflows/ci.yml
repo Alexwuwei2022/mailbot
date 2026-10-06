@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -e
-          bad=$(git ls-files | grep -E '^(data/|\.env$)|google-token|audit\.jsonl|\.eml$' || true)
+          bad=$(git ls-files | grep -E '^(data/|\.env$)|google-token|audit\.jsonl|\.eml$|secrets\.(json|dpapi)' || true)
           if [ -n "$bad" ]; then
             echo "::error::仓库里出现了不应提交的运行数据/凭据："
             echo "$bad"

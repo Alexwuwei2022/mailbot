@@ -117,6 +117,11 @@ export const api = {
   /** 定时任务（主动性）：状态 + 立即试一次 */
   scheduleStatus: () => request('GET', '/api/schedule'),
   runScheduleNow: () => request('POST', '/api/schedule/run', {}),
+  /** 密钥存储：现状 / 迁入保管库 / 迁回明文（后两者会改配置文件，接口侧强制 confirm） */
+  secrets: () => request('GET', '/api/secrets'),
+  secretsMigrate: (mode) => request('POST', '/api/secrets/migrate', { confirm: true, mode }),
+  secretsRevert: () => request('POST', '/api/secrets/revert', { confirm: true }),
+
   /** 一屏体检（纯本地、不连网）：回答"能不能开始用、还差哪一步" */
   health: () => request('GET', '/api/health'),
 

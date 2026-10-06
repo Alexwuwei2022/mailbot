@@ -45,8 +45,16 @@ async function test(name, fn) {
     passed += 1;
     console.log(`  ✓ ${name}${detail ? ` — ${detail}` : ''}`);
   } catch (err) {
-    failures.push({ name, message: err?.stack || String(err) });
-    console.log(`  ✗ ${name}\n      ${err?.message || err}`);
+    /*
+     * 把底层 `cause` 也打出来。
+     *
+     * `fetch` 抛出的信息就是一句 "fetch failed"，真正的原因（ECONNREFUSED / 端口没起来 /
+     * 沙箱拦截……）全在 `err.cause` 里。只打印 message 等于把线索丢掉，
+     * 排查的人只能靠猜——这个坑我踩过一次，不留第二次。
+     */
+    const cause = err?.cause ? ` ← ${err.cause.code || err.cause.name || ''} ${err.cause.message || err.cause}` : '';
+    failures.push({ name, message: (err?.stack || String(err)) + cause });
+    console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}`);
   }
 }
 function assert(cond, msg) {

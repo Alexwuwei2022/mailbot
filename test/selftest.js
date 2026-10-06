@@ -25,9 +25,20 @@ delete process.env.MAILBOT_LLM_API_KEY;
 delete process.env.MAILBOT_IMAP_PASS;
 delete process.env.MAILBOT_SMTP_PASS;
 
-const { loadConfig, getConfig, getInstance, getPaths, resetConfigCache, maskConfig, saveConfig, ensureDirs } = await import(
-  '../server/config/index.js'
-);
+const {
+  loadConfig,
+  getConfig,
+  getInstance,
+  getPaths,
+  resetConfigCache,
+  maskConfig,
+  saveConfig,
+  ensureDirs,
+  migrateSecrets,
+  revertSecrets,
+  secretsReport,
+} = await import('../server/config/index.js');
+const { decodeVault, readVault, resetVaultCache, __setBackendForTest } = await import('../server/lib/secrets.js');
 const { parseMessage, stripQuoted, makeSnippet } = await import('../server/mail/parse.js');
 const { buildMime, textToHtml, ensureReplyPrefix } = await import('../server/mail/compose.js');
 const { LlmClient } = await import('../server/llm/client.js');
@@ -57,8 +68,10 @@ function test(name, fn) {
       console.log(`  ✓ ${name}`);
     })
     .catch((err) => {
-      failures.push({ name, message: err?.stack || String(err) });
-      console.log(`  ✗ ${name}\n      ${err?.message || err}`);
+      // `fetch` 只说 "fetch failed"，真正原因在 cause 里（详见 fresh-install.js 的同类注释）
+      const cause = err?.cause ? ` ← ${err.cause.code || err.cause.name || ''} ${err.cause.message || err.cause}` : '';
+      failures.push({ name, message: (err?.stack || String(err)) + cause });
+      console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}`);
     });
 }
 
@@ -781,12 +794,19 @@ await test('自检：配置缺失时给出可读问题清单', async () => {
 });
 
 await test('配置：授权码脱敏且掩码值不会被覆盖', async () => {
+  const real = getConfig().instances[0].imap.authPass;
   const masked = maskConfig(getConfig());
   assertEqual(masked.instances[0].imap.authPass, '***', 'IMAP 授权码应脱敏');
   assertEqual(masked.instances[0].smtp.authPass, '***', 'SMTP 授权码应脱敏');
   assertEqual(masked.llm.apiKey, '***', 'API Key 应脱敏');
+  /*
+   * 精确比对**真实值**，而不是搜一个像 'secret' 这样的子串。
+   * 早先的写法是 `json.includes('secret')`：只要配置里出现任何含该子串的键名
+   * （例如后来新增的 `secrets` 配置节）就会误报——而"密钥没泄漏"这件事必须靠值来判断。
+   */
   const json = JSON.stringify(masked);
-  assert(!json.includes('secret'), '输出中不应出现真实授权码');
+  assert(real && !json.includes(real), `输出中不应出现真实授权码（${real}）`);
+  assert(!json.includes('"authPass":"' + real + '"'), '授权码不得原样出现在脱敏输出里');
 });
 
 await test('配置：保存到磁盘后掩码回传不破坏原密钥', async () => {
@@ -2942,6 +2962,229 @@ await test('备份：导出默认抹掉密钥、可选用包含；导入保留�
     (await import('../server/store/state.js')).loadState({ force: true });
   } finally {
     Object.assign(config, backupConfig);
+  }
+});
+
+/* -------------------------------------------------- 21. 密钥保管（系统钥匙串） */
+
+/**
+ * 用一个**假后端**测保管逻辑：真实后端要起子进程（DPAPI 走 PowerShell、
+ * 钥匙串走 security），在受限环境和 CI 上都不该依赖它。
+ * 真假后端之间的边界就是"字符串进、字符串出"，所以假后端足以覆盖全部业务逻辑；
+ * 真实 DPAPI 的往返在开发机上单独验过（见文档）。
+ */
+function installFakeVault({ failWrite = false, failRead = false, mangle = false } = {}) {
+  const store = { text: null, writes: 0, clears: 0 };
+  __setBackendForTest('faketest', {
+    id: 'faketest',
+    label: '测试保管库',
+    encrypted: true,
+    detail: '仅测试用',
+    available: () => true,
+    read() {
+      if (failRead) return { ok: false, code: 'FAKE_READ_FAIL', message: '测试：读失败' };
+      return { ok: true, value: store.text };
+    },
+    write(_dataDir, text) {
+      store.writes += 1;
+      if (failWrite) return { ok: false, code: 'FAKE_WRITE_FAIL', message: '测试：写失败' };
+      /*
+       * mangle 要真的"写进去和读出来不一样"：只在末尾加个空格是不够的——
+       * JSON 照样能解析、值也一样，校验根本不会失败（这个测试本身因此一度形同虚设）。
+       * 这里把每一项的**值**改掉但保持 JSON 合法，才能覆盖"搬过去打不开"的真实情形。
+       */
+      if (mangle) {
+        const parsed = JSON.parse(text);
+        for (const k of Object.keys(parsed.secrets || {})) parsed.secrets[k] = `${parsed.secrets[k]}-MANGLED`;
+        store.text = JSON.stringify(parsed, null, 2);
+      } else {
+        store.text = text;
+      }
+      return { ok: true };
+    },
+    clear() {
+      store.clears += 1;
+      store.text = null;
+      return { ok: true };
+    },
+  });
+  resetVaultCache();
+  return store;
+}
+
+await test('密钥保管：迁移会清空配置文件、注入回内存，且读回校验通过才算成功', async () => {
+  const store = installFakeVault();
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  try {
+    const before = getConfig().instances[0].imap.authPass;
+    const out = migrateSecrets({ mode: 'faketest' });
+    assert(out.migrated >= 3, `应迁移多项（实际 ${out.migrated}）`);
+    assertEqual(out.backend, 'faketest', '应报告后端');
+    // ① 配置文件里的密钥必须被清空
+    const disk = JSON.parse(fs.readFileSync(p.configFile, 'utf8'));
+    assertEqual(disk.instances[0].imap.authPass, '', '磁盘上不应再留明文授权码');
+    assertEqual(disk.instances[0].smtp.authPass, '', '磁盘上不应再留明文发信授权码');
+    assertEqual(disk.llm.apiKey, '', '磁盘上不应再留明文 API Key');
+    assertEqual(disk.vault.mode, 'faketest', '应记住用哪个后端');
+    // ② 但程序仍然能用（从保管库注入）
+    const live = getConfig();
+    assertEqual(live.instances[0].imap.authPass, before, '内存里应恢复出真实授权码');
+    assert(live.llm.apiKey, 'API Key 也应恢复');
+    // ③ 保管库内容应是真的（不是空写）
+    const decoded = decodeVault(store.text);
+    assert(decoded.ok, '保管库内容应可解析');
+    assert(Object.keys(decoded.secrets).length >= 3, '保管库应有内容');
+    // ④ 报告应显示"已无明文"
+    const report = secretsReport();
+    assertEqual(report.plaintextCount, 0, `不应再有明文密钥（实际 ${report.plaintextCount}）`);
+    assertEqual(report.resolved, 'faketest', '应报告当前后端');
+    assert(
+      report.items.every((i) => i.location !== 'config'),
+      '不应有密钥还标为"明文在 config.json"',
+    );
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('密钥保管：写失败时绝不抹掉明文（否则密钥就真丢了）', async () => {
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  installFakeVault({ failWrite: true });
+  try {
+    const before = getConfig().instances[0].imap.authPass;
+    let code = null;
+    try {
+      migrateSecrets({ mode: 'faketest' });
+    } catch (err) {
+      code = err.code;
+    }
+    assertEqual(code, 'SECRETS_WRITE_FAILED', '写失败应明确报错');
+    const disk = JSON.parse(fs.readFileSync(p.configFile, 'utf8'));
+    assertEqual(disk.instances[0].imap.authPass, before, '写失败时明文必须原样保留');
+    assertEqual(disk.vault?.mode || 'config', 'config', '写失败时不应改 mode');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('密钥保管：读回校验不一致时回滚，密钥仍在原处', async () => {
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const store = installFakeVault({ mangle: true }); // 写进去和读出来不一样（模拟"搬过去打不开"）
+  try {
+    const before = getConfig().instances[0].imap.authPass;
+    let code = null;
+    try {
+      migrateSecrets({ mode: 'faketest' });
+    } catch (err) {
+      code = err.code;
+    }
+    assertEqual(code, 'SECRETS_VERIFY_FAILED', '校验不一致必须报错');
+    assertEqual(store.clears, 1, '应把写坏的内容清掉（回滚）');
+    const disk = JSON.parse(fs.readFileSync(p.configFile, 'utf8'));
+    assertEqual(disk.instances[0].imap.authPass, before, '密钥必须仍在原处');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('密钥保管：迁回明文后保管库被清空、配置文件恢复明文', async () => {
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const store = installFakeVault();
+  try {
+    const before = getConfig().instances[0].imap.authPass;
+    migrateSecrets({ mode: 'faketest' });
+    const back = revertSecrets();
+    assert(back.restored >= 3, '应迁回多项');
+    const disk = JSON.parse(fs.readFileSync(p.configFile, 'utf8'));
+    assertEqual(disk.instances[0].imap.authPass, before, '配置文件应恢复明文');
+    assertEqual(disk.vault.mode, 'config', 'mode 应回到 config');
+    assertEqual(store.clears, 1, '保管库应被清空（避免密钥存在两处）');
+    assertEqual(store.text, null, '保管库内容应为空');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('密钥保管：读取失败只警告、不崩，且报告里能看见失败', async () => {
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  try {
+    // 先用假后端迁移成功，再让读取失败：模拟"换了台机器/换了账户，密文解不开"
+    installFakeVault();
+    migrateSecrets({ mode: 'faketest' });
+    installFakeVault({ failRead: true });
+    resetConfigCache();
+    // 关键：不能抛异常（否则整个程序起不来）
+    const cfg = loadConfig({ rootDir: root, force: true });
+    assert(cfg && cfg.instances, '配置仍应加载成功');
+    assertEqual(cfg.instances[0].imap.authPass, '', '读不出来时该字段为空（而不是崩）');
+    const report = secretsReport();
+    assertEqual(report.vaultOk, false, '报告必须如实说明保管库读取失败');
+    assert(report.vaultError, '应给出失败原因');
+    assertEqual(report.lastLoad.ok, false, '最近一次加载的状态也应是失败');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('密钥保管：不搬运来自环境变量的密钥（用户刻意放在那里的）', async () => {
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  installFakeVault();
+  const oldEnv = process.env.MAILBOT_IMAP_PASS;
+  const oldNoDot = process.env.MAILBOT_NO_DOTENV;
+  try {
+    // 用环境变量提供 IMAP 授权码，再走一次"保存配置"：它不该被抄进保管库
+    process.env.MAILBOT_IMAP_PASS = 'FROM-ENV-SECRET';
+    process.env.MAILBOT_NO_DOTENV = '1';
+    resetConfigCache();
+    // 迁移（收集时也会跳过 env 提供的项）
+    const out = migrateSecrets({ mode: 'faketest' });
+    assert(
+      !out.items.includes('imap:test') && !out.items.includes('imap:default'),
+      `不应迁移环境变量提供的授权码（实际迁移了 ${out.items.join(',')}）`,
+    );
+    const decoded = decodeVault(
+      readVault('faketest', { dataDir: getPaths().dataDir, force: true }).data,
+    );
+    assert(
+      !Object.values(decoded.secrets).includes('FROM-ENV-SECRET'),
+      '环境变量里的密钥不得被抄进保管库',
+    );
+  } finally {
+    if (oldEnv === undefined) delete process.env.MAILBOT_IMAP_PASS;
+    else process.env.MAILBOT_IMAP_PASS = oldEnv;
+    if (oldNoDot === undefined) delete process.env.MAILBOT_NO_DOTENV;
+    else process.env.MAILBOT_NO_DOTENV = oldNoDot;
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
   }
 });
 

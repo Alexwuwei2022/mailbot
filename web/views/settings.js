@@ -31,6 +31,10 @@ export function renderSettings(root, app) {
     exporting: false,
     /** 导入前的自动备份列表（可回滚） */
     safetyBackups: [],
+    /** 密钥存储现状（/api/secrets） */
+    secrets: null,
+    secretsBusy: false,
+    secretsPick: null,
     /** 上次保存后的配置快照，用于判断是否有未保存改动 */
     savedSnapshot: null,
     activeInstance: null,
@@ -411,6 +415,25 @@ export function renderSettings(root, app) {
             '留空则发给你自己的发件身份',
           ),
           scheduleStatusLine(),
+        ),
+      ),
+
+      /* ---------------- 密钥存储 ---------------- */
+      h(
+        'section',
+        { class: 'block' },
+        h(
+          'div',
+          { class: 'block-head' },
+          h('h3', { text: '密钥存储' }),
+          h('span', { class: 'muted small', text: '授权码 / API Key / 令牌放在哪' }),
+        ),
+        h(
+          'div',
+          { class: 'pad' },
+          state.secrets
+            ? secretsPanel()
+            : h('p', { class: 'muted small', text: '加载中…' }),
         ),
       ),
 
@@ -1074,6 +1097,219 @@ async function loadBackups() {
   paint();
 }
 
+/**
+ * 密钥存储面板。
+ *
+ * 三件事必须一眼看清，否则用户会一直猜：
+ *   ①现在每个密钥**到底存在哪**（明文配置文件 / .env / 保管库）；
+ *   ②保管库是**加密的**还是降级成了未加密文件；
+ *   ③换成另一台电脑会发生什么。
+ */
+function secretsPanel() {
+  const s = state.secrets;
+  const backendLabel = s.currentBackend?.label || s.resolved || '—';
+  const plain = (s.items || []).filter((i) => i.set && (i.location === 'config' || i.location === 'envFile' || i.location === 'envReal'));
+  const inVault = (s.items || []).filter((i) => i.location === 'vault');
+  const locText = { config: '明文在 config.json', envFile: '明文在 .env', envReal: '来自环境变量', vault: '系统保管库', none: '未设置' };
+
+  const options = (s.backends || []).filter((b) => b.available);
+
+  return h(
+    'div',
+    {},
+    h(
+      'div',
+      { class: 'kv-row' },
+      h('span', { class: 'kv-label', text: '当前方式' }),
+      h(
+        'span',
+        { class: 'kv-value' },
+        s.mode === 'config' ? '明文写在配置文件里（默认）' : `${backendLabel}${s.currentBackend?.encrypted ? '' : '（**未加密**）'}`,
+      ),
+    ),
+    s.degraded
+      ? h('p', { class: 'error small' }, `⚠️ 已降级为未加密的本地文件：${s.degradeReason}`)
+      : null,
+    s.vaultOk === false
+      ? h(
+          'p',
+          { class: 'error small' },
+          `⚠️ 保管库读取失败：${s.vaultError}。**你的密钥没有被删除**，本次只是没能注入；修好后再刷新本页。`,
+        )
+      : null,
+
+    h(
+      'div',
+      { class: 'storage-table mt-2' },
+      ...(s.items || []).map((i) =>
+        h(
+          'div',
+          { class: 'storage-row' },
+          h('span', { class: 'storage-label', text: i.label }),
+          h('span', { class: `tag ${i.location === 'vault' ? 'tag-ok' : i.set ? 'tag-warn' : ''}`, text: locText[i.location] || i.location }),
+          h('span', { class: 'muted small storage-hint', text: i.set ? '' : '（空）' }),
+        ),
+      ),
+    ),
+
+    h(
+      'p',
+      { class: 'muted small mt-2' },
+      '**威胁模型（不夸大）**：搬进保管库能防的是"`config.json` / `.env` 被拷走、被网盘同步、进了备份包、被人翻到"——' +
+        '文件里不再有密钥，密文只有**这台机器的这个用户**能解开。它**防不住**以你的身份运行的恶意程序、' +
+        '你离开时没锁屏的电脑。',
+    ),
+    h(
+      'p',
+      { class: 'muted small' },
+      '**换电脑/重装系统**：保管库里的密钥解不开（这是它的设计目标），需要在「开始使用」或设置里重新填一次授权码。' +
+        '导出的备份包**不含**保管库内容，所以别指望用它搬密钥。',
+    ),
+    (s.notCovered || []).length
+      ? h('p', { class: 'muted small' }, `尚未纳入：${s.notCovered.join('；')}`)
+      : null,
+
+    h(
+      'div',
+      { class: 'row-actions mt-3' },
+      s.mode === 'config'
+        ? [
+            ...(options.length
+              ? [
+                  h(
+                    'button',
+                    {
+                      class: 'btn btn-primary',
+                      disabled: state.secretsBusy,
+                      onclick: (ev) => migrateSecrets(ev.currentTarget, s.bestMode || options[0].id),
+                    },
+                    state.secretsBusy ? '迁移中…' : `迁入「${options[0].label}」`,
+                  ),
+                ]
+              : [h('span', { class: 'muted small', text: '本机没有可用的系统保管后端' })]),
+            options.length > 1
+              ? h(
+                  'select',
+                  {
+                    class: 'input input-inline',
+                    onchange: (e) => {
+                      state.secretsPick = e.target.value;
+                      paint();
+                    },
+                  },
+                  ...options.map((b) =>
+                    h('option', { value: b.id, selected: (state.secretsPick || options[0].id) === b.id }, `${b.label}${b.encrypted ? '' : '（未加密）'}`),
+                  ),
+                )
+              : null,
+          ]
+        : [
+            h(
+              'button',
+              {
+                class: 'btn',
+                disabled: state.secretsBusy,
+                onclick: (ev) => revertSecrets(ev.currentTarget),
+              },
+              state.secretsBusy ? '处理中…' : '迁回明文（我不想用它了）',
+            ),
+            h(
+              'button',
+              {
+                class: 'btn',
+                disabled: state.secretsBusy,
+                onclick: (ev) => migrateSecrets(ev.currentTarget, state.secretsPick || options[0]?.id || s.resolved),
+              },
+              '改用其它保管方式',
+            ),
+          ],
+      h('button', { class: 'btn btn-small', disabled: state.secretsBusy, onclick: loadSecrets }, '刷新'),
+    ),
+    inVault.length
+      ? h('p', { class: 'muted small mt-2' }, `已在保管库：${inVault.length} 项；明文残留：${plain.length} 项`)
+      : h('p', { class: 'muted small mt-2' }, `明文残留：${plain.length} 项（任何能读 config.json 的人都能看到）`),
+  );
+}
+
+/** 迁移确认：把"会发生什么"讲清楚再动手。 */
+async function migrateSecrets(btn, mode) {
+  const s = state.secrets;
+  const backend = (s.backends || []).find((b) => b.id === mode);
+  const ok = await confirmDialog({
+    title: `把密钥迁到「${backend?.label || mode}」？`,
+    message: h(
+      'div',
+      {},
+      h('p', { class: 'small', text: '程序会：①把当前所有密钥写进保管库；②读回来逐项比对；③比对通过后，才把 config.json 与 .env 里的明文清空。' }),
+      h('p', { class: 'small', text: '任何一步失败都会回滚，密钥不会丢。' }),
+      backend && !backend.encrypted
+        ? h('p', { class: 'error small', text: '⚠️ 这个后端**不加密**：只是把密钥挪进单独一个 600 权限的文件。' })
+        : null,
+      h('p', { class: 'muted small', text: `换电脑后需要重新填写授权码（${backend?.detail || ''}）。` }),
+    ),
+    confirmText: '确认迁移',
+  });
+  if (!ok) return;
+  const label = btn?.textContent;
+  state.secretsBusy = true;
+  if (btn) btn.textContent = '迁移中…';
+  paint();
+  try {
+    const out = await api.secretsMigrate(mode);
+    state.secrets = out.status;
+    toast(out.message || '已迁移', 'success', 8000);
+    state.config = null;
+    invalidate(app, 'settings');
+  } catch (err) {
+    toastError(err);
+  } finally {
+    state.secretsBusy = false;
+    if (btn) btn.textContent = label;
+    paint();
+  }
+}
+
+async function revertSecrets(btn) {
+  const ok = await confirmDialog({
+    title: '把密钥迁回明文？',
+    message: h(
+      'div',
+      {},
+      h('p', { class: 'small', text: '密钥会重新写进 `config.json`（明文），保管库里的副本会被清空。' }),
+      h('p', { class: 'small', text: '之后**不要**把 config.json 放进网盘或提交到代码仓库。' }),
+    ),
+    confirmText: '确认迁回',
+    danger: true,
+  });
+  if (!ok) return;
+  state.secretsBusy = true;
+  if (btn) btn.textContent = '处理中…';
+  paint();
+  try {
+    const out = await api.secretsRevert();
+    state.secrets = out.status;
+    toast(out.message || '已迁回明文', 'success', 8000);
+    if (out.warning) toast(out.warning, 'error', 12_000);
+    state.config = null;
+    invalidate(app, 'settings');
+  } catch (err) {
+    toastError(err);
+  } finally {
+    state.secretsBusy = false;
+    paint();
+  }
+}
+
+async function loadSecrets() {
+  try {
+    state.secrets = await api.secrets();
+  } catch (err) {
+    state.secrets = null;
+    toastError(err);
+  }
+  paint();
+}
+
 /** 「关于」里的一行：标签 / 值 / 说明。 */
 function aboutRow(label, value, hint) {
   return h(
@@ -1501,6 +1737,17 @@ function field(label, control, hint) {
         state.storage = await api.storage();
       } catch {
         state.storage = null;
+      }
+      // 密钥存储现状 + 导入前的自动备份列表
+      try {
+        state.secrets = await api.secrets();
+      } catch {
+        state.secrets = null;
+      }
+      try {
+        state.safetyBackups = (await api.backups()).backups || [];
+      } catch {
+        state.safetyBackups = [];
       }
       state.fetched = true;
     } catch (err) {
