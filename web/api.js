@@ -196,6 +196,12 @@ export const api = {
   storageCleanup: (payload) => request('POST', '/api/storage/cleanup', { confirm: true, ...payload }),
 
   /**
+   * 重置本地分析数据（不可逆，接口侧强制 confirm）。
+   * 只清本机的分析与草稿记录，不动邮箱里的邮件。
+   */
+  resetState: () => request('POST', '/api/state/reset', { confirm: true }),
+
+  /**
    * 备份：导出（拿 Blob 自己触发下载）、检查、导入、自动备份列表。
    *
    * 导出/导入不能用 `request()`：前者返回 zip（不是 JSON），后者要发**二进制**请求体。

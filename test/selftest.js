@@ -3305,6 +3305,180 @@ await test('跟催：合并保留用户状态、幂等重扫、对方已回则�
   assertEqual(sum.overdue, 1, '超期只算有截止时间且已过期的');
 });
 
+await test('跟催：同一封邮件内互相包含的承诺折叠成一条，且保留信息更完整的那条', async () => {
+  const { foldSimilarCommitments, TITLE_CONTAINMENT_RATIO } = await import('../server/followup.js');
+
+  // 真实用户数据：同一封邮件（draft_INBOX_8646）里模型把同一件事抽了两条
+  const LONG = '安排开发人员（邹佳）对接集团接口并逐项对标必传字段';
+  const SHORT = '安排开发人员（邹佳）对接集团接口';
+  const src = (title, id) => ({ id, kind: 'mine', draftId: 'draft_INBOX_8646', sourceKey: `draft:draft_INBOX_8646#${id}`, title, status: 'open' });
+
+  const folded = foldSimilarCommitments([src(LONG, 'a'), src(SHORT, 'b')]);
+  assertEqual(folded.items.length, 1, `同一封邮件内的包含关系应折叠成 1 条（实际 ${folded.items.length}）`);
+  assertEqual(folded.items[0].title, LONG, '必须保留更长、信息更完整的那条');
+  assertEqual(folded.folded, 1, '应报告折叠掉 1 条');
+  assertEqual(folded.absorbed.map((f) => f.title).join('|'), SHORT, '被丢掉的应是那条短的');
+
+  // 归一化后完全相同的两条（大小写/标点/全角差异）同样折叠
+  const same = foldSimilarCommitments([src('整理上周的会议纪要', 'c'), src('整理上周的会议纪要。', 'd')]);
+  assertEqual(same.items.length, 1, '只差一个句号的两条应折叠');
+
+  // 通过 messageId 分组（没有草稿 id 时）：同一封邮件内仍要折叠
+  // 注：这里的短串必须是长串的**前缀**且后接并列连词才会折叠——只差尾部的两条
+  //     （如「…逐项对标」vs「…逐项对标必传字段」）占比够、但不是"前缀+并"形态，按保守口径不折。
+  const byMail = foldSimilarCommitments([
+    { id: 'e', kind: 'mine', messageId: '<m9@x>', sourceKey: 'draft:d9#1', title: '按附件1接口协议文档逐项对标并核对全部必传字段' },
+    { id: 'f', kind: 'mine', messageId: '<m9@x>', sourceKey: 'draft:d9#2', title: '按附件1接口协议文档逐项对标' },
+  ]);
+  assertEqual(byMail.items.length, 1, '同一 messageId 内也应折叠');
+
+  // 占比阈值本身：短串必须占到长串的 TITLE_CONTAINMENT_RATIO 以上
+  assertEqual(TITLE_CONTAINMENT_RATIO, 0.5, '占比阈值应明确写死为 0.5，便于评审');
+});
+
+await test('跟催：相似但确实是两件事的承诺不被折叠（反例）', async () => {
+  const { foldSimilarCommitments } = await import('../server/followup.js');
+  const src = (title, id) => ({ id, kind: 'mine', draftId: 'd1', sourceKey: `draft:d1#${id}`, title, status: 'open' });
+
+  /** 两条都不该被折叠：同来源、彼此"看起来像"，但都是独立的事 */
+  const keepBoth = (a, b, why) => {
+    const r = foldSimilarCommitments([src(a, 'x'), src(b, 'y')]);
+    assertEqual(r.items.length, 2, `${why} → 不该折叠（实际折成 ${r.items.length} 条：${r.items.map((f) => f.title).join(' / ')}）`);
+    assertEqual(r.folded, 0, `${why} → folded 应为 0`);
+  };
+
+  /*
+   * 下面全是"差一两个词/只差一个修饰语"的改写：Dice 相似度 0.6~0.86，都**低于** 0.9 阈值。
+   * 它们要么是两件不同的事，要么本地无法确定是不是同一件——按"宁可少合并"的口径一律不折。
+   */
+  keepBoth('通过版本修正综调透明化接口入参不对的bug', '通过版本修正综调透明化接口billQueryActionDetail入参不对的问题', '一个泛指 bug、一个指具体字段的问题');
+  keepBoth('安排开发人员对接集团接口', '安排开发人员对接集团财务接口', '集团接口 ≠ 集团财务接口');
+  keepBoth('周三前把报价发给李总', '周三前把样品清单发给李总', '报价 与 样品清单 是两件事');
+  keepBoth('跟进A项目的验收进度', '跟进B项目的验收进度', 'A 项目 ≠ B 项目（只差一个字母）');
+  keepBoth('下周一前给张总发合同', '本周五前给张总发合同', '截止时间不同，很可能真的是两次发送');
+  keepBoth('联系供应商询价', '联系供应商确认交期', '询价 与 确认交期 是两件事');
+  keepBoth('组织相关方讨论并推进标化产数工单迁移综调后续落地', '组织相关方讨论并推进标化产数工单迁移后续落地', '中间插入「综调」，本地无法断定是不是同一件');
+  keepBoth('核查业务名称为空、疑似缺少对应规则的情况并回复', '核查业务名称为空、疑似缺少对应规则的问题并尽快回复', '「情况/问题」「回复/尽快回复」都不同');
+  // 子串但**只是前缀顺带提到**：短串不到长串的一半 → 不折
+  keepBoth('把报价发给李总', '把报价发给李总并抄送财务、法务与项目经理各一份', '短串占比不足一半');
+  keepBoth('按时参加9月29日综维超级数字员工及重点任务讨论会', '按时参加9月29日10:00至17:00的综维讨论会', '不是包含关系，且时间信息不同');
+  // 太短（归一化后 < 6 字）的包含关系不认，避免"共同的几个字"把两件事连起来
+  keepBoth('发报价', '发报价单', '短串太短，不做包含判定');
+  keepBoth('确认合同', '确认合同B', '短串太短，且 B 可能是另一件独立的事');
+
+  // 跨来源绝不折叠：标题一模一样，但分属两封邮件 → 各自保留
+  const crossSource = foldSimilarCommitments([
+    { id: 'p', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#1', title: '把报价发给李总', status: 'open' },
+    { id: 'q', kind: 'mine', draftId: 'd2', sourceKey: 'draft:d2#1', title: '把报价发给李总', status: 'open' },
+  ]);
+  assertEqual(crossSource.items.length, 2, '跨邮件（不同草稿 id）的同名承诺是两个来源，不能合并');
+});
+
+await test('跟催：折叠是幂等的（重扫两遍结果一致，且与输入顺序无关）', async () => {
+  const { foldSimilarCommitments, normalizeCommitments } = await import('../server/followup.js');
+  const src = (title, id) => ({ id, kind: 'mine', draftId: 'd1', sourceKey: `draft:d1#${id}`, title, status: 'open' });
+  const input = [
+    src('安排开发人员（邹佳）对接集团接口并逐项对标必传字段', 'a'),
+    src('国庆节后启动接口联调并同步具体计划', 'b'),
+    src('安排开发人员（邹佳）对接集团接口', 'c'),
+    src('按附件1接口协议文档逐项对标必传字段', 'd'),
+    src('安排开发人员（邹佳）对接集团接口。', 'e'),
+  ];
+
+  const first = foldSimilarCommitments(input);
+  assertEqual(first.items.length, 3, `首轮应留下 3 条（实际 ${first.items.length}）`);
+  const second = foldSimilarCommitments(first.items);
+  assertEqual(second.items.length, first.items.length, '第二次折叠不应再改变条数');
+  assertEqual(JSON.stringify(second.items.map((f) => f.title)), JSON.stringify(first.items.map((f) => f.title)), '第二次折叠不应改变内容与顺序');
+  assertEqual(second.folded, 0, '已经折过的不应再折出东西来');
+
+  // 输入顺序颠倒（例如模型返回顺序变了）结果必须一致
+  const reversed = foldSimilarCommitments([...input].reverse());
+  const sortTitles = (r) => r.items.map((f) => f.title).sort().join('|');
+  assertEqual(sortTitles(reversed), sortTitles(first), '折叠结果不应依赖输入顺序');
+
+  // 端到端幂等：同一批模型原始返回扫两遍，规范化的结论完全一致
+  const sources = [{ id: 'd1', subject: '接口对接', sentAt: '2026-10-04T09:00:00Z', to: 'li@client.com', messageId: '<m1@x>' }];
+  const raw = [
+    { idx: 1, title: '安排开发人员（邹佳）对接集团接口并逐项对标必传字段' },
+    { idx: 1, title: '安排开发人员（邹佳）对接集团接口' },
+    { idx: 1, title: '国庆节后启动接口联调并同步具体计划' },
+  ];
+  const now = new Date('2026-10-06T12:00:00Z');
+  const n1 = normalizeCommitments(raw, sources, { now });
+  const n2 = normalizeCommitments(raw, sources, { now });
+  assertEqual(n1.length, 2, `同一件事的两条应在提取阶段就被折成 1 条（实际共 ${n1.length} 条）`);
+  assertEqual(JSON.stringify(n1), JSON.stringify(n2), '重复扫描同一封邮件必须得到完全一致的结果');
+  assertEqual(new Set(n1.map((i) => i.sourceKey)).size, n1.length, '折叠后幂等键仍必须互不相同');
+  assert(n1.some((i) => i.title === '安排开发人员（邹佳）对接集团接口并逐项对标必传字段'), '应保留更长的那条');
+  assert(!n1.some((i) => i.title === '安排开发人员（邹佳）对接集团接口'), '被包含的那条应已消失');
+});
+
+await test('跟催：折叠不弄丢用户状态（完成/稍后/忽略都要保住）', async () => {
+  const { foldSimilarCommitments, mergeFollowUps } = await import('../server/followup.js');
+  const now = new Date('2026-10-06T12:00:00Z');
+  const LONG = '安排开发人员（邹佳）对接集团接口并逐项对标必传字段';
+  const SHORT = '安排开发人员（邹佳）对接集团接口';
+
+  /*
+   * ① 短的那条被用户标记过、长的那条没动过 → 长条留下，但状态必须搬过去。
+   *    否则用户会看到"我明明标过完成，它又变成待办了"。
+   */
+  const doneOnShort = foldSimilarCommitments([
+    { id: 'l', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#l', title: LONG, status: 'open' },
+    { id: 's', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#s', title: SHORT, status: 'done', doneAt: '2026-10-05T01:00:00.000Z', closeReason: '手动标记完成' },
+  ]);
+  assertEqual(doneOnShort.items.length, 1, '应折成 1 条');
+  assertEqual(doneOnShort.items[0].title, LONG, '保留更完整的那条');
+  assertEqual(doneOnShort.items[0].status, 'done', '被折叠条上的"已完成"必须搬到保留条上，不能丢');
+  assertEqual(doneOnShort.items[0].doneAt, '2026-10-05T01:00:00.000Z', '完成时间也要一并保留');
+  assertEqual(doneOnShort.items[0].closeReason, '手动标记完成', '关闭原因要一并保留');
+
+  // ② snoozed 的稍后时间不能被丢
+  const snoozedOnShort = foldSimilarCommitments([
+    { id: 'l', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#l', title: LONG, status: 'open' },
+    { id: 's', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#s', title: SHORT, status: 'snoozed', snoozeUntil: '2026-10-10T01:00:00.000Z' },
+  ]);
+  assertEqual(snoozedOnShort.items[0].status, 'snoozed', '稍后提醒要保住');
+  assertEqual(snoozedOnShort.items[0].snoozeUntil, '2026-10-10T01:00:00.000Z', '稍后时间要保住');
+
+  // ③ 放弃的那条状态更强 → 取更强的那个，绝不把用户的终态降级
+  const rank = foldSimilarCommitments([
+    { id: 'l', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#l', title: LONG, status: 'snoozed', snoozeUntil: '2026-10-10T01:00:00.000Z' },
+    { id: 's', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#s', title: SHORT, status: 'ignored' },
+  ]);
+  assertEqual(rank.items[0].title, LONG, '内容仍然取更完整的那条');
+  assertEqual(rank.items[0].status, 'ignored', '更强的终态（已忽略）要提升到保留条上，不能被 snoozed 盖住');
+
+  // ④ 保留条自己带的 project 标签在折叠后不能丢（时间线要用）
+  const withProject = foldSimilarCommitments([
+    { id: 'l', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#l', title: LONG, status: 'open', project: '集团接口对接' },
+    { id: 's', kind: 'mine', draftId: 'd1', sourceKey: 'draft:d1#s', title: SHORT, status: 'open' },
+  ]);
+  assertEqual(withProject.items[0].project, '集团接口对接', '项目标签不能被折叠弄丢');
+
+  /*
+   * ⑤ 存量数据（扫描前就已经重复落库）也要在合并阶段折掉，且状态不能丢。
+   *    模拟升级前 state.json 里的两条：
+   *      open  的长条（没有用户操作）+ done 的短条（用户点过完成）
+   */
+  const existing = {
+    f_long: { id: 'f_long', kind: 'mine', draftId: 'd1', messageId: '<m1@x>', sourceKey: 'draft:d1#long', title: LONG, status: 'open' },
+    f_short: { id: 'f_short', kind: 'mine', draftId: 'd1', messageId: '<m1@x>', sourceKey: 'draft:d1#short', title: SHORT, status: 'done', doneAt: '2026-10-05T01:00:00.000Z' },
+  };
+  const merged = mergeFollowUps(existing, [], { now });
+  const left = Object.values(merged.map);
+  assertEqual(left.length, 1, `存量重复应在合并阶段被折成 1 条（实际 ${left.length}）`);
+  assertEqual(left[0].title, LONG, '存量折叠也应保留更完整的那条');
+  assertEqual(left[0].status, 'done', '用户在这条上的"已完成"绝不能被弄丢');
+  assertEqual(merged.folded, 1, '应报告折叠了 1 条');
+
+  // ⑥ 折叠后的结果再合并一次必须稳定（幂等）
+  const again = mergeFollowUps(merged.map, [], { now });
+  assertEqual(Object.keys(again.map).length, 1, '再合并一次不应再生变化');
+  assertEqual(again.folded, 0, '已经折过的不应重复计数');
+});
+
 await test('跟催：状态闭环与 store 语义（恢复不删记录、终态保留原因）', async () => {
   const store = await import('../server/store/state.js');
   store.replaceFollowUps({

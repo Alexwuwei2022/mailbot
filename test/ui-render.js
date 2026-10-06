@@ -2928,6 +2928,13 @@ await step('设置页字段统一：长说明收进「?」提示，短说明仍�
     check(allLinked, '每个目录项都应有对应的区块锚点');
     // 点击不该抛错（linkedom 没有 scrollIntoView，代码里做了防御）
     chips[0].dispatchEvent(new window.Event('click', { bubbles: true }));
+
+    // ⑧ 选中的分区标签要加粗高亮，用户才知道"当前在哪一块"
+    check(chips[0].classList.contains('active'), '点击后该分区标签应变为选中态');
+    checkEqual(chips.filter((c) => c.classList.contains('active')).length, 1, '同时只应有一个分区处于选中态');
+
+    // ⑨ 「关于」必须排在最后（用户要求：别夹在配置项中间）
+    checkEqual(titles[titles.length - 1], '关于', '「关于」应是最后一个分区（实际 ' + titles[titles.length - 1] + '）');
   } finally {
     box.remove();
   }
@@ -3118,6 +3125,21 @@ await step('时间线：项目标签切换、四类来源标注、空状态说�
     check(/别人在 Google 日历上直接创建/.test(text), '必须如实说明日程来源的局限');
     check(/重命名 \/ 合并/.test(text), '应有重命名合并入口');
     check(calls.includes('华东区投标'), '应默认加载项目最多的那个（实际 ' + JSON.stringify(calls) + '）');
+
+    /*
+     * 默认倒序（最新在上）：打开某项目时间线时，用户多数想知道"最近进展到哪"。
+     * 断言顺序而不只是断言有按钮，否则改了默认值也测不出来。
+     */
+    {
+      const order = [...container.querySelectorAll('.tl-title')].map((x) => x.textContent);
+      check(order[0] === '等确认保证金', '默认应最新在上（实际首条 ' + order[0] + '）');
+      const btn = [...container.querySelectorAll('button')].find((b) => /最新在上|最早在上/.test(b.textContent));
+      check(!!btn, '应有时间顺序切换按钮');
+      btn.dispatchEvent(new window.Event('click', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 60));
+      const after = [...container.querySelectorAll('.tl-title')].map((x) => x.textContent);
+      check(after[0] === '招标公告', '切换后应变为最早在上（实际首条 ' + after[0] + '）');
+    }
 
     // 切到另一个项目
     const chip = [...container.querySelectorAll('.setup-chip')].find((b) => /官网改版/.test(b.textContent));

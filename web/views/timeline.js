@@ -124,6 +124,15 @@ export function renderTimeline(root, app) {
         ...state.projects.slice(0, 40).map((p) => chip(p.name, p.name, p.count)),
         state.unclassified ? chip('未归类', '', state.unclassified) : null,
       ),
+      /*
+       * 归类规则必须写在界面上，否则用户只看到"分类结果"，不知道该找谁改。
+       */
+      h(
+        'p',
+        { class: 'muted small pad' },
+        '项目归类是**分析邮件时由模型给出的短标签**（2-8 字），同一件事的邮件会归到一起；没给出标签的进「未归类」。' +
+          '标签不合适时用「重命名 / 合并」收拾：填一个已有项目的名字即合并，历史记录会一起改写。',
+      ),
       state.projects.some((p) => (p.aliases || []).length)
         ? h(
             'p',
@@ -151,6 +160,29 @@ export function renderTimeline(root, app) {
       .map(([k, v]) => `${KIND_META[k]?.label || k} ${v}`)
       .join(' · ');
 
+    /*
+     * 默认**倒序**（最新在上）。
+     *
+     * 理由：打开"某个项目的时间线"，绝大多数时候问的是"最近进展到哪了"，
+     * 而不是"从头讲一遍"。倒序让答案在第一屏；要看完整脉络再点正序。
+     * 但顺序本身不该由我替用户定死——所以给了切换（本次会话内记住）。
+     */
+    const newestFirst = state.order !== 'asc';
+    const entries = newestFirst ? [...d.entries].reverse() : d.entries;
+
+    const orderBtn = h(
+      'button',
+      {
+        class: 'btn btn-small',
+        title: '切换时间顺序',
+        onclick: async () => {
+          state.order = newestFirst ? 'asc' : 'desc';
+          paint();
+        },
+      },
+      newestFirst ? '最新在上 ↓' : '最早在上 ↑',
+    );
+
     return h(
       'section',
       { class: 'block' },
@@ -164,7 +196,8 @@ export function renderTimeline(root, app) {
         'div',
         { class: 'pad' },
         d.calendarNote ? h('p', { class: 'muted small' }, `ℹ️ ${d.calendarNote}`) : null,
-        h('div', { class: 'timeline' }, ...d.entries.map(entry)),
+        h('div', { class: 'row-actions mb-2' }, orderBtn),
+        h('div', { class: 'timeline' }, ...entries.map(entry)),
       ),
     );
   }

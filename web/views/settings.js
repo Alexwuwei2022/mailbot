@@ -61,7 +61,7 @@ export function renderSettings(root, app) {
 
   const paint = () => {
     renderInto(container, app, 'settings', paintInner, () => renderSettings(root, app));
-    buildToc(container);
+    organizeSettings(container);
   };
 
   const paintInner = () => {
@@ -257,7 +257,9 @@ export function renderSettings(root, app) {
           h(
             'button',
             {
-              class: 'link-btn',
+              /* 与其它区块内动作（运行自检 / 刷新状态）用同一种按钮样式：
+                 "绿字链接"混在按钮中间会让设置页看起来有三套视觉语言 */
+              class: 'btn btn-small',
               onclick: async () => {
                 try {
                   const r = await api.testLlm();
@@ -287,71 +289,6 @@ export function renderSettings(root, app) {
           field('Temperature', numberInput(cfg.llm.temperature, (v) => (cfg.llm.temperature = v), { min: 0, max: 2, step: 0.1 })),
           field('单批邮件数', numberInput(cfg.llm.classifyBatchSize, (v) => (cfg.llm.classifyBatchSize = v), { min: 1, max: 50 }), '越小越稳，越大越省调用次数'),
           field('失败重试次数', numberInput(cfg.llm.maxRetries, (v) => (cfg.llm.maxRetries = v), { min: 0, max: 8 })),
-        ),
-      ),
-
-      /* ---------------- 服务与安全 ---------------- */
-      h(
-        'section',
-        { class: 'block' },
-        h('div', { class: 'block-head' }, h('h3', { text: '服务与访问控制' })),
-        h(
-          'div',
-          { class: 'form-grid' },
-          field('监听地址', textInput(cfg.web.host, (v) => (cfg.web.host = v)), '默认 127.0.0.1，仅本机可访问'),
-          field('端口', numberInput(cfg.web.port, (v) => (cfg.web.port = v), { min: 1, max: 65535 }), '修改后需重启服务'),
-          field(
-            '访问令牌',
-            passwordInput(cfg.web.authToken, (v) => (cfg.web.authToken = v), { placeholder: '留空表示不校验' }),
-            '填写后，浏览器需一致才可访问 API',
-          ),
-        ),
-        h(
-          'label',
-          { class: 'field' },
-          h('span', { text: '浏览器本地令牌（保存在 localStorage）' }),
-          h('input', {
-            class: 'input',
-            type: 'text',
-            value: state.token,
-            placeholder: '与上面的访问令牌一致',
-            oninput: (ev) => {
-              state.token = ev.target.value;
-              setToken(ev.target.value.trim());
-            },
-          }),
-        ),
-        h(
-          'div',
-          { class: 'danger-zone' },
-          h('div', {}, h('b', { text: '重置本地分析数据' }), h('p', { class: 'muted small', text: '删除 data/state.json 里的分析与草稿记录（原文件会备份），不影响邮箱里的邮件。' })),
-          h(
-            'button',
-            {
-              class: 'btn btn-danger-quiet',
-              onclick: async () => {
-                const ok = await confirmDialog({
-                  title: '重置本地分析数据？',
-                  message: '这只会清空本机的分析与草稿记录，邮件与邮箱草稿箱不受影响。',
-                  confirmText: '确认重置',
-                  danger: true,
-                });
-                if (!ok) return;
-                try {
-                  await fetch('/api/state/reset', {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json', 'x-mailbot-token': getToken() },
-                    body: JSON.stringify({ confirm: true }),
-                  }).then((r) => r.json());
-                  toast('已重置', 'success');
-                  app.refreshCounts?.();
-                } catch (err) {
-                  toastError(err);
-                }
-              },
-            },
-            '重置',
-          ),
         ),
       ),
 
@@ -1034,7 +971,10 @@ export function renderSettings(root, app) {
         h(
           'button',
           {
-            class: 'btn',
+            /* 这一块的主操作（保存 + 立刻验证能不能连上），所以用实心主按钮：
+               与页面级「保存配置」同为实心，次级动作（运行自检 / 刷新状态 / 测试连接）
+               一律描边——全页就只有这两级，不再有"绿字链接"这第三种。 */
+            class: 'btn btn-primary',
             onclick: async () => {
               state.activeInstance = inst.id;
               await save();
@@ -1454,6 +1394,43 @@ function securityPanel() {
       ),
       h('button', { class: 'btn', disabled: state.securityBusy, onclick: loadSecurity }, '刷新状态'),
     ),
+    /*
+     * 「重置本地分析数据」原来在「服务与访问控制」块里，两块合并时不能把它弄丢——
+     * 这是不可逆操作，界面上少一个入口，用户就只能去翻文档。
+     */
+    h(
+      'div',
+      { class: 'danger-zone mt-3' },
+      h(
+        'div',
+        {},
+        h('b', { text: '重置本地分析数据' }),
+        h('p', { class: 'muted small', text: '删除 data/state.json 里的分析与草稿记录（原文件会备份），不影响邮箱里的邮件。' }),
+      ),
+      h(
+        'button',
+        {
+          class: 'btn btn-danger-quiet',
+          onclick: async () => {
+            const ok = await confirmDialog({
+              title: '重置本地分析数据？',
+              message: '这只会清空本机的分析与草稿记录，邮件与邮箱草稿箱不受影响。',
+              confirmText: '确认重置',
+              danger: true,
+            });
+            if (!ok) return;
+            try {
+              await api.resetState();
+              toast('已重置', 'success');
+              app.refreshCounts?.();
+            } catch (err) {
+              toastError(err);
+            }
+          },
+        },
+        '重置',
+      ),
+    ),
     h('p', { class: 'muted small mt-2' }, '改动监听地址与 HTTPS 需要**重启服务**才生效（会话策略与令牌立即生效）。'),
   );
 }
@@ -1516,6 +1493,10 @@ async function saveSecurity(btn) {
     await api.saveConfig({
       web: {
         host: web.host,
+        /* 端口与访问令牌也在这一块里改，必须一起提交——
+           否则用户改完点「保存」什么都不会发生（漏提交比报错更难发现） */
+        port: web.port,
+        authToken: web.authToken,
         allowedHosts: web.allowedHosts || [],
         sessionIdleHours: web.sessionIdleHours,
         sessionAbsoluteDays: web.sessionAbsoluteDays,
@@ -1641,20 +1622,61 @@ function field(label, control, hint) {
 }
 
 /**
- * 分区目录：按**实际渲染出来的区块**生成，而不是硬编码一份清单。
+ * 设置页的**阅读顺序**（按配置时的思考顺序排，而不是按开发时的添加顺序）。
  *
- * 这样做的理由很实在：设置页有十来个区块，硬编码的目录一旦和页面不同步
- * （改标题、加区块、按条件隐藏），用户点了却滚到别处——比没有目录更糟。
- * 扫描 DOM 生成的目录永远和页面一致。
+ * 为什么用"渲染后再排序"而不是把 JSX 搬来搬去：这个文件两千多行，
+ * 手工搬动大段 JSX 出错风险高、diff 也没法评审。这里用一份标题顺序表，
+ * 渲染完把区块**实际移动**到对应位置——DOM 顺序真的变了（Tab 顺序、读屏顺序都跟着），
+ * 不是 CSS 的视觉障眼法。表里没有的区块保持原有相对顺序、放在末尾。
  *
- * 区块少于 4 个时不出目录：那种规模下目录本身才是噪音。
+ * 「关于」放最后：它是最少被打开的一块，不该夹在配置项中间（用户原话）。
  */
-function buildToc(container) {
-  container.querySelector('.settings-toc')?.remove();
+const SETTINGS_ORDER = [
+  '邮箱账户',
+  '分析与起草策略',
+  '大模型',
+  '日历数字人',
+  '定时分析与通知',
+  '服务与访问控制',
+  '访问与安全',
+  '数据去向',
+  '密钥存储',
+  '备份与恢复',
+  '存储与清理',
+  '外观',
+  '关于',
+];
 
+/**
+ * 分区目录 + 区块顺序。
+ *
+ * 目录按**实际渲染出来的区块**生成，而不是硬编码一份清单：
+ * 硬编码的目录一旦和页面不同步（改标题、加区块、条件隐藏），
+ * 用户点了滚到别处——那比没有目录更糟。
+ */
+function organizeSettings(container) {
   const blocks = [...container.querySelectorAll('section.block')];
+  if (!blocks.length) return;
+
+  // ① 按 SETTINGS_ORDER 重排（用前缀匹配，标题带括号或补充说明也能对上）
+  const rank = (block) => {
+    const title = block.querySelector('.block-head h3')?.textContent?.trim() || '';
+    const index = SETTINGS_ORDER.findIndex((name) => title.startsWith(name));
+    return index === -1 ? SETTINGS_ORDER.length : index;
+  };
+  const sorted = blocks
+    .map((block, index) => ({ block, index, rank: rank(block) }))
+    // 同名的（或都不在表里的）保持原有相对顺序
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map((item) => item.block);
+
+  const parent = blocks[0].parentElement;
+  for (const block of sorted) parent.append(block);
+
+  // ② 重排后再生成目录（顺序才会与页面一致）
+  container.querySelector('.settings-toc')?.remove();
   const items = [];
-  blocks.forEach((block, index) => {
+  sorted.forEach((block, index) => {
     const title = block.querySelector('.block-head h3')?.textContent?.trim();
     if (!title) return;
     const id = `settings-sec-${index}`;
@@ -1669,14 +1691,25 @@ function buildToc(container) {
       {
         class: 'toc-chip',
         type: 'button',
+        dataset: { target: it.id },
         onclick: () => {
           // scrollIntoView 在测试环境（linkedom）里不存在，缺了也不该让点击炸掉
           container.querySelector(`#${it.id}`)?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+          setActive(it.id);
         },
       },
       it.title,
     ),
   );
+
+  /** 选中态：加粗 + 高亮，让用户知道"当前在哪一块"。 */
+  function setActive(id) {
+    for (const chip of chips) {
+      const on = chip.dataset.target === id;
+      chip.classList.toggle('active', on);
+      chip.setAttribute('aria-current', on ? 'true' : 'false');
+    }
+  }
 
   const nav = h(
     'nav',
@@ -1688,6 +1721,26 @@ function buildToc(container) {
   const head = container.querySelector('.page-head');
   if (head && head.nextSibling) container.insertBefore(nav, head.nextSibling);
   else container.append(nav);
+
+  /*
+   * 滚动时同步高亮：否则用户手动滚到别的区块，目录还highlight着上一个，
+   * 那比不高亮更误导。取"最后一个已经滚过顶部偏移的区块"。
+   */
+  const offset = 130;
+  const syncActive = () => {
+    let current = items[0];
+    for (const it of items) {
+      const el = container.querySelector(`#${it.id}`);
+      if (el && el.getBoundingClientRect().top <= offset) current = it;
+    }
+    setActive(current.id);
+  };
+  setActive(items[0].id);
+  // 先摘掉上一次渲染挂的监听，避免每次重绘都累积一个
+  if (container._tocScroll) window.removeEventListener('scroll', container._tocScroll);
+  container._tocScroll = syncActive;
+  window.addEventListener('scroll', syncActive, { passive: true });
+  syncActive();
 }
 
 /**

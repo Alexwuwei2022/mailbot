@@ -1138,9 +1138,17 @@ body {
 }
 
 .tag-warn {
-  color: var(--warn, #b26a00);
-  border-color: color-mix(in srgb, var(--warn, #b26a00) 45%, transparent);
-  background: color-mix(in srgb, var(--warn, #b26a00) 10%, transparent);
+  /* 「风险」这类标签用红色：它说的是"要你处理"，不是"顺带一提" */
+  color: var(--danger, #e5534b);
+  border-color: color-mix(in srgb, var(--danger, #e5534b) 45%, transparent);
+  background: color-mix(in srgb, var(--danger, #e5534b) 10%, transparent);
+}
+
+/* 已经出错（而不只是有风险）：底色加重，一眼能从一排标签里挑出来 */
+.tag-error {
+  color: #fff;
+  border-color: var(--danger, #e5534b);
+  background: var(--danger, #e5534b);
 }
 
 .input-inline {
@@ -1913,6 +1921,13 @@ body {
 .toc-chip:hover {
   background: var(--surface-2);
   color: var(--text);
+}
+
+/* 选中分区：加粗 + 高亮，让用户知道当前在哪一块 */
+.toc-chip.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 650;
 }
 
 /* 滚到区块时留出顶栏 + 目录的高度，否则标题会被它们盖住 */
@@ -3442,7 +3457,23 @@ section.block {
 
 .stat-grid-tight {
   grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  margin: 14px 16px 12px;
+  /* 与下方区块**同宽对齐**：原先左右各留 16px，比区块窄一圈，看着就是没对齐。
+     卡片自身有 16px 内边距，所以文字仍然与区块标题左对齐。 */
+  margin: 14px 0 12px;
+}
+
+.stat-card-clickable {
+  cursor: pointer;
+  transition: border-color 0.15s, transform 0.15s;
+}
+
+.stat-card-clickable:hover {
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  transform: translateY(-1px);
+}
+
+.stat-card-clickable:active {
+  transform: translateY(0);
 }
 
 .stat-grid-tight .stat-value {

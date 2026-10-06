@@ -94,8 +94,9 @@ export function renderFollowUps(root, app) {
       h(
         'div',
         { class: 'stat-grid stat-grid-tight' },
-        statCard('我承诺的', mine.length, `${state.summary?.mine || 0} 条未完成`),
-        statCard('等对方回复', waiting.length, `${state.summary?.waiting || 0} 条未回复`),
+        statCard('我承诺的', mine.length, `${state.summary?.mine || 0} 条未完成`, 'followup-mine'),
+        statCard('等对方回复', waiting.length, `${state.summary?.waiting || 0} 条未回复`, 'followup-waiting'),
+        /* 「已超期」跨两个分组，所以不指向某一块，只作提示 */
         statCard('已超期', state.summary?.overdue || 0, '有截止时间且已过期'),
       ),
 
@@ -119,8 +120,8 @@ export function renderFollowUps(root, app) {
           )
         : null,
 
-      mine.length ? group('我承诺的', mine, '这些是我在邮件里答应要做的事（截止时间来自我当时写的话）') : null,
-      waiting.length ? group('等对方回复', waiting, '这些是我发出去的、对方还没回的邮件') : null,
+      mine.length ? group('我承诺的', mine, '这些是我在邮件里答应要做的事（截止时间来自我当时写的话）', 'followup-mine') : null,
+      waiting.length ? group('等对方回复', waiting, '这些是我发出去的、对方还没回的邮件', 'followup-waiting') : null,
 
       closed.length
         ? h(
@@ -148,20 +149,41 @@ export function renderFollowUps(root, app) {
     );
   }
 
-  function statCard(label, value, hint) {
-    return h(
+  /**
+   * 统计卡。
+   *
+   * 数字可点击：滚动到对应分组。理由很直接——用户看到"我承诺的 14"，
+   * 下一件事一定是"哪 14 条"。让这个动作只需一次点击，而不是自己去下面找。
+   * "已超期"是跨分组的筛选口径，所以它不指向某个分组，只作提示。
+   */
+  function statCard(label, value, hint, targetId) {
+    const card = h(
       'div',
-      { class: 'stat-card' },
+      { class: `stat-card${targetId ? ' stat-card-clickable' : ''}` },
       h('div', { class: 'stat-label', text: label }),
       h('div', { class: 'stat-value', text: String(value) }),
       h('div', { class: 'stat-hint', text: hint }),
     );
+    if (targetId) {
+      card.setAttribute('role', 'button');
+      card.setAttribute('tabindex', '0');
+      card.setAttribute('title', '点击跳到下面的列表');
+      const jump = () => document.getElementById(targetId)?.scrollIntoView?.({ behavior: 'smooth', block: 'start' });
+      card.onclick = jump;
+      card.onkeydown = (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') {
+          ev.preventDefault();
+          jump();
+        }
+      };
+    }
+    return card;
   }
 
-  function group(title, items, hint) {
+  function group(title, items, hint, id) {
     return h(
       'section',
-      { class: 'block' },
+      { class: 'block', id },
       h('div', { class: 'block-head' }, h('h3', { text: `${title}（${items.length}）` }), h('span', { class: 'muted small', text: hint })),
       h('div', { class: 'pad' }, ...items.map(row)),
     );
