@@ -3265,6 +3265,85 @@ await test('HTTP：手工归类（归到项目 / 移出 / 拒绝坏名字 / 不�
   }
 });
 
+await test('HTTP：批量重新归类（没配模型就明确拒绝、失败不写数据、应用才落库）', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  const { resetSessions } = await import('../server/lib/session.js');
+  const store = await import('../server/store/state.js');
+  resetThrottle();
+  resetSessions();
+  const saved = {
+    analyses: JSON.parse(JSON.stringify(store.getState().analyses)),
+    projects: JSON.parse(JSON.stringify(store.getProjectRegistry())),
+    llm: JSON.parse(JSON.stringify(getConfig().llm || {})),
+  };
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  const post = (body) =>
+    fetch(`${url}/api/projects/reclassify`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  try {
+    store.upsertAnalyses([
+      { folder: 'INBOX', uid: 9201, project: '', mail: { date: '2026-10-02T09:00:00Z', subject: '未归类甲', from: { address: 'a@x.com' } }, summary: '摘要' },
+      { folder: 'INBOX', uid: 9202, project: '', mail: { date: '2026-10-02T10:00:00Z', subject: '未归类乙', from: { address: 'b@x.com' } }, summary: '摘要' },
+    ]);
+    store.persistState();
+
+    /*
+     * ① 没有可用的模型时必须**明确拒绝**，而不是降级成"模型没有建议"。
+     * 这里把 Key 与 baseUrl 都清成非回环且无 Key 的状态模拟"没配"。
+     */
+    getConfig().llm.apiKey = '';
+    getConfig().llm.baseUrl = 'https://api.deepseek.com';
+    const denied = await post({});
+    assertEqual(denied.status, 400, '没配模型应明确 400，而不是静默降级');
+    const deniedBody = await denied.json();
+    assertEqual(deniedBody.code, 'LLM_NOT_CONFIGURED', '错误码应能区分"没配模型"');
+    assertEqual(store.getAnalysis('INBOX', 9201).project, '', '失败时不得写入任何数据');
+
+    /* ② 应用阶段（不需要模型）：勾选的才写，并标记为手工确认 */
+    const applied = await (
+      await post({ apply: [{ folder: 'INBOX', uid: 9201, project: '批量测试项目' }] })
+    ).json();
+    assertEqual(applied.ok, true, '应用应成功');
+    assertEqual(applied.applied, 1, '应报告写入了 1 条');
+    assertEqual(store.getAnalysis('INBOX', 9201).project, '批量测试项目', '标签应写入');
+    assertEqual(store.getAnalysis('INBOX', 9201).projectSource, 'manual', '用户确认过的归类应标记为手工');
+    assertEqual(store.getAnalysis('INBOX', 9202).project, '', '没勾选的不该被改动');
+
+    /* ③ 坏名字逐条跳过并报明原因，而不是静默丢弃 */
+    const mixed = await (
+      await post({
+        apply: [
+          { folder: 'INBOX', uid: 9202, project: '邮件' },
+          { folder: 'INBOX', uid: 999999, project: '某项目' },
+          { folder: 'INBOX', uid: 9202, project: '正常项目' },
+        ],
+      })
+    ).json();
+    assertEqual(mixed.applied, 1, '只有合法的那条应被写入');
+    assertEqual(mixed.skipped.length, 2, '两条应被跳过');
+    assert(mixed.skipped.every((s) => s.reason), '每条跳过都要给出原因');
+    assertEqual(store.getAnalysis('INBOX', 9202).project, '正常项目', '合法的那条应写入');
+
+    /* ④ 跨源必须被拒 */
+    const evil = await fetch(`${url}/api/projects/reclassify`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example.com' },
+      body: JSON.stringify({ apply: [{ folder: 'INBOX', uid: 9201, project: 'x项目' }] }),
+    });
+    assertEqual(evil.status, 403, '跨源批量改写应被拒绝');
+  } finally {
+    store.getState().analyses = saved.analyses;
+    store.replaceProjects(saved.projects);
+    Object.assign(getConfig().llm, saved.llm);
+    store.persistState();
+    await new Promise((r) => server.close(r));
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await google.close();

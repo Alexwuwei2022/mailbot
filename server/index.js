@@ -1066,8 +1066,25 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     }
 
     /* ---------- 预览：只返回建议，不写任何数据 ---------- */
-    if (!cfgNow.llm?.apiKey && !cfgNow.llm?.baseUrl) {
-      throw new AppError('还没有配置大模型：批量归类需要模型给出标签', { code: 'LLM_NOT_CONFIGURED', status: 400 });
+    /*
+     * 判断"到底配没配模型"：不能只看 baseUrl——它有默认值（公网地址），
+     * 于是没填 API Key 也会一路调下去，然后静默降级成"没有建议"，
+     * 用户看到的是"模型没给建议"，而真实原因是**根本没配 Key**。
+     * 本机模型（Ollama 之类）不需要 Key，所以回环地址也算已配置。
+     */
+    const hasKey = !!String(cfgNow.llm?.apiKey || '').trim();
+    let isLocalModel = false;
+    try {
+      const { isLoopbackHost } = await import('./lib/privacy.js');
+      isLocalModel = isLoopbackHost(new URL(cfgNow.llm?.baseUrl || 'http://127.0.0.1').hostname);
+    } catch {
+      isLocalModel = false;
+    }
+    if (!hasKey && !isLocalModel) {
+      throw new AppError('还没有配置大模型 API Key：批量归类需要模型给出标签（本机模型如 Ollama 可省略 Key）', {
+        code: 'LLM_NOT_CONFIGURED',
+        status: 400,
+      });
     }
     const limit = Math.min(Math.max(Number(body.limit) || 40, 1), 80);
     const all = store.listAnalyses({ limit: 5000 });
@@ -1100,11 +1117,34 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       body: a.summary || '',
     }));
 
+    /*
+     * classifyMails 在单批失败时会**降级**成兜底结果（保证自动分析不中断），
+     * 但这在"用户主动花钱归类"的场景里是错的：降级结果没有标签，
+     * 用户会以为"模型觉得这些邮件都不属于任何项目"。
+     * 所以这里统计失败批次：全失败就直接报错，不把降级当结论。
+     */
+    let failedBatches = 0;
+    let totalBatches = 0;
     let results = [];
     try {
-      results = await classifyMails({ mails, client, config: cfgNow, knownProjects });
+      results = await classifyMails({
+        mails,
+        client,
+        config: cfgNow,
+        knownProjects,
+        onProgress: ({ total, failed }) => {
+          totalBatches = total || totalBatches;
+          if (failed) failedBatches += 1;
+        },
+      });
     } catch (err) {
       throw new AppError(`批量归类失败：${err?.message || err}`, { code: 'RECLASSIFY_FAILED', status: 502 });
+    }
+    if (totalBatches > 0 && failedBatches >= totalBatches) {
+      throw new AppError('大模型调用全部失败（请检查 API Key、网络与 Base URL）：本次没有产生任何建议，也没有写入任何数据', {
+        code: 'RECLASSIFY_LLM_FAILED',
+        status: 502,
+      });
     }
     /*
      * 结果与输入**必须一一对应**：数量对不上就当作失败，而不是猜着对应。
