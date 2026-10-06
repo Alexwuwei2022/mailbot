@@ -392,7 +392,13 @@ export function renderTimeline(root, app) {
         { class: 'reclassify-row' },
         h('input', { type: 'checkbox', checked: true, dataset: { key: `${s.folder}:${s.uid}` } }),
         h('span', { class: 'reclassify-subject', text: s.subject }),
-        h('span', { class: 'tag', text: s.suggested }),
+        /*
+         * 把"实际会写成什么"摆出来：与已有项目近似的建议会被并过去，
+         * 用户应当在确认之前就看到，而不是写完之后发现标签变了样。
+         */
+        s.mergedInto
+          ? h('span', { class: 'tag tag-ok', text: `${s.suggested}（并入已有）` })
+          : h('span', { class: 'tag', text: s.suggested }),
       ),
     );
     const apply = await confirmDialog({
@@ -401,6 +407,7 @@ export function renderTimeline(root, app) {
         'div',
         {},
         h('p', { class: 'muted small' }, `看了 ${preview.scanned} 封，给出 ${preview.suggestions.length} 条建议；不需要的取消勾选。`),
+        preview.warning ? h('p', { class: 'error small' }, `⚠️ ${preview.warning}`) : null,
         h('div', { class: 'reclassify-list' }, ...boxes),
         preview.remaining ? h('p', { class: 'muted small', text: `还有 ${preview.remaining} 封没看，可以再来一次。` }) : null,
       ),

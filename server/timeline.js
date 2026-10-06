@@ -243,3 +243,65 @@ export function mergeProjects({ from, to, analyses = [], drafts = [], followUps 
 
   return { moved: { analyses: aCount, drafts: dCount, followUps: fCount }, nextAnalyses, nextDrafts, nextFollowUps, registry: nextRegistry };
 }
+
+
+/* ------------------------------------------------------------ 近似标签合并 */
+
+/** 归一化：全角转半角、去空白与标点、转小写（只用于比较，不改原样显示的名字）。 */
+function labelKey(name) {
+  return String(name || '')
+    .replace(/[\uFF01-\uFF5E]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .toLowerCase()
+    .replace(/[\s·・,，.。:：;；\-—_/\\|()（）[\]【】"'`]+/g, '');
+}
+
+/** 字符二元组集合（中文没有词边界，二元组是最稳的近似度量）。 */
+function bigrams(text) {
+  const out = new Set();
+  for (let i = 0; i < text.length - 1; i += 1) out.add(text.slice(i, i + 2));
+  return out;
+}
+
+/** Dice 相似度（0-1）。 */
+export function labelSimilarity(a, b) {
+  const x = labelKey(a);
+  const y = labelKey(b);
+  if (!x || !y) return 0;
+  if (x === y) return 1;
+  const A = bigrams(x);
+  const B = bigrams(y);
+  let hit = 0;
+  for (const g of A) if (B.has(g)) hit += 1;
+  return (2 * hit) / (A.size + B.size);
+}
+
+/**
+ * 把一个新标签**并到已有的近似标签**上，并回已有的那个名字。
+ *
+ * 为什么需要：模型对同一批邮件是**并行分批**分类的，各批看不到彼此刚发明的标签，
+ * 于是会分别给出「综调每日告警」「综调每日问题告警」这种近义标签；
+ * 而只查重名是拦不住的（名字确实不同）。结果是时间线又被碎片化——
+ * 这正是"重命名/合并"想解决的问题，但它本该在**写入前**就自动收敛一次。
+ *
+ * 阈值取 0.6：真实数据里「综调每日告警 vs 综调每日问题告警」约 0.67、
+ * 「IT需求流程综调重构 vs IT需求流程重构」更高；而「综调告警 vs 综调微服务」约 0.29、
+ * 「9月工单结算 vs 9月作业计划」约 0.2。0.6 能抓住前者、放过后者。
+ * 太短的标签（<3 字）不参与，否则「周报」会和「日报」互相吞。
+ */
+export function mergeSimilarLabel(name, existingNames = [], { threshold = 0.6, minLen = 3 } = {}) {
+  const raw = String(name || '').trim();
+  if (!raw) return { name: '', mergedInto: '' };
+  if (labelKey(raw).length < minLen) return { name: raw, mergedInto: '' };
+  let best = null;
+  let bestScore = 0;
+  for (const existing of existingNames) {
+    if (!existing || labelKey(existing).length < minLen) continue;
+    const score = labelSimilarity(raw, existing);
+    if (score > bestScore) {
+      bestScore = score;
+      best = existing;
+    }
+  }
+  if (best && bestScore >= threshold) return { name: best, mergedInto: best };
+  return { name: raw, mergedInto: '' };
+}

@@ -1023,7 +1023,9 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     if (Array.isArray(body.apply)) {
       const { tidyProject } = await import('./ai/analyze.js');
       const registry = { ...store.getProjectRegistry() };
+      const { mergeSimilarLabel } = await import('./timeline.js');
       let applied = 0;
+      let mergedCount = 0;
       const skipped = [];
       for (const item of body.apply) {
         const folder = String(item?.folder || '').trim();
@@ -1037,11 +1039,24 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
           skipped.push({ folder, uid, reason: '没有分析记录' });
           continue;
         }
-        const project = tidyProject(raw);
-        if (!project) {
+        const tidy = tidyProject(raw);
+        if (!tidy) {
           skipped.push({ folder, uid, reason: '项目名不合适（过短、过长或过于笼统）' });
           continue;
         }
+        /*
+         * 写入前做一次**本地近似合并**：模型是并行分批分类的，各批看不到彼此刚发明的
+         * 标签，于是会给出「综调每日告警」「综调每日问题告警」这类近义名；只查重名拦不住。
+         * 已有的名字优先——让时间线向已有标签收敛，而不是每跑一次多几个碎片。
+         */
+        const picked = mergeSimilarLabel(
+          tidy,
+          Object.values(registry)
+            .map((r) => r?.name)
+            .filter(Boolean),
+        );
+        const project = picked.name;
+        if (picked.mergedInto) mergedCount += 1;
         store.upsertAnalyses([{ folder, uid, project, projectSource: 'manual' }]);
         const key = projectKey(project);
         if (!Object.values(registry).some((r) => projectKey(r?.name) === key)) {
@@ -1060,8 +1075,11 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       return sendJson(res, 200, {
         ok: true,
         applied,
+        merged: mergedCount,
         skipped,
-        message: applied ? `已归类 ${applied} 封${skipped.length ? `，跳过 ${skipped.length} 封` : ''}` : '没有可写入的归类',
+        message: applied
+          ? `已归类 ${applied} 封${mergedCount ? `（其中 ${mergedCount} 条并入了已有项目）` : ''}${skipped.length ? `，跳过 ${skipped.length} 封` : ''}`
+          : '没有可写入的归类',
       });
     }
 
@@ -1091,7 +1109,7 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     const unclassified = all.filter((a) => !a.project);
     const batch = unclassified.slice(0, limit);
 
-    const [{ classifyMails }, { LlmClient }, { listProjects: listP }] = await Promise.all([
+    const [{ classifyMails }, { LlmClient }, { listProjects: listP, mergeSimilarLabel }] = await Promise.all([
       import('./ai/analyze.js'),
       import('./llm/client.js'),
       import('./timeline.js'),
@@ -1174,9 +1192,30 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       });
     });
 
+    /*
+     * 把"实际会写成什么"提前算出来给用户看：与已有项目近似的建议会被并过去，
+     * 用户应当在**确认之前**就知道，而不是写完之后发现标签变了。
+     */
+    const seen = [...knownProjects];
+    for (const s of suggestions) {
+      const picked = mergeSimilarLabel(s.suggested, seen);
+      s.suggestedRaw = s.suggested;
+      s.suggested = picked.name;
+      s.mergedInto = picked.mergedInto;
+      if (!seen.includes(picked.name)) seen.push(picked.name);
+    }
+
     return sendJson(res, 200, {
       ok: true,
       preview: true,
+      /*
+       * 如实报告失败的批次：classifyMails 失败时会降级成空标签，
+       * 若不区分，用户会把"调用失败"读成"模型认为这些邮件没有项目"。
+       */
+      failedBatches,
+      warning: failedBatches
+        ? `有 ${failedBatches} 批调用失败：这些邮件这次没给出建议，不代表它们没有项目归属`
+        : '',
       unclassifiedTotal: unclassified.length,
       scanned: mails.length,
       remaining: Math.max(unclassified.length - mails.length, 0),

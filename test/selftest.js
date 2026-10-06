@@ -3649,6 +3649,36 @@ await test('HTML：extractHtmlBody 能取出富文本，且不进分析记录（
   assertEqual(parsed.bodyFormat, 'text', '有纯文本时应记为 text');
 });
 
+/* -------------------------------------------------- 26. 近似项目标签的本地合并 */
+
+await test('项目标签：近义标签本地合并（模型并行分批各造名字时收敛）', async () => {
+  const { mergeSimilarLabel, labelSimilarity } = await import('../server/timeline.js');
+
+  // 用户真实遇到的碎片：同一类邮件被并行分批各造了一个名字
+  const merged = mergeSimilarLabel('综调每日告警', ['综调每日问题告警']);
+  assertEqual(merged.name, '综调每日问题告警', '近义标签应并到**已有**的名字上（向已有标签收敛）');
+  assertEqual(merged.mergedInto, '综调每日问题告警', '应报告并入了哪个');
+  assertEqual(mergeSimilarLabel('IT需求流程综调重构', ['IT需求流程重构']).mergedInto, 'IT需求流程重构', '插入词也应能识别');
+
+  // 反例：确实不是一回事，不能合并
+  for (const [a, b] of [
+    ['综调告警', '综调微服务'],
+    ['9月工单结算', '9月作业计划'],
+    ['权限登录', '综调告警'],
+    ['报表导出', '综调告警'],
+  ]) {
+    assertEqual(mergeSimilarLabel(a, [b]).mergedInto, '', `「${a}」与「${b}」不该被合并（相似度 ${labelSimilarity(a, b).toFixed(2)}）`);
+  }
+
+  // 短标签不参与合并：否则「周报」会和「日报」互相吞
+  assertEqual(mergeSimilarLabel('周报', ['日报']).mergedInto, '', '过短的标签不参与近似合并');
+
+  // 归一化：全角/大小写/标点差异应视为同一个
+  assertEqual(mergeSimilarLabel('ＩＴ需求流程重构', ['it需求流程重构']).mergedInto, 'it需求流程重构', '全角与大小写差异应视为同一个');
+  assertEqual(mergeSimilarLabel('', ['任意']).name, '', '空标签原样返回');
+  assertEqual(mergeSimilarLabel('新项目名', []).name, '新项目名', '没有已有标签时保留原名');
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await imap.close();
