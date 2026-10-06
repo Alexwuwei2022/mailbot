@@ -1349,7 +1349,7 @@ function securityPanel() {
       { class: 'form-row' },
       field(
         '监听地址',
-        selectInput(
+        selectChoice(
           [
             { value: '127.0.0.1', label: '仅本机（推荐）' },
             { value: '0.0.0.0', label: '所有网卡（局域网可访问）' },
@@ -1525,7 +1525,14 @@ function textInput(value, oninput) {
   return h('input', { class: 'input', type: 'text', value: value ?? '', oninput: (e) => oninput(e.target.value) });
 }
 
-function selectInput(options, value, onchange) {
+/**
+ * 下拉框（选项数组在前）。
+ *
+ * 特意**不叫** selectInput：那个名字在本文件里已被页面原有的同名函数占用
+ * （签名是 value/onChange/options），一旦重名就会覆盖它，导致所有旧调用把字符串
+ * 当数组传 → options.map is not a function，整页崩掉。这个坑我踩过。
+ */
+function selectChoice(options, value, onchange) {
   return h(
     'select',
     { class: 'input', onchange: (e) => onchange(e.target.value) },
