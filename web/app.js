@@ -426,9 +426,16 @@ const app = {
  *
  * 净化只在**渲染的那一刻**做一次；切回纯文本不重新解析。
  */
-function makeBodyBlock(bodyInfo, plainBlock) {
-  const html = typeof bodyInfo?.html === 'string' ? bodyInfo.html : '';
-  if (!html.trim()) return plainBlock;
+/** 导出仅供测试：验证「渲染 HTML」入口的显示条件与按需获取行为。 */
+export function makeBodyBlock(bodyInfo, plainBlock, loadHtml) {
+  let html = typeof bodyInfo?.html === 'string' ? bodyInfo.html : '';
+  /*
+   * 服务端只给 hasHtml 这个**布尔标记**，不直接给正文（需求 F22.9：按需提供）。
+   * 因此"这封邮件有没有 HTML"与"HTML 拿到了没"是两件事：
+   * 前者决定按钮显不显示，后者在用户真的点下去时才补齐。
+   */
+  const canRender = !!html.trim() || bodyInfo?.hasHtml === true;
+  if (!canRender) return plainBlock;
 
   const content = h('div', {}, plainBlock);
   let mode = 'text';
@@ -461,9 +468,32 @@ function makeBodyBlock(bodyInfo, plainBlock) {
     }
   }
 
-  function switchTo(next) {
+  async function switchTo(next) {
     mode = next;
     if (next === 'html') {
+      if (!html && typeof loadHtml === 'function') {
+        htmlBtn.disabled = true;
+        htmlBtn.textContent = '获取中…';
+        try {
+          html = (await loadHtml()) || '';
+        } catch {
+          html = '';
+        }
+        htmlBtn.disabled = false;
+        htmlBtn.textContent = '渲染 HTML';
+      }
+      if (!html) {
+        /*
+         * 取不到就老实说，并把视图留在纯文本——
+         * 不要给出一个"渲染了但空白"的状态，那会让人以为邮件本身是空的。
+         */
+        mode = 'text';
+        content.replaceChildren(plainBlock);
+        lastBlocked = 0;
+        paintButtons();
+        toast('取不到这封邮件的 HTML 正文，只能看纯文本', 'error');
+        return;
+      }
       const result = renderMailHtml(content, html, { allowRemoteImages: false });
       lastBlocked = result.blockedImages;
     } else {
@@ -652,7 +682,9 @@ function showMailModal(detail, fallback, app, initialTab = 'analysis') {
      *      所以渲染后若拦下了图片，明确告诉用户拦了几张，由他决定要不要加载。
      */
     const plainBlock = h('pre', { class: 'mail-body-text', text: bodyInfo.text || '（正文为空）' });
-    const textBlock = makeBodyBlock(bodyInfo, plainBlock);
+    const textBlock = makeBodyBlock(bodyInfo, plainBlock, () =>
+      api.mailDetail(mail.folder, mail.uid, { withHtml: true }).then((d) => d?.body?.html || ''),
+    );
     const quotedBlock = bodyInfo.quoted
       ? h(
           'details',

@@ -59,6 +59,12 @@ export async function parseMessage(source) {
     headers: headersToObject(parsed.headers),
     body,
     bodyFormat: text ? 'text' : html ? 'html' : 'empty',
+    /*
+     * 只给一个布尔标记，**不把 HTML 正文塞进返回值**：这个结果会被写进分析记录，
+     * 而 HTML 动辄几十 KB。客户端据此决定要不要显示「渲染 HTML」按钮，
+     * 真正取正文走 extractHtmlBody()。
+     */
+    hasHtml: !!html.trim(),
     attachments: (parsed.attachments || []).map((a) => ({
       filename: a.filename || null,
       contentType: a.contentType || null,

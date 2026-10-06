@@ -2836,6 +2836,61 @@ await step('跟催：我承诺的 / 等对方回复 两栏，状态按钮与超�
   }
 });
 
+await step('HTML 入口：有 HTML 时才给「渲染 HTML」，且正文是点下去才按需取的', async () => {
+  const { makeBodyBlock } = await import('../web/app.js');
+  const { h } = await import('../web/dom.js');
+  if (globalThis.window?.document) globalThis.document = globalThis.window.document;
+
+  // ① 没有 HTML 的邮件：不该出现「渲染 HTML」按钮（否则用户点了没反应）
+  const plainOnly = makeBodyBlock({ text: '纯文本正文', hasHtml: false, html: '' }, h('pre', { text: '纯文本正文' }), null);
+  check(plainOnly.tagName === 'PRE', '没有 HTML 时应直接给出纯文本块');
+  check(!/渲染 HTML/.test(plainOnly.textContent || ''), '没有 HTML 时不该显示渲染按钮');
+
+  // ② 有 HTML（但正文还没取）：必须显示按钮，且此时**不能**已经去取过
+  let loadCalls = 0;
+  const html = '<p>富文本</p><img src="https://tracker.test/p.gif"><script>alert(1)</script>';
+  const block = makeBodyBlock(
+    { text: '纯文本正文', hasHtml: true, html: '' },
+    h('pre', { text: '纯文本正文' }),
+    () => {
+      loadCalls += 1;
+      return Promise.resolve(html);
+    },
+  );
+  check(/渲染 HTML/.test(block.textContent || ''), '有 HTML 时必须显示「渲染 HTML」入口');
+  check(loadCalls === 0, '打开详情时不该已经去取 HTML（要按需）');
+  check(/纯文本正文/.test(block.textContent || ''), '默认应显示纯文本');
+
+  // ③ 点按钮：才去取，并且渲染的是**净化后**的内容
+  const btn = [...block.querySelectorAll('button')].find((b) => /渲染 HTML/.test(b.textContent));
+  btn.dispatchEvent(new window.Event('click', { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 60));
+  check(loadCalls === 1, '点一次应只取一次（实际 ' + loadCalls + '）');
+  const rendered = block.innerHTML;
+  check(/富文本/.test(rendered), '应渲染出 HTML 内容');
+  check(!/<script/i.test(rendered), '渲染的内容必须已净化（不得出现 script）');
+  check(/已拦 1 张/.test(block.textContent || ''), '应告诉用户拦下了几张远程图片（实际正文：' + (block.textContent || '').slice(0, 60) + '）');
+  /*
+   * 用 DOM 精确检查，而不是正则：data-blocked-src="https://…" 里**包含**
+   * src="https://… 这个子串，正则会把正确行为判成失败（同一个坑我踩过两次了）。
+   */
+  {
+    const probe = document.createElement('div');
+    probe.innerHTML = rendered;
+    check(probe.querySelectorAll('img[src^="http"]').length === 0, '渲染后仍不得带远程图片 src');
+  }
+
+  // ④ 取不到 HTML 时要退回纯文本并说明，而不是给出空白渲染态
+  const failBlock = makeBodyBlock(
+    { text: '纯文本正文', hasHtml: true, html: '' },
+    h('pre', { text: '纯文本正文' }),
+    () => Promise.resolve(''),
+  );
+  const failBtn = [...failBlock.querySelectorAll('button')].find((b) => /渲染 HTML/.test(b.textContent));
+  failBtn.dispatchEvent(new window.Event('click', { bubbles: true }));
+  await new Promise((r) => setTimeout(r, 50));
+  check(/纯文本正文/.test(failBlock.textContent || ''), '取不到 HTML 时应退回纯文本');
+});
 await step('HTML 净化：白名单、危险标签、链接与属性、远程图片默认阻断', async () => {
   const { sanitizeMailHtml, restoreImages, isSafeUrl } = await import('../web/sanitize-html.js');
   /*

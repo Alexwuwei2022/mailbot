@@ -224,7 +224,14 @@ export const api = {
    * @param {object} [options] { withBody=false } 不要原文全文（更快）
    */
   mailDetail: (folder, uid, options = {}) =>
-    request('GET', `/api/mails/${encodeURIComponent(folder)}/${encodeURIComponent(uid)}${query({ body: options.withBody === false ? '0' : '' })}`),
+    request(
+      'GET',
+      `/api/mails/${encodeURIComponent(folder)}/${encodeURIComponent(uid)}${query({
+        body: options.withBody === false ? '0' : '',
+        // 原始 HTML 体积大、且必须由前端净化后才安全，所以只在用户点「渲染 HTML」时才取
+        html: options.withHtml ? '1' : '',
+      })}`,
+    ),
 
   /**
    * 附件下载地址（按 `visibleAttachments()` 的下标）。
