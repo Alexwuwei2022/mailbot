@@ -1573,13 +1573,67 @@ function selectChoice(options, value, onchange) {
   );
 }
 
+/**
+ * 超过这个长度的说明改成「?」提示。
+ *
+ * 为什么：设置页有 68 个字段，长说明（常常 2-4 行）会把同一行的字段撑得高矮不一，
+ * 整页看起来就是"凌乱"。短的说明（「SSL 通常 993」）留一行反而有用，
+ * 所以按长度分流，而不是一律塞进提示里。
+ */
+const HINT_TOOLTIP_MIN = 22;
+
+/**
+ * 标签后的「?」提示。
+ *
+ * 交互上选**点击展开**而不是纯 hover：hover 提示在触屏上根本出不来，
+ * 而且用户想照着提示操作时会因为移开鼠标而消失。同时保留 title 属性，
+ * 鼠标悬停也能看到（两种习惯都照顾）。
+ */
+function helpTip(text) {
+  const box = h('span', { class: 'field-help-box' }, h('span', { class: 'field-help-text', text }));
+  const btn = h(
+    'button',
+    {
+      class: 'field-help',
+      type: 'button',
+      title: text,
+      'aria-label': `说明：${text}`,
+      onclick: (ev) => {
+        // 点在 label 里，不阻止冒泡就会把焦点转到输入框上，提示反而关掉
+        ev.preventDefault();
+        ev.stopPropagation();
+        box.classList.toggle('open');
+      },
+    },
+    '?',
+  );
+  return h('span', { class: 'field-help-wrap' }, btn, box);
+}
+
+function fieldLabel(text, hint) {
+  const long = typeof hint === 'string' && hint.length > HINT_TOOLTIP_MIN;
+  return h(
+    'span',
+    { class: 'field-label-row' },
+    h('span', { text }),
+    long ? helpTip(hint) : null,
+  );
+}
+
+/** 字段下方的说明；已在「?」里的不再重复显示。 */
+function fieldHint(hint) {
+  if (!hint || hint.length > HINT_TOOLTIP_MIN) return null;
+  return h('span', { class: 'muted small', text: hint });
+}
+
+/** 统一的字段结构（全页只有这一份：设置页所有字段都该长这样）。 */
 function field(label, control, hint) {
   return h(
     'label',
-    { class: 'form-field' },
-    h('span', { class: 'form-label', text: label }),
+    { class: 'field' },
+    fieldLabel(label, hint),
     control,
-    hint ? h('span', { class: 'muted small', text: hint }) : null,
+    fieldHint(hint),
   );
 }
 
@@ -1977,9 +2031,9 @@ function field(label, control, hint) {
     return h(
       'label',
       { class: 'field' },
-      h('span', { text: label }),
+      fieldLabel(label, hint),
       control,
-      hint ? h('span', { class: 'muted small', text: hint }) : null,
+      fieldHint(hint),
     );
   }
 

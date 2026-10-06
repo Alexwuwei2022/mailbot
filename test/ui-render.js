@@ -2848,6 +2848,49 @@ await step('跟催：我承诺的 / 等对方回复 两栏，状态按钮与超�
   }
 });
 
+await step('设置页字段统一：长说明收进「?」提示，短说明仍留在字段下方', async () => {
+  const settingsView = await import('../web/views/settings.js');
+  if (globalThis.window?.document) globalThis.document = globalThis.window.document;
+  const box = document.createElement('div');
+  document.body.append(box);
+  try {
+    settingsView.renderSettings(box, { navigate() {}, toast() {}, refreshCounts() {}, paintNav() {}, viewStates: {} });
+    await new Promise((r) => setTimeout(r, 150));
+
+    // ① 长说明应被收进「?」，全页应该有相当多这样的字段
+    const helps = [...box.querySelectorAll('.field-help')];
+    check(helps.length >= 5, '长的字段说明应改成「?」提示（实际 ' + helps.length + ' 个）');
+
+    // ② 点击展开，且提示里的文字确实是那条长说明
+    const tip = helps[0];
+    const wrap = tip.closest('.field-help-wrap');
+    const tipBox = wrap.querySelector('.field-help-box');
+    check(!tipBox.classList.contains('open'), '提示默认应是收起的（否则排版又乱了）');
+    tip.dispatchEvent(new window.Event('click', { bubbles: true }));
+    check(tipBox.classList.contains('open'), '点「?」应展开说明');
+    check((tipBox.textContent || '').length > 22, '展开的应是那条长说明（实际 ' + (tipBox.textContent || '').length + ' 字）');
+    tip.dispatchEvent(new window.Event('click', { bubbles: true }));
+    check(!tipBox.classList.contains('open'), '再点一次应收起');
+
+    /*
+     * ③ 提示里的文字不该**再**以可见说明的形式重复一遍。
+     * 注意不能直接判 includes：提示框本身就在 DOM 里，textContent 当然包含它。
+     * 所以数出现次数——只应出现在提示框里那一次。
+     */
+    const tipText = (tipBox.textContent || '').trim();
+    const occurrences = (box.textContent || '').split(tipText).length - 1;
+    checkEqual(occurrences, 1, '这条说明只应出现在「?」里（实际出现 ' + occurrences + ' 次）');
+
+    // ④ 短说明（如「SSL 通常 993」）仍然直接显示——它们一行就够，藏起来反而难用
+    check(/SSL 通常 993/.test(box.textContent), '短说明应继续直接显示');
+
+    // ⑤ 每个字段都应带标签行（统一结构），不能有的走 .form-field、有的走 .field
+    const legacy = box.querySelectorAll('.form-field').length;
+    checkEqual(legacy, 0, '设置页不该再有旧结构的字段（实际 ' + legacy + ' 个）');
+  } finally {
+    box.remove();
+  }
+});
 await step('HTML 入口：有 HTML 时才给「渲染 HTML」，且正文是点下去才按需取的', async () => {
   const { makeBodyBlock } = await import('../web/app.js');
   const { h } = await import('../web/dom.js');

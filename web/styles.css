@@ -1859,6 +1859,96 @@ body {
   font-weight: 550;
 }
 
+/* ------------------------------------------------------------ 字段宽度上限
+
+   控件一律 width:100% 会让"单个字段独占一行"的地方（签名、发送策略、
+   定时分析的时刻）被拉到一千多像素，看着松散、也不像表单。
+   按控件类型给上限：在多列网格里格子本来就窄，等于没限制；
+   只有独占一行时才生效——该紧凑的紧凑、该铺开的铺开。 */
+
+.field > input.input:not([type='checkbox']):not([type='radio']),
+.field > select.input {
+  max-width: 420px;
+}
+
+/* 数字类（端口、条数、小时）再紧一些：本来就是短值 */
+.field > input.input[type='number'] {
+  max-width: 170px;
+}
+
+/* 多行编辑器（签名）给足宽度，但别铺满整屏 */
+.field > textarea.input {
+  max-width: 760px;
+}
+
+/* 一行里「标签 + ?」的排布 */
+.field-label-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.field-help-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.field-help {
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-3);
+  font-size: 10.5px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.field-help:hover {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.field-help:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 说明气泡：点击展开（hover 在触屏上出不来，想照着操作时又会被鼠标移开弄没） */
+.field-help-box {
+  display: none;
+  position: absolute;
+  top: 22px;
+  left: -8px;
+  z-index: 30;
+  width: max-content;
+  max-width: min(360px, 70vw);
+}
+
+.field-help-box.open {
+  display: block;
+}
+
+.field-help-text {
+  display: block;
+  padding: 9px 11px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.7;
+  box-shadow: 0 8px 24px color-mix(in srgb, #000 28%, transparent);
+  white-space: normal;
+}
+
 .input,
 .textarea {
   width: 100%;
