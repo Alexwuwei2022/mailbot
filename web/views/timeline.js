@@ -14,6 +14,7 @@
  */
 
 import { api } from '../api.js';
+import { openAssignDialog } from '../assign-project.js';
 import { confirmDialog, fmtFull, h, mount, toast, toastError } from '../dom.js';
 import { invalidateAll, markLoaded, renderInto, viewState } from '../view-state.js';
 
@@ -110,13 +111,13 @@ export function renderTimeline(root, app) {
         'div',
         { class: 'block-head' },
         h('h3', { text: '选择项目' }),
-        state.current
-          ? h(
-              'button',
-              { class: 'btn btn-small', onclick: (ev) => openRename(ev.currentTarget) },
-              '重命名 / 合并…',
-            )
-          : null,
+        h(
+          'div',
+          { class: 'row-actions' },
+          state.current
+            ? h('button', { class: 'btn btn-small', onclick: (ev) => openRename(ev.currentTarget) }, '重命名 / 合并…')
+            : h('button', { class: 'btn btn-small', onclick: () => openReclassify() }, '用大模型重新归类…'),
+        ),
       ),
       h(
         'div',
@@ -340,47 +341,84 @@ export function renderTimeline(root, app) {
    * 用户往往要连着收拾十几封。一键点选比"展开下拉、找、点"快得多。
    */
   async function openAssign(e) {
-    const input = h('input', { class: 'input', type: 'text', placeholder: '新项目名（2-16 字）' });
-    const chips = h(
-      'div',
-      { class: 'row-actions flex-wrap mb-2' },
-      ...state.projects.map((p) =>
-        h(
-          'button',
-          {
-            class: 'btn btn-small',
-            onclick: async () => {
-              await doAssign(e, p.name);
-            },
-          },
-          p.name,
-        ),
-      ),
-    );
+    // 规则只有一份：共用的归类对话框（点已有项目一键归、或填新名字）
+    await openAssignDialog({
+      folder: e.meta.folder,
+      uid: e.meta.uid,
+      title: e.title,
+      current: state.current || '',
+      projects: state.projects,
+      onDone: () => load(true),
+    });
+  }
+
+  /**
+   * 批量重新归类：**先预览、后应用**。
+   *
+   * 这一步会调用大模型（消耗额度），所以：
+   *   ① 先把"要看多少封、会花什么"说清楚，用户点确认才发请求；
+   *   ② 拿到建议后逐条可勾选，用户确认后才写库；
+   *   ③ 写入的标签算"用户确认过的"，后续自动分析不会再改。
+   */
+  async function openReclassify() {
     const ok = await confirmDialog({
-      title: `归类「${e.title}」`,
+      title: '用大模型重新归类未归类邮件？',
       message: h(
         'div',
         {},
-        state.projects.length ? h('p', { class: 'muted small', text: '归到已有项目：' }) : null,
-        state.projects.length ? chips : null,
-        h('p', { class: 'muted small', text: '或填一个新项目名：' }),
-        input,
-        h('p', { class: 'muted small', text: '归类只改本机的标签，不改动邮件本身；手工归类不会被后来的自动分析覆盖。' }),
+        h('p', { class: 'small' }, `当前有 ${state.unclassified} 封未归类。本次最多看 40 封（标题、发件人、摘要）。`),
+        h('p', { class: 'muted small' }, '**会调用大模型并消耗额度**；只看标题与摘要，不上传邮件正文与附件。'),
+        h('p', { class: 'muted small' }, '模型给的建议会先给你过目：确认后才写入，不会直接改数据。'),
       ),
-      confirmText: '归到这个新项目',
+      confirmText: '先看看建议',
     });
     if (!ok) return;
-    const name = input.value.trim();
-    if (!name) return;
-    await doAssign(e, name);
-  }
 
-  async function doAssign(e, project) {
+    let preview = null;
     try {
-      const out = await api.assignProject(e.meta.folder, e.meta.uid, project);
-      toast(out.message || '已归类', 'success');
-      // 归类会改变项目清单与计数，所以整个视图重载（而不是只改这一行）
+      preview = await api.reclassifyPreview(40);
+    } catch (err) {
+      toastError(err);
+      return;
+    }
+    if (!preview.suggestions?.length) {
+      toast(`模型没给出新的归类建议（看了 ${preview.scanned} 封）`, 'info', 8000);
+      return;
+    }
+
+    const boxes = preview.suggestions.map((s) =>
+      h(
+        'label',
+        { class: 'reclassify-row' },
+        h('input', { type: 'checkbox', checked: true, dataset: { key: `${s.folder}:${s.uid}` } }),
+        h('span', { class: 'reclassify-subject', text: s.subject }),
+        h('span', { class: 'tag', text: s.suggested }),
+      ),
+    );
+    const apply = await confirmDialog({
+      title: '确认要写入的归类',
+      message: h(
+        'div',
+        {},
+        h('p', { class: 'muted small' }, `看了 ${preview.scanned} 封，给出 ${preview.suggestions.length} 条建议；不需要的取消勾选。`),
+        h('div', { class: 'reclassify-list' }, ...boxes),
+        preview.remaining ? h('p', { class: 'muted small', text: `还有 ${preview.remaining} 封没看，可以再来一次。` }) : null,
+      ),
+      confirmText: '应用勾选的归类',
+    });
+    if (!apply) return;
+
+    const picked = preview.suggestions.filter((s) => {
+      const box = boxes.find((b) => b.querySelector('input')?.dataset.key === `${s.folder}:${s.uid}`);
+      return box?.querySelector('input')?.checked;
+    });
+    if (!picked.length) {
+      toast('没有勾选任何条目', 'info');
+      return;
+    }
+    try {
+      const out = await api.reclassifyApply(picked.map((s) => ({ folder: s.folder, uid: s.uid, project: s.suggested })));
+      toast(out.message || '已写入', 'success', 8000);
       await load(true);
     } catch (err) {
       toastError(err);

@@ -13,6 +13,27 @@ import { getConfig, getInstance, getPaths, validateInstance } from '../config/in
 import { AppError, hoursAgo, log, mapLimit, truncate } from '../lib/util.js';
 import { LlmClient } from '../llm/client.js';
 import { runFollowUpScan } from '../followup.js';
+
+/**
+ * 当前已有的项目标签（喂给分类提示词，让模型尽量**复用**而不是每次换个说法）。
+ *
+ * 取不到就返回空数组：分类本身不该因为"读不到已有标签"而失败。
+ */
+async function knownProjectLabels() {
+  try {
+    const [{ listProjects }, store] = await Promise.all([import('../timeline.js'), import('../store/state.js')]);
+    return listProjects({
+      analyses: store.listAnalyses({ limit: 5000 }),
+      drafts: store.listDrafts({}),
+      followUps: store.getFollowUpMap(),
+      registry: store.getProjectRegistry(),
+    })
+      .map((p) => p.name)
+      .slice(0, 40);
+  } catch {
+    return [];
+  }
+}
 import { REPORT_SYSTEM, buildReportPrompt } from '../llm/prompts.js';
 import { classifyMails, draftReply, sortByPriority, PRIORITY_LABELS, TYPE_LABELS } from '../ai/analyze.js';
 import {
@@ -501,6 +522,8 @@ export async function runScan({ instanceId, windowHours, force = false, trigger 
           mails: pending.map((p) => p.mail),
           client,
           config,
+          /* 已有项目标签：不给列表的话，"照抄已知标签"这条要求根本无从执行 */
+          knownProjects: await knownProjectLabels(),
           onProgress: ({ done, total, failed }) =>
             emit(run.id, { type: 'analyze:progress', done, total, failed: !!failed }),
         })

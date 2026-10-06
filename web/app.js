@@ -5,6 +5,7 @@ import { attachmentButton, copyButton, fmtAddress, fmtBytes, fmtFull, h, mount, 
 import { THEMES, applyTheme, effectiveTheme, initTheme } from './theme.js';
 import { invalidate, invalidateAll } from './view-state.js';
 import { renderMailHtml, restoreImages } from './sanitize-html.js';
+import { openAssignDialog } from './assign-project.js';
 import { renderOverview } from './views/overview.js';
 import { renderDrafts } from './views/drafts.js';
 import { renderSearch } from './views/search.js';
@@ -811,7 +812,34 @@ function showMailModal(detail, fallback, app, initialTab = 'analysis') {
     ),
     tabBar,
     panel,
-    h('div', { class: 'modal-actions' }, h('button', { class: 'btn', onclick: close }, '关闭'), analyzeAction(), draftAction()),
+    h(
+      'div',
+      { class: 'modal-actions' },
+      /*
+       * 归类入口也放在邮件详情里：用户从"这封邮件归错类了"的现场出发时，
+       * 不该被要求先回到时间线页面去找它。
+       */
+      (mail.folder && mail.uid)
+        ? h(
+            'button',
+            {
+              class: 'btn',
+              onclick: () =>
+                openAssignDialog({
+                  folder: mail.folder,
+                  uid: mail.uid,
+                  title: original.subject || mail.subject || '',
+                  current: analysis?.project || '',
+                  onDone: () => {
+                    close();
+                    app.refreshCounts?.();
+                  },
+                }),
+            },
+            '归类到项目…',
+          )
+        : null,
+      h('button', { class: 'btn', onclick: close }, '关闭'), analyzeAction(), draftAction()),
   );
   overlay.append(modal);
   closeModal = openModal(overlay);

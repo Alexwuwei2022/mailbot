@@ -175,6 +175,13 @@ export const api = {
   /** 手工归类：把某封邮件归到某个项目（project 传空串 = 移出项目） */
   assignProject: (folder, uid, project) => request('POST', '/api/projects/assign', { folder, uid, project }),
 
+  /**
+   * 批量重新归类「未归类」邮件。
+   * 预览**只返回建议、不写任何数据**；用户勾选后再调 apply 落库。
+   */
+  reclassifyPreview: (limit) => request('POST', '/api/projects/reclassify', { limit }),
+  reclassifyApply: (apply) => request('POST', '/api/projects/reclassify', { apply }),
+
   /** 跟催：列表 / 扫描（会调模型，接口侧要求 confirm）/ 改状态 */
   followups: (params) => request('GET', `/api/followups${query(params || {})}`),
   followUpsScan: () => request('POST', '/api/followups/scan', { confirm: true }),

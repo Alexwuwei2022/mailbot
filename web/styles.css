@@ -1999,6 +1999,36 @@ section.block {
   min-width: 0;
 }
 
+/* 批量重新归类的建议列表：一行一封，可勾选 */
+.reclassify-list {
+  max-height: 46vh;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+.reclassify-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+}
+
+.reclassify-row:first-child {
+  border-top: 0;
+}
+
+.reclassify-subject {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .field-help-wrap {
   position: relative;
   display: inline-flex;

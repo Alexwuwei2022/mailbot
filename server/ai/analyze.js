@@ -42,7 +42,7 @@ export const PRIORITY_LABELS = { urgent: '紧急', high: '高', normal: '普通'
  * @param {object} params.config
  * @param {(p:object)=>void} params.onProgress
  */
-export async function classifyMails({ mails, client, config, onProgress }) {
+export async function classifyMails({ mails, client, config, onProgress, knownProjects = [] }) {
   const batchSize = clampNumber(config.llm.classifyBatchSize, 1, 50, 12);
   const batches = chunk(mails, batchSize);
   let done = 0;

@@ -1003,6 +1003,149 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       }),
     });
   }
+  /**
+   * 批量重新归类「未归类」的邮件。
+   *
+   * ## 为什么分两步（预览 → 应用）
+   *
+   * 这一步**会调用大模型、消耗额度**，而且模型可能给出一堆没用的标签。
+   * 直接写库的后果是：用户花了一次调用，换来一屏更乱的分类，还得手工收拾。
+   * 所以默认只返回**建议**（preview），用户看过、勾选之后再调一次来落库。
+   *
+   * 应用时标记为 manual：这批标签是**用户确认过的**，属于人的决定，
+   * 后续自动扫描不该把它冲掉（与单封手工归类同一套语义）。
+   */
+  if (route === 'POST /api/projects/reclassify') {
+    const body = await readJsonBody(req);
+    const cfgNow = getConfig();
+
+    /* ---------- 应用：只写用户勾选的 ---------- */
+    if (Array.isArray(body.apply)) {
+      const { tidyProject } = await import('./ai/analyze.js');
+      const registry = { ...store.getProjectRegistry() };
+      let applied = 0;
+      const skipped = [];
+      for (const item of body.apply) {
+        const folder = String(item?.folder || '').trim();
+        const uid = Number(item?.uid);
+        const raw = String(item?.project ?? '').trim();
+        if (!folder || !Number.isFinite(uid) || !raw) {
+          skipped.push({ folder, uid, reason: '标识或项目名为空' });
+          continue;
+        }
+        if (!store.getAnalysis(folder, uid)) {
+          skipped.push({ folder, uid, reason: '没有分析记录' });
+          continue;
+        }
+        const project = tidyProject(raw);
+        if (!project) {
+          skipped.push({ folder, uid, reason: '项目名不合适（过短、过长或过于笼统）' });
+          continue;
+        }
+        store.upsertAnalyses([{ folder, uid, project, projectSource: 'manual' }]);
+        const key = projectKey(project);
+        if (!Object.values(registry).some((r) => projectKey(r?.name) === key)) {
+          registry[key] = { key, name: project, aliases: [], createdAt: new Date().toISOString() };
+        }
+        applied += 1;
+      }
+      store.replaceProjects(registry);
+      if (applied) {
+        appendAudit('project.reclassify', {
+          target: `批量归类 ${applied} 封`,
+          source: '界面操作',
+          extra: { applied, skipped: skipped.length },
+        });
+      }
+      return sendJson(res, 200, {
+        ok: true,
+        applied,
+        skipped,
+        message: applied ? `已归类 ${applied} 封${skipped.length ? `，跳过 ${skipped.length} 封` : ''}` : '没有可写入的归类',
+      });
+    }
+
+    /* ---------- 预览：只返回建议，不写任何数据 ---------- */
+    if (!cfgNow.llm?.apiKey && !cfgNow.llm?.baseUrl) {
+      throw new AppError('还没有配置大模型：批量归类需要模型给出标签', { code: 'LLM_NOT_CONFIGURED', status: 400 });
+    }
+    const limit = Math.min(Math.max(Number(body.limit) || 40, 1), 80);
+    const all = store.listAnalyses({ limit: 5000 });
+    const unclassified = all.filter((a) => !a.project);
+    const batch = unclassified.slice(0, limit);
+
+    const [{ classifyMails }, { LlmClient }, { listProjects: listP }] = await Promise.all([
+      import('./ai/analyze.js'),
+      import('./llm/client.js'),
+      import('./timeline.js'),
+    ]);
+    const knownProjects = listP({
+      analyses: all,
+      drafts: store.listDrafts({}),
+      followUps: store.getFollowUpMap(),
+      registry: store.getProjectRegistry(),
+    })
+      .map((p) => p.name)
+      .slice(0, 40);
+
+    const client = new LlmClient(cfgNow.llm);
+    const mails = batch.map((a) => ({
+      folder: a.folder,
+      uid: a.uid,
+      subject: a.mail?.subject || '(无主题)',
+      from: a.mail?.from || null,
+      to: a.mail?.to || [],
+      cc: a.mail?.cc || [],
+      date: a.mail?.date || a.analyzedAt,
+      body: a.summary || '',
+    }));
+
+    let results = [];
+    try {
+      results = await classifyMails({ mails, client, config: cfgNow, knownProjects });
+    } catch (err) {
+      throw new AppError(`批量归类失败：${err?.message || err}`, { code: 'RECLASSIFY_FAILED', status: 502 });
+    }
+    /*
+     * 结果与输入**必须一一对应**：数量对不上就当作失败，而不是猜着对应。
+     * 猜错的后果是给邮件贴错项目，用户很难发现。
+     */
+    if (results.length !== mails.length) {
+      throw new AppError(`模型返回 ${results.length} 条、输入 ${mails.length} 条，对不上；本次不写入任何数据`, {
+        code: 'RECLASSIFY_MISMATCH',
+        status: 502,
+      });
+    }
+
+    const suggestions = [];
+    const unchanged = [];
+    mails.forEach((m, i) => {
+      const project = String(results[i]?.project || '').trim();
+      if (!project) {
+        unchanged.push({ folder: m.folder, uid: m.uid, subject: m.subject, reason: '模型认为不属于任何项目' });
+        return;
+      }
+      suggestions.push({
+        folder: m.folder,
+        uid: m.uid,
+        subject: m.subject,
+        from: m.from?.name || m.from?.address || '',
+        suggested: project,
+      });
+    });
+
+    return sendJson(res, 200, {
+      ok: true,
+      preview: true,
+      unclassifiedTotal: unclassified.length,
+      scanned: mails.length,
+      remaining: Math.max(unclassified.length - mails.length, 0),
+      suggestions,
+      unchanged,
+      knownProjects,
+      message: `看了 ${mails.length} 封，能归类的 ${suggestions.length} 封；确认后会写入（不会自动应用）`,
+    });
+  }
   /** 重命名 / 合并项目：会改写历史记录，并要求确认。 */
   if (route === 'POST /api/projects/rename') {
     const body = await readJsonBody(req);
