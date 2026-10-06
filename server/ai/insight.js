@@ -322,7 +322,7 @@ export async function loadRawFor({ folder, uid, instanceId } = {}) {
  *
  * @returns {Promise<{available: boolean, source: string, text: string, quoted: string, truncated: boolean, chars: number, reason: string}>}
  */
-export async function loadMailBody({ folder, uid, instanceId, maxChars = 40_000 } = {}) {
+export async function loadMailBody({ folder, uid, instanceId, maxChars = 40_000, withHtml = false } = {}) {
   const empty = { available: false, source: 'none', text: '', quoted: '', truncated: false, chars: 0, reason: '' };
   const numUid = Number(uid);
   if (!folder || !Number.isFinite(numUid)) return { ...empty, reason: '邮件标识不完整' };
@@ -338,6 +338,19 @@ export async function loadMailBody({ folder, uid, instanceId, maxChars = 40_000 
   try {
     const parsed = await parseMessage(raw);
     const { fresh, quoted } = splitQuoted(parsed.body);
+    /*
+     * HTML 正文只在明确要求时取（用户点「渲染 HTML」）。
+     * 它体积大、且要由前端白名单净化后才安全，所以默认不取。
+     * 注意：**失败不能影响纯文本**——取不到 HTML 只意味着少一个渲染选项。
+     */
+    let htmlBody = '';
+    if (withHtml) {
+      try {
+        htmlBody = (await extractHtmlBody(raw)).html;
+      } catch {
+        htmlBody = '';
+      }
+    }
 
     const limit = Number(maxChars) > 0 ? Number(maxChars) : 40_000;
     const truncated = fresh.length > limit;
@@ -381,7 +394,7 @@ export async function loadMailBody({ folder, uid, instanceId, maxChars = 40_000 
  *
  * @param {object} options { folder, uid, instanceId, withBody }
  */
-export async function buildMailDetail({ folder, uid, instanceId, withBody = true } = {}) {
+export async function buildMailDetail({ folder, uid, instanceId, withBody = true, withHtml = false } = {}) {
   const config = getConfig();
   const id = instanceId || config.defaultInstanceId;
   const entry = store.getAnalysis(folder, uid);
@@ -397,7 +410,7 @@ export async function buildMailDetail({ folder, uid, instanceId, withBody = true
         mailbox: found.mailbox || null,
       }
     : null;
-  const body = withBody ? await loadMailBody({ folder, uid, instanceId: id }) : null;
+  const body = withBody ? await loadMailBody({ folder, uid, instanceId: id, withHtml }) : null;
 
   if (entry) {
     return {

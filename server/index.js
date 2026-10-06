@@ -1241,6 +1241,8 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
   const mailDetailMatch = url.pathname.match(/^\/api\/mails\/([^/]+)\/(\d+)$/);
   if (mailDetailMatch && method === 'GET') {
     const detail = await buildMailDetail({
+      // 只有用户点「渲染 HTML」时才取原始 HTML（体积大，且要前端净化后才安全）
+      withHtml: url.searchParams.get('html') === '1',
       folder: decodeURIComponent(mailDetailMatch[1]),
       uid: Number(mailDetailMatch[2]),
 
