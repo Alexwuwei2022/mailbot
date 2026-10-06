@@ -887,7 +887,7 @@ function buildShell(root) {
     h(
       'footer',
       { class: 'footer' },
-      h('span', { text: '邮件草稿与日程写入都需你逐封确认；数据只保存在本机。© 2026 mail.wwu@gmail.com' }),
+      h('span', { text: '邮箱与日历数字人 | © 2026 mail.wwu@gmail.com | 供个人/内部使用' }),
     ),
   );
 

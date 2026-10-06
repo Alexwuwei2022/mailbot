@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { listenRandom } from './lib/port.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-cal-'));
@@ -271,9 +272,9 @@ async function mocks2StartMockLlm({ handler }) {
       );
     });
   });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const mockPort = await listenRandom(server);
   return {
-    baseUrl: `http://127.0.0.1:${server.address().port}`,
+    baseUrl: `http://127.0.0.1:${mockPort}`,
     close: () => new Promise((r) => server.close(r)),
   };
 }
@@ -2243,8 +2244,8 @@ await test('代理：HTTPS 目标走 CONNECT 隧道；代理拒绝时给出可�
   const { server: deadServer } = await (async () => {
     const net = await import('node:net');
     const s = net.createServer();
-    await new Promise((r) => s.listen(0, '127.0.0.1', r));
-    const p = s.address().port;
+    // 与其它测试一样：等端口真的可用再取，避免拿到 :0 拼出坏地址
+    const p = await listenRandom(s);
     await new Promise((r) => s.close(r));
     return { server: { port: p } };
   })();
@@ -3197,6 +3198,67 @@ await test('HTTP：项目清单 / 时间线 / 重命名合并（改写历史并�
   } finally {
     store.getState().analyses = saved.analyses;
     store.getState().drafts = saved.drafts;
+    store.replaceProjects(saved.projects);
+    store.persistState();
+    await new Promise((r) => server.close(r));
+  }
+});
+
+await test('HTTP：手工归类（归到项目 / 移出 / 拒绝坏名字 / 不回写未分析的邮件）', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  const store = await import('../server/store/state.js');
+  const { resetSessions } = await import('../server/lib/session.js');
+  resetThrottle();
+  resetSessions();
+  const saved = {
+    analyses: JSON.parse(JSON.stringify(store.getState().analyses)),
+    projects: JSON.parse(JSON.stringify(store.getProjectRegistry())),
+  };
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  const H = { 'content-type': 'application/json' };
+  const post = (body) => fetch(`${url}/api/projects/assign`, { method: 'POST', headers: H, body: JSON.stringify(body) });
+  try {
+    // 先造一封已分析、未归类的邮件
+    store.upsertAnalyses([
+      { folder: 'INBOX', uid: 9101, project: '', mail: { date: '2026-10-01T09:00:00Z', subject: '待归类', from: { address: 'a@x.com' } }, summary: '' },
+    ]);
+    store.persistState();
+
+    // ① 归类到新项目
+    const one = await (await post({ folder: 'INBOX', uid: 9101, project: '官网改版' })).json();
+    assertEqual(one.ok, true, '归类应成功');
+    assertIncludes(one.message, '官网改版', '返回信息要说清归到哪了');
+    assertEqual(store.getAnalysis('INBOX', 9101).project, '官网改版', '分析记录的标签应被改写');
+    assertEqual(store.getAnalysis('INBOX', 9101).projectSource, 'manual', '应标记为手工归类');
+    assert(one.projects.some((p) => p.name === '官网改版'), '新项目应立刻出现在清单里');
+
+    // ② 手工归类不会被后来的自动分析覆盖（这是手工入口能被信任的前提）
+    store.upsertAnalyses([{ folder: 'INBOX', uid: 9101, project: '模型给的名字' }]);
+    assertEqual(store.getAnalysis('INBOX', 9101).project, '官网改版', '自动分析的标签不得覆盖手工归类');
+
+    // ③ 坏名字要拒绝（通用词没有区分度）
+    assertEqual((await post({ folder: 'INBOX', uid: 9101, project: '邮件' })).status, 400, '通用词应被拒绝');
+    assertEqual((await post({ folder: 'INBOX', uid: 9101, project: '这是一个特别长的项目名超过十六个字了' })).status, 400, '过长应被拒绝');
+
+    // ④ 没有分析记录的邮件不能归类（否则会凭空造出一条记录）
+    assertEqual((await post({ folder: 'INBOX', uid: 999999, project: 'x项目' })).status, 404, '未分析的邮件应 404');
+    assertEqual((await post({ folder: '', uid: 0, project: 'x' })).status, 400, '缺标识应 400');
+
+    // ⑤ 移出项目：回到未归类
+    const cleared = await (await post({ folder: 'INBOX', uid: 9101, project: '' })).json();
+    assertEqual(cleared.project, '', '应已移出项目');
+    assertEqual(store.getAnalysis('INBOX', 9101).project, '', '标签应被清空');
+
+    // ⑥ 跨源写入必须被拒
+    const evil = await fetch(`${url}/api/projects/assign`, {
+      method: 'POST',
+      headers: { ...H, origin: 'https://evil.example.com' },
+      body: JSON.stringify({ folder: 'INBOX', uid: 9101, project: 'x' }),
+    });
+    assertEqual(evil.status, 403, '跨源归类应被拒绝');
+  } finally {
+    store.getState().analyses = saved.analyses;
     store.replaceProjects(saved.projects);
     store.persistState();
     await new Promise((r) => server.close(r));

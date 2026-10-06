@@ -379,7 +379,17 @@ export function upsertAnalyses(records) {
   for (const rec of records) {
     if (!rec?.uid) continue;
     const key = analysisKey(rec.folder || 'INBOX', rec.uid);
-    s.analyses[key] = { ...(s.analyses[key] || {}), ...rec, key };
+    const prev = s.analyses[key] || {};
+    /*
+     * **手工归类的标签不能被下一次扫描冲掉**。
+     * 分析记录里的 project 是模型给的，而用户手工改过之后，那条记录会带上
+     * projectSource: 'manual'；此后凡是「模型给标签」的写入都跳过 project 字段。
+     * 不这样做的话，用户辛苦归好类，下次扫一遍就全白费了——而且没有任何提示。
+     */
+    const keepManual = prev.projectSource === 'manual' && rec.projectSource !== 'manual' && 'project' in rec;
+    const merged = { ...prev, ...rec, key };
+    if (keepManual) merged.project = prev.project;
+    s.analyses[key] = merged;
   }
   return records.length;
 }

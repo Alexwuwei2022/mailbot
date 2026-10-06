@@ -172,6 +172,9 @@ export const api = {
   timeline: (project) => request('GET', `/api/timeline${query({ project: project || '' })}`),
   renameProject: (from, to) => request('POST', '/api/projects/rename', { from, to, confirm: true }),
 
+  /** 手工归类：把某封邮件归到某个项目（project 传空串 = 移出项目） */
+  assignProject: (folder, uid, project) => request('POST', '/api/projects/assign', { folder, uid, project }),
+
   /** 跟催：列表 / 扫描（会调模型，接口侧要求 confirm）/ 改状态 */
   followups: (params) => request('GET', `/api/followups${query(params || {})}`),
   followUpsScan: () => request('POST', '/api/followups/scan', { confirm: true }),

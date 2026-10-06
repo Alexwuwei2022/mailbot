@@ -54,6 +54,8 @@ export const AUDIT_ACTIONS = {
   'followup.status': { label: '跟催状态变更', group: '跟催' },
   /** 项目重命名/合并：会改写历史记录的标签 */
   'project.rename': { label: '项目重命名或合并', group: '跟催' },
+  /** 手工把某封邮件归到某个项目（或移出项目） */
+  'project.assign': { label: '邮件归类调整', group: '跟催' },
 };
 
 function auditPath() {

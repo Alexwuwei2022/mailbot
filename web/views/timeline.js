@@ -205,6 +205,12 @@ export function renderTimeline(root, app) {
   /** 一条记录：时间 + 来源 + 标题 + 细节。 */
   function entry(e) {
     const meta = KIND_META[e.kind] || { label: e.kind, icon: '•' };
+    /*
+     * 邮件条目可以**手工归类**。
+     * 入口放在列表里而不是只放在邮件详情：未归类动辄上百封，
+     * 逐个开弹窗归类没人会去做；能在列表里逐个改，归类才可能被收拾干净。
+     */
+    const canAssign = e.kind === 'mail' && e.meta?.folder && e.meta?.uid;
     return h(
       'div',
       { class: `tl-row tl-${e.kind}` },
@@ -213,7 +219,14 @@ export function renderTimeline(root, app) {
       h(
         'div',
         { class: 'tl-main' },
-        h('div', { class: 'tl-title', text: e.title }),
+        h(
+          'div',
+          { class: 'tl-title-row' },
+          h('div', { class: 'tl-title', text: e.title }),
+          canAssign
+            ? h('button', { class: 'btn btn-small', onclick: () => openAssign(e) }, state.current ? '改归类…' : '归类…')
+            : null,
+        ),
         h(
           'div',
           { class: 'tl-meta muted small' },
@@ -317,6 +330,60 @@ export function renderTimeline(root, app) {
     } finally {
       if (btn) btn.textContent = label;
       paint();
+    }
+  }
+
+  /**
+   * 归类对话框：点已有项目（一键）或输入新名字。
+   *
+   * 为什么把已有项目做成按钮而不是下拉：归类是**重复动作**——
+   * 用户往往要连着收拾十几封。一键点选比"展开下拉、找、点"快得多。
+   */
+  async function openAssign(e) {
+    const input = h('input', { class: 'input', type: 'text', placeholder: '新项目名（2-16 字）' });
+    const chips = h(
+      'div',
+      { class: 'row-actions flex-wrap mb-2' },
+      ...state.projects.map((p) =>
+        h(
+          'button',
+          {
+            class: 'btn btn-small',
+            onclick: async () => {
+              await doAssign(e, p.name);
+            },
+          },
+          p.name,
+        ),
+      ),
+    );
+    const ok = await confirmDialog({
+      title: `归类「${e.title}」`,
+      message: h(
+        'div',
+        {},
+        state.projects.length ? h('p', { class: 'muted small', text: '归到已有项目：' }) : null,
+        state.projects.length ? chips : null,
+        h('p', { class: 'muted small', text: '或填一个新项目名：' }),
+        input,
+        h('p', { class: 'muted small', text: '归类只改本机的标签，不改动邮件本身；手工归类不会被后来的自动分析覆盖。' }),
+      ),
+      confirmText: '归到这个新项目',
+    });
+    if (!ok) return;
+    const name = input.value.trim();
+    if (!name) return;
+    await doAssign(e, name);
+  }
+
+  async function doAssign(e, project) {
+    try {
+      const out = await api.assignProject(e.meta.folder, e.meta.uid, project);
+      toast(out.message || '已归类', 'success');
+      // 归类会改变项目清单与计数，所以整个视图重载（而不是只改这一行）
+      await load(true);
+    } catch (err) {
+      toastError(err);
     }
   }
 

@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { listenRandom } from './lib/port.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 
@@ -548,7 +549,7 @@ await step('外壳：右上角是「轻效 | Ease & Effect」Logo + 外观模式
   const footer = root.querySelector('.footer');
   checkEqual(
     footer.textContent,
-    '邮件草稿与日程写入都需你逐封确认；数据只保存在本机。© 2026 mail.wwu@gmail.com',
+    '邮箱与日历数字人 | © 2026 mail.wwu@gmail.com | 供个人/内部使用',
     '页脚文案',
   );
 });
@@ -2131,8 +2132,7 @@ await step('网络：代理 CONNECT 路径不得再写 agent: false（会静默�
     res.writeHead(200);
     res.end('LIVE');
   });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
-  const port = server.address().port;
+  const port = await listenRandom(server);
   const probe = (opts) =>
     new Promise((resolve) => {
       const req = http.request(

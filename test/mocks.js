@@ -7,6 +7,8 @@
 
 import net from 'node:net';
 
+import { resolvePort } from './lib/port.js';
+
 const CRLF = '\r\n';
 
 /** 逐行读取 socket，支持 IMAP 字面量（{n} 后跟 n 字节）。 */
@@ -394,7 +396,7 @@ export async function startMockImap({
   });
 
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  const actualPort = server.address().port;
+  const actualPort = await resolvePort(server);
 
   return {
     port: actualPort,
@@ -586,7 +588,7 @@ export async function startMockSmtp({  user = 'bot@example.com',
 
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
   return {
-    port: server.address().port,
+    port: await resolvePort(server),
     host: '127.0.0.1',
     received,
     get authAttempts() {
@@ -643,9 +645,10 @@ export async function startMockLlm({ port = 0, handler } = {}) {
     });
   });
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+  const actualPort = await resolvePort(server);
   return {
-    port: server.address().port,
-    baseUrl: `http://127.0.0.1:${server.address().port}`,
+    port: actualPort,
+    baseUrl: `http://127.0.0.1:${actualPort}`,
     calls,
     close: () => new Promise((resolve) => server.close(resolve)),
   };

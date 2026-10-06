@@ -51,7 +51,7 @@ import {
 import { resolveTls } from './lib/tls.js';
 import { egressReport } from './lib/privacy.js';
 import { followUpConfig, runFollowUpScan } from './followup.js';
-import { buildTimeline, listProjects, mergeProjects } from './timeline.js';
+import { buildTimeline, listProjects, mergeProjects, projectKey } from './timeline.js';
 import { LlmClient, pingLlm } from './llm/client.js';
 import { currentRun, clampWindowHours, isRunning, previewScan, progressBus, runScan, cancelRun } from './ai/engine.js';
 import { runScheduledScan, schedulerStatus, setNotifyEmitter, startScheduler, stopScheduler } from './schedule.js';
@@ -940,6 +940,69 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     });
   }
 
+  /**
+   * 手工归类：把某封邮件归到某个项目，或移出项目（回到「未归类」）。
+   *
+   * 为什么必须有这个入口：项目标签是**分析时由模型给的**，模型不可能知道
+   * 用户心里的项目划分。没有手工入口时，用户看到归类不对只能去改提示词——
+   * 那是把用户当成开发者。
+   *
+   * 写回时带 `projectSource: 'manual'` 标记：store 的写入会保护它，
+   * 后续自动分析不再覆盖这次人工决定（否则用户归好类，下次扫一遍就白费）。
+   */
+  if (route === 'POST /api/projects/assign') {
+    const body = await readJsonBody(req);
+    const folder = String(body.folder || '').trim();
+    const uid = Number(body.uid);
+    if (!folder || !Number.isFinite(uid)) {
+      throw new AppError('缺少邮件标识（folder 与 uid）', { code: 'MAIL_ID_REQUIRED', status: 400 });
+    }
+    if (!store.getAnalysis(folder, uid)) {
+      throw new AppError('这封邮件还没有分析记录：先分析它，再归类', { code: 'ANALYSIS_NOT_FOUND', status: 404 });
+    }
+
+    const raw = String(body.project ?? '').trim();
+    let project = '';
+    if (raw) {
+      const { tidyProject } = await import('./ai/analyze.js');
+      project = tidyProject(raw);
+      if (!project) {
+        throw new AppError('项目名不合适：请用 2-16 字的短标签，不要用「邮件」「通知」这类通用词', {
+          code: 'PROJECT_NAME_INVALID',
+          status: 400,
+        });
+      }
+    }
+
+    store.upsertAnalyses([{ folder, uid, project, projectSource: 'manual' }]);
+    if (project) {
+      // 新建的项目要进登记表：否则它在「重命名 / 合并」里还不存在
+      const registry = store.getProjectRegistry();
+      const key = projectKey(project);
+      const known = Object.values(registry).some((r) => projectKey(r?.name) === key);
+      if (!known) {
+        store.replaceProjects({ ...registry, [key]: { key, name: project, aliases: [], createdAt: new Date().toISOString() } });
+      }
+    }
+    appendAudit('project.assign', {
+      target: `${folder} #${uid} → ${project || '未归类'}`,
+      source: '界面操作',
+      extra: { folder, uid, project },
+    });
+    return sendJson(res, 200, {
+      ok: true,
+      folder,
+      uid,
+      project,
+      message: project ? `已归类到「${project}」` : '已移出项目（回到「未归类」）',
+      projects: listProjects({
+        analyses: store.listAnalyses({ limit: 5000 }),
+        drafts: store.listDrafts({}),
+        followUps: store.getFollowUpMap(),
+        registry: store.getProjectRegistry(),
+      }),
+    });
+  }
   /** 重命名 / 合并项目：会改写历史记录，并要求确认。 */
   if (route === 'POST /api/projects/rename') {
     const body = await readJsonBody(req);
