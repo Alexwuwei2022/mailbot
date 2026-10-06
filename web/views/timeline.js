@@ -185,6 +185,11 @@ export function renderTimeline(root, app) {
           'div',
           { class: 'tl-meta muted small' },
           h('span', { class: 'tag', text: meta.label }),
+          /*
+           * 来源比类别更具体（类别「跟催」→ 来源「等对方回复」/「我的承诺」），
+           * 客户端的措辞能帮用户一眼分清这是谁欠谁，所以两者都显示、不重复时才显示。
+           */
+          e.source && e.source !== meta.label ? h('span', { text: e.source }) : null,
           e.meta?.from ? h('span', { text: `发件人：${e.meta.from}` }) : null,
           e.meta?.to ? h('span', { text: `收件人：${e.meta.to}` }) : null,
           e.meta?.counterparty ? h('span', { text: e.meta.counterparty }) : null,

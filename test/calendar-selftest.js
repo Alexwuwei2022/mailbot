@@ -3119,6 +3119,90 @@ await test('HTTP：跟催 列表 / 扫描（需确认）/ 改状态', async () =
   }
 });
 
+await test('HTTP：项目清单 / 时间线 / 重命名合并（改写历史并记别名）', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  const store = await import('../server/store/state.js');
+  resetThrottle();
+  const saved = {
+    analyses: JSON.parse(JSON.stringify(store.getState().analyses)),
+    drafts: JSON.parse(JSON.stringify(store.getState().drafts)),
+    projects: JSON.parse(JSON.stringify(store.getProjectRegistry())),
+  };
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  try {
+    // 造两个"碎掉"的项目名 + 一封未归类
+    store.upsertAnalyses([
+      { folder: 'INBOX', uid: 9001, project: '官网改版', mail: { date: '2026-10-01T09:00:00Z', subject: '改版需求', from: { address: 'a@x.com' } }, summary: '需求' },
+      { folder: 'INBOX', uid: 9002, project: '官网改版项目', mail: { date: '2026-10-02T09:00:00Z', subject: '设计稿', from: { address: 'b@x.com' } }, summary: '设计' },
+      { folder: 'INBOX', uid: 9003, project: '', mail: { date: '2026-10-03T09:00:00Z', subject: '无关的事' }, summary: '' },
+    ]);
+    store.persistState();
+
+    const projects = await (await fetch(url + '/api/projects')).json();
+    assertEqual(projects.ok, true, '项目清单应可用');
+    const names = projects.projects.map((p) => p.name);
+    assert(names.includes('官网改版') && names.includes('官网改版项目'), '两个碎片名都应列出');
+    assert(projects.unclassified >= 1, '应报告未归类数量');
+    const target = projects.projects.find((p) => p.name === '官网改版');
+    assert(target.count >= 1, '应带每条项目的记录数');
+    assert(target.sources && target.sources.mail >= 1, '应带来源明细');
+
+    // 时间线
+    const tl = await (await fetch(url + '/api/timeline?project=' + encodeURIComponent('官网改版'))).json();
+    assertEqual(tl.ok, true, '时间线应可用');
+    assert(tl.entries.length >= 1, '应有条目');
+    assert(tl.calendarNote, '必须如实说明日程来源的局限（不能让人以为这是全部日程）');
+
+    // 未归类视图不该混入日程
+    const un = await (await fetch(url + '/api/timeline?project=')).json();
+    assert(!un.entries.some((e) => e.kind === 'calendar'), '未归类里不该出现日程');
+
+    // 未确认的合并必须拒绝（会改写历史）
+    const noConfirm = await fetch(url + '/api/projects/rename', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ from: '官网改版项目', to: '官网改版' }),
+    });
+    assertEqual(noConfirm.status, 428, '未确认应返回 428');
+    const missing = await fetch(url + '/api/projects/rename', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ from: '', to: 'x', confirm: true }),
+    });
+    assertEqual(missing.status, 400, '缺名字应 400');
+
+    // 真合并
+    const merged = await (
+      await fetch(url + '/api/projects/rename', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ from: '官网改版项目', to: '官网改版', confirm: true }),
+      })
+    ).json();
+    assert(merged.moved >= 1, '应报告改写了几条记录（实际 ' + merged.moved + '）');
+    assertIncludes(merged.message, '官网改版', '返回信息要说清并到哪去了');
+    const after = (await (await fetch(url + '/api/projects')).json()).projects.map((p) => p.name);
+    assert(!after.includes('官网改版项目'), '合并后旧名不该再作为项目出现');
+    const alias = (await (await fetch(url + '/api/projects')).json()).projects.find((p) => p.name === '官网改版');
+    assert((alias.aliases || []).includes('官网改版项目'), '旧名应记成别名');
+
+    // 跨源必须被拒（改写历史是写操作）
+    const evil = await fetch(url + '/api/projects/rename', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example.com' },
+      body: JSON.stringify({ from: 'a', to: 'b', confirm: true }),
+    });
+    assertEqual(evil.status, 403, '跨源改名应被拒绝');
+  } finally {
+    store.getState().analyses = saved.analyses;
+    store.getState().drafts = saved.drafts;
+    store.replaceProjects(saved.projects);
+    store.persistState();
+    await new Promise((r) => server.close(r));
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await google.close();

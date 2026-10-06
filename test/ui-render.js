@@ -526,6 +526,8 @@ await step('boot()：外壳与导航渲染', async () => {
   check(html.includes('日历'), '缺少日历导航');
   check(html.includes('知识库'), '缺少知识库导航');
   check(html.includes('运行与记录'), '缺少运行与记录导航');
+  check(html.includes('跟催'), '缺少跟催导航');
+  check(html.includes('时间线'), '缺少时间线导航');
   check(html.includes('开始使用'), '缺少开始使用（配置向导）导航');
   check(html.includes('设置'), '缺少设置导航');
 });
@@ -2834,6 +2836,75 @@ await step('跟催：我承诺的 / 等对方回复 两栏，状态按钮与超�
   }
 });
 
+await step('时间线：项目标签切换、四类来源标注、空状态说明标签来源', async () => {
+  const tl = await import('../web/views/timeline.js');
+  const container = document.createElement('div');
+  document.body.append(container);
+  const { api } = await import('../web/api.js');
+  const real = { projects: api.projects, timeline: api.timeline, rename: api.renameProject };
+  const calls = [];
+  try {
+    api.projects = () =>
+      Promise.resolve({
+        ok: true,
+        projects: [
+          { key: 'a', name: '华东区投标', count: 4, aliases: ['华东投标'], sources: { mail: 2, draft: 1, followUp: 1 } },
+          { key: 'b', name: '官网改版', count: 2, aliases: [], sources: { mail: 2 } },
+        ],
+        unclassified: 3,
+      });
+    api.timeline = (project) => {
+      calls.push(project);
+      return Promise.resolve({
+        ok: true,
+        project,
+        calendarNote: '日程来自本程序的操作记录；别人在 Google 日历上直接创建的日程不会出现在这里',
+        counts: { mail: 2, calendar: 1 },
+        entries: [
+          { at: '2026-10-01T09:00:00Z', kind: 'mail', source: '收到的邮件', title: '招标公告', detail: '公告', meta: { from: 'a@x.com', needsReply: false } },
+          { at: '2026-10-03T09:00:00Z', kind: 'calendar', source: '日程', title: '答疑会', meta: {} },
+          { at: '2026-10-04T09:00:00Z', kind: 'followUp', source: '等对方回复', title: '等确认保证金', meta: { status: 'open' } },
+        ],
+      });
+    };
+    api.renameProject = (from, to) => {
+      calls.push(from + '->' + to);
+      return Promise.resolve({ ok: true, moved: 2, message: '已把记录并入' });
+    };
+
+    tl.renderTimeline(container, { viewStates: {}, navigate() {}, refreshCounts() {}, invalidateAll() {}, paintNav() {} });
+    await new Promise((r) => setTimeout(r, 200));
+    const text = container.textContent;
+    check(/华东区投标/.test(text) && /官网改版/.test(text), '应列出项目标签');
+    check(/未归类/.test(text), '未归类也应是可点入口');
+    check(/已合并的旧名字/.test(text) && /华东投标/.test(text), '应显示合并过的旧名（让用户明白标签为何收敛）');
+    check(/收到的邮件/.test(text) && /日程/.test(text) && /等对方回复/.test(text), '每条都要标注来源');
+    check(/别人在 Google 日历上直接创建/.test(text), '必须如实说明日程来源的局限');
+    check(/重命名 \/ 合并/.test(text), '应有重命名合并入口');
+    check(calls.includes('华东区投标'), '应默认加载项目最多的那个（实际 ' + JSON.stringify(calls) + '）');
+
+    // 切到另一个项目
+    const chip = [...container.querySelectorAll('.setup-chip')].find((b) => /官网改版/.test(b.textContent));
+    chip.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 150));
+    check(calls.filter((c) => c === '官网改版').length >= 1, '点标签应加载对应项目的时间线');
+
+    // 空状态：没有任何项目时要说清标签从哪来
+    api.projects = () => Promise.resolve({ ok: true, projects: [], unclassified: 0 });
+    const c2 = document.createElement('div');
+    document.body.append(c2);
+    tl.renderTimeline(c2, { viewStates: {}, navigate() {}, refreshCounts() {}, invalidateAll() {}, paintNav() {} });
+    await new Promise((r) => setTimeout(r, 200));
+    check(/还没有可归类的邮件/.test(c2.textContent), '空状态应给出引导');
+    check(/分析邮件/.test(c2.textContent), '空状态应说清标签是分析时产生的');
+    c2.remove();
+  } finally {
+    api.projects = real.projects;
+    api.timeline = real.timeline;
+    api.renameProject = real.rename;
+    container.remove();
+  }
+});
 await step('总览页：配置没配完时顶部给出「开始使用」引导', async () => {
   const overview = await import('../web/views/overview.js');
   const container = document.createElement('div');

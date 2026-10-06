@@ -3360,6 +3360,71 @@ await test('项目标签：分类提示词给出字段与"照抄已知标签"的
   assertEqual(tidyProject(''), '', '空值就是"不属于任何项目"');
 });
 
+/* -------------------------------------------------- 24. 项目时间线 */
+
+await test('时间线：按项目聚合四类来源，未归类不含日程（不编造关联）', async () => {
+  const { buildTimeline, listProjects, projectKey } = await import('../server/timeline.js');
+  const analyses = [
+    { project: '华东区投标', mail: { date: '2026-10-01T09:00:00Z', subject: '招标公告', from: { address: 'a@x.com' } }, summary: '公告' },
+    { project: '华东区投标', mail: { date: '2026-10-03T09:00:00Z', subject: '答疑', from: { name: '李总' } }, summary: '答疑', needsReply: true },
+    { project: '', mail: { date: '2026-10-02T09:00:00Z', subject: '日常杂事' }, summary: '' },
+  ];
+  const drafts = [{ id: 'd1', status: 'sent', project: '华东区投标', subject: '我方回复', sentAt: '2026-10-04T09:00:00Z', to: ['a@x.com'] }];
+  const followUps = { f1: { id: 'f1', kind: 'waiting', project: '华东区投标', title: '等确认保证金', since: '2026-10-05T09:00:00Z', status: 'open' } };
+  const audit = [
+    { at: '2026-10-06T02:00:00Z', action: 'calendar.event.create', target: '华东区投标答疑会' },
+    { at: '2026-10-06T03:00:00Z', action: 'calendar.event.create', target: '不相关的会' },
+    { at: '2026-10-06T04:00:00Z', action: 'draft.send', target: '不该出现的非日程记录' },
+  ];
+
+  const tl = buildTimeline({ project: '华东区投标', analyses, drafts, followUps, audit });
+  assertEqual(tl.length, 5, '应是 邮件2 + 我发出的1 + 跟催1 + 日程1（实际 ' + tl.length + '）');
+  // 时间必须升序——时间线的意义就在顺序
+  for (let i = 1; i < tl.length; i += 1) {
+    assert(new Date(tl[i].at) >= new Date(tl[i - 1].at), '时间线必须按时间升序');
+  }
+  assertEqual(tl.map((e) => e.kind).join(','), 'mail,mail,draft,followUp,calendar', '四类来源都要在且顺序正确');
+  assert(tl.every((e) => e.source), '每一条都要带来源（界面靠它告诉用户这是什么）');
+  assert(!tl.some((e) => /不相关|不该出现/.test(e.title)), '不该混入不匹配的项目与飞日程记录');
+
+  // 未归类：只含没有标签的邮件，**绝不含日程**（台账里的日程没有项目标签，塞进来等于编造关联）
+  const un = buildTimeline({ project: '', analyses, drafts: [], followUps: {}, audit });
+  assertEqual(un.length, 1, '未归类应只有 1 封邮件');
+  assertEqual(un[0].kind, 'mail', '未归类里不该出现日程');
+  assertEqual(un[0].title, '日常杂事', '应是那封没有标签的邮件');
+
+  // 匹配要忽略大小写与标点
+  assertEqual(projectKey('  华东区 投标 '), projectKey('华东区投标'), '空白不该影响匹配');
+});
+
+await test('时间线：合并会改写历史标签并记成别名（否则碎掉的两半合不回来）', async () => {
+  const { mergeProjects, listProjects, projectKey } = await import('../server/timeline.js');
+  const analyses = [
+    { project: '华东区投标', mail: { date: '2026-10-01T00:00:00Z', subject: 'a' } },
+    { project: '华东投标', mail: { date: '2026-10-02T00:00:00Z', subject: 'b' } },
+  ];
+  const drafts = [{ id: 'd1', status: 'sent', project: '华东投标', subject: 'c', sentAt: '2026-10-03T00:00:00Z' }];
+  const followUps = { f1: { id: 'f1', kind: 'mine', project: '华东投标', title: 't', since: '2026-10-04T00:00:00Z' } };
+
+  const before = listProjects({ analyses, drafts, followUps });
+  assertEqual(before.length, 2, '合并前应是两个项目（这就是碎片化）');
+
+  const out = mergeProjects({ from: '华东投标', to: '华东区投标', analyses, drafts, followUps, registry: {} });
+  assertEqual(out.moved.analyses, 1, '应改写 1 条分析记录');
+  assertEqual(out.moved.drafts, 1, '应改写 1 条草稿');
+  assertEqual(out.moved.followUps, 1, '应改写 1 条跟催');
+  const reg = Object.values(out.registry)[0];
+  assert(reg.aliases.map(projectKey).includes(projectKey('华东投标')), '旧名必须进别名（下次遇到也要归到一起）');
+
+  const after = listProjects({ analyses: out.nextAnalyses, drafts: out.nextDrafts, followUps: out.nextFollowUps, registry: out.registry });
+  assertEqual(after.length, 1, '合并后应只剩一个项目');
+  assertEqual(after[0].count, 4, '四条记录都要在（2 邮件 + 1 草稿 + 1 跟催）');
+
+  // 合并到自己是空操作，不该误改
+  const noop = mergeProjects({ from: '同名', to: '同名', analyses, drafts, followUps, registry: {} });
+  assertEqual(noop.moved.analyses, 0, '合并到同名应是空操作');
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await imap.close();
