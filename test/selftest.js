@@ -3425,6 +3425,56 @@ await test('时间线：合并会改写历史标签并记成别名（否则碎�
   assertEqual(noop.moved.analyses, 0, '合并到同名应是空操作');
 });
 
+/* -------------------------------------------------- 25. HTML 正文按需提取 */
+
+await test('HTML：extractHtmlBody 能取出富文本，且不进分析记录（防 state 膨胀）', async () => {
+  const { extractHtmlBody, parseMessage } = await import('../server/mail/parse.js');
+  const mime = [
+    'From: =?utf-8?B?5p2O5oC7?= <li@client.com>',
+    'To: me@example.com',
+    'Subject: =?utf-8?B?5oql5Lu35Yqh5q+U?=',
+    'Date: Mon, 06 Oct 2026 09:00:00 +0800',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/alternative; boundary="B1"',
+    '',
+    '--B1',
+    'Content-Type: text/plain; charset=utf-8',
+    '',
+    '这是纯文本版本。',
+    '--B1',
+    'Content-Type: text/html; charset=utf-8',
+    '',
+    '<html><body><p>这是<b>富文本</b>版本。</p><img src="https://tracker.test/x.gif"><script>alert(1)</script></body></html>',
+    '--B1--',
+    '',
+  ].join('\r\n');
+
+  const html = await extractHtmlBody(mime);
+  assertEqual(html.hasHtml, true, '应认出这是 HTML 邮件');
+  assertIncludes(html.html, '<b>富文本</b>', '应取到 HTML 源码（原样，未净化）');
+  assertIncludes(html.html, 'tracker.test', '远程图片的地址要原样带出来（净化与拦截由前端做）');
+  assertIncludes(html.html, '<script>', '服务端不负责净化——净化必须在渲染前由前端白名单完成');
+
+  // 纯文本邮件不该被当成 HTML（否则界面会给出一个"渲染 HTML"的空按钮）
+  const plainOnly = await extractHtmlBody('From: a@b.com\r\nSubject: t\r\n\r\n纯文本正文\r\n');
+  assertEqual(plainOnly.hasHtml, false, '只有纯文本时不该报"有 HTML"');
+
+  // 坏输入不能抛错（详情页不该因为解析失败整页崩掉）
+  for (const bad of [null, undefined, '', 'not a mail at all']) {
+    const r = await extractHtmlBody(bad);
+    assertEqual(r.hasHtml, false, '坏输入应安全返回空（' + JSON.stringify(bad) + '）');
+  }
+
+  /*
+   * 关键保证：**parseMessage 的返回值里不能有 html**。
+   * 那个结果会被写进分析记录，邮件 HTML 动辄几十 KB，全量落盘会让 state.json 迅速膨胀。
+   */
+  const parsed = await parseMessage(mime);
+  assert(!('html' in parsed), 'parseMessage 不得返回 html 字段（防 state 膨胀）');
+  assert(parsed.body && parsed.body.includes('纯文本版本'), '正文仍应是纯文本（可读、可送模型）');
+  assertEqual(parsed.bodyFormat, 'text', '有纯文本时应记为 text');
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await imap.close();
