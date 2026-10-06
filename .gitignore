@@ -1,0 +1,46 @@
+# ⚠️ 这个文件比看上去重要。
+#
+# 一旦 `data/` 或 `.env` 被提交并推到 GitHub，就等于把**邮箱授权码、大模型 API Key、
+# Google refresh token、真实邮件原文**公开出去；即使随后删除，历史提交里仍然留着，
+# 必须重写历史才能清掉。
+#
+# 旧版这里是**逐文件列举**的，因此漏掉了 `data/google-token.json`（活的 OAuth 令牌）、
+# `data/audit.jsonl`（含真实人名与日程标题）和 `data/attachments/`。
+# 现在改成"整目录排除"，新增的运行数据文件自动被挡住，不会再漏。
+
+# 依赖与运行时
+node_modules/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+.npm-cache/
+.pnpm-store/
+
+# 密钥与本地配置（务必不要提交）
+.env
+.env.*
+!.env.example
+
+# 运行数据：凭据 + 真实邮件 + 台账，整目录排除
+data/
+
+# 其它可能落盘的令牌/备份
+*.token.json
+*.broken-*
+*.tmp
+*.bak
+
+# 运行产物
+.tmp-dbg/
+coverage/
+.nyc_output/
+*.log
+logs/
+
+# 编辑器与系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp

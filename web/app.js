@@ -1,0 +1,894 @@
+/** 主壳：导航、全局进度、视图切换、计数徽标。 */
+
+import { api, subscribeProgress } from './api.js';
+import { attachmentButton, copyButton, fmtAddress, fmtBytes, fmtFull, h, mount, openModal, setDisplayTimeZone, toast, toastError } from './dom.js';
+import { THEMES, applyTheme, effectiveTheme, initTheme } from './theme.js';
+import { invalidate, invalidateAll } from './view-state.js';
+import { renderOverview } from './views/overview.js';
+import { renderDrafts } from './views/drafts.js';
+import { renderSearch } from './views/search.js';
+import { renderCalendar } from './views/calendar.js';
+import { renderKnowledge } from './views/knowledge.js';
+import { renderRecords } from './views/records.js';
+import { renderSettings } from './views/settings.js';
+
+const VIEWS = [
+  { id: 'overview', label: '邮件总览' },
+  { id: 'drafts', label: '邮件草稿' },
+  { id: 'search', label: '对话查邮件' },
+  { id: 'calendar', label: '日历' },
+  { id: 'knowledge', label: '知识库' },
+  { id: 'records', label: '运行与记录' },
+  { id: 'settings', label: '设置' },
+];
+
+/** 供测试与调试使用的应用实例。 */
+export { app };
+
+const PHASE_TEXT = {
+  starting: '准备中…',
+  connecting: '连接邮箱…',
+  fetching: '拉取邮件…',
+  reading: '读取正文…',
+  threads: '整理会话…',
+  analyzing: 'AI 分析中…',
+  drafting: '起草回复…',
+  reporting: '生成简报…',
+  done: '完成',
+  error: '失败',
+  cancelled: '已取消',
+};
+
+const app = {
+  current: null,
+  viewId: null,
+  running: false,
+  counts: null,
+  progress: null,
+  els: {},
+  /** 各视图持久化的内部状态（切走再切回不丢上下文） */
+  viewStates: {},
+  /** 跨视图跳转参数（例如「已发送邮件」要直达草稿页的「已发送」标签） */
+  navParams: {},
+
+  /**
+   * 切换视图。
+   * @param {string} viewId
+   * @param {object} [params] 传给目标视图的一次性参数，由目标视图用 takeNavParams 取走
+   */
+  navigate(viewId, params) {
+    if (!VIEWS.some((v) => v.id === viewId)) viewId = 'overview';
+    const sameView = viewId === this.viewId;
+    if (params && typeof params === 'object') this.navParams[viewId] = { ...(this.navParams[viewId] || {}), ...params };
+    this.viewId = viewId;
+    location.hash = `#/${viewId}`;
+    this.renderView();
+    this.paintNav();
+    // 切换标签页要回到顶部：否则从长列表底部跳到另一页，会停在半空的内容里
+    // （同一页内带着跳转参数重绘时不重置，避免「跳到某封草稿」被顶掉）
+    if (!sameView) {
+      scrollPageToTop();
+      app.syncBackToTop?.();
+    }
+  },
+
+  /** 取出并清空跳转参数（一次性，避免下次普通进入页面又被带偏） */
+  takeNavParams(viewId) {
+    const params = this.navParams[viewId] || null;
+    this.navParams[viewId] = null;
+    return params;
+  },
+
+  renderView() {
+    const view = VIEWS.find((v) => v.id === this.viewId) || VIEWS[0];
+    const factory = {
+      overview: renderOverview,
+      drafts: renderDrafts,
+      search: renderSearch,
+      calendar: renderCalendar,
+      knowledge: renderKnowledge,
+      records: renderRecords,
+      settings: renderSettings,
+    }[view.id];
+    this.current = factory(this.els.main, this) || null;
+  },
+
+  reloadCurrent() {
+    if (this.current?.reload) return this.current.reload();
+    this.renderView();
+    return Promise.resolve();
+  },
+
+  /**
+   * 声明数据已变更，所有视图下次进入时重新取数。
+   * 任何会改数据的操作（起草 / 发送 / 删除 / 重写 / 补签名 / 补引文 / 同步草稿箱 /
+   * 跑分析 / 改设置）结束后都必须调用它，否则总览的按钮状态会停留在旧值。
+   */
+  invalidateAll() {
+    invalidateAll(this);
+  },
+
+  /** 标记单个视图过期。 */
+  invalidate(key) {
+    invalidate(this, key);
+  },
+
+  /**
+   * 数据变更后统一收尾：失效缓存 + 刷新徽标 + **按当前视图重新取数**。
+   *
+   * 与 analyze() 早先的写法相比，这里对**所有**视图都走 reload（而不是只对
+   * overview/knowledge），因为草稿页的 `reload` 才会真正重新拉列表。
+   */
+  async syncAfterChange() {
+    this.invalidateAll();
+    await this.refreshCounts();
+    const reloaded = this.current?.reload?.();
+    if (reloaded && typeof reloaded.then === 'function') await reloaded;
+    else await this.reloadCurrent();
+  },
+
+  /**
+   * 处理一条进度事件。
+   *
+   * 抽成方法（而不是内联在 subscribeProgress 里）有两个好处：
+   * 一是定时任务跑完时**用户没点过任何按钮**，这里必须主动失效缓存并重取，
+   *   否则页面要等用户手动刷新才更新（总览页已经没有「刷新」按钮了）；
+   * 二是前端渲染测试可以直接投递事件验证这条链路，而不需要模拟 EventSource。
+   */
+  onProgressEvent(event) {
+    if (!event || event.type === 'stream:error') return;
+    /*
+     * 定时分析跑完的提醒。
+     *
+     * 独立于进度条：它可能在**你没看页面**的时候到（页面开着但切到别的标签页），
+     * 所以除了页内弹条，还要按需发浏览器桌面通知——只有邮件能在你什么都没打开时找到你。
+     */
+    if (event.type === 'notify') {
+      this.handleNotify(event);
+      return;
+    }
+    this.showProgress(event);
+    if (event.type === 'run:done' || event.type === 'run:error') {
+      this.invalidateAll();
+      // 跑完就刷新徽标与当前页数据
+      Promise.resolve(this.refreshCounts())
+        .then(() => this.reloadCurrent())
+        .catch(() => {});
+    }
+  },
+
+  /** 定时任务的通知：页内弹条 + （可选）桌面通知。 */
+  handleNotify(event) {
+    const bits = [];
+    if (event.needsReply) bits.push(`需要你处理 ${event.needsReply} 封`);
+    if (event.drafts) bits.push(`新起草 ${event.drafts} 封`);
+    const text = bits.length ? `自动分析完成：${bits.join('，')}` : `自动分析完成：拉取 ${event.fetched ?? 0} 封，没有需要你处理的`;
+    toast(text, bits.length ? 'success' : 'info', 8000);
+    this.invalidateAll();
+    Promise.resolve(this.refreshCounts()).catch(() => {});
+
+    // 桌面通知：只有用户开了开关、且浏览器已授权才发
+    if (!this.notifyBrowser || typeof Notification === 'undefined') return;
+    if (Notification.permission !== 'granted') return;
+    try {
+      const n = new Notification('轻效 · 邮件与日历数字人', { body: text, tag: 'mailbot-schedule' });
+      n.onclick = () => {
+        window.focus();
+        this.navigate('overview');
+      };
+    } catch {
+      /* 某些浏览器在非安全上下文下会抛，忽略即可 */
+    }
+  },
+
+  async refreshCounts() {
+    try {
+      const res = await api.status();
+      this.counts = res.counts;
+      this.running = res.running;
+      this.paintNav();
+    } catch {
+      /* 静默 */
+    }
+  },
+
+  paintNav() {
+    for (const btn of this.els.navButtons) {
+      const id = btn.dataset.view;
+      btn.classList.toggle('active', id === this.viewId);
+      const badge =
+        id === 'drafts'
+          ? this.counts?.pendingDrafts
+          : id === 'overview'
+            ? this.counts?.needsReply
+            : 0;
+      let dot = btn.querySelector('.nav-badge');
+      if (badge) {
+        if (!dot) {
+          dot = h('span', { class: 'nav-badge' });
+          btn.append(dot);
+        }
+        dot.textContent = String(badge);
+      } else if (dot) {
+        dot.remove();
+      }
+    }
+  },
+
+  paintRunButton() {
+    const btn = this.els.runBtn;
+    if (!btn) return;
+    btn.disabled = this.running;
+    btn.textContent = this.running ? '分析中…' : '分析最近 24 小时';
+  },
+
+
+  /* 全局进度条 */
+  showProgress(event) {
+    const bar = this.els.progress;
+    if (!bar) return;
+    const text = PHASE_TEXT[event.phase] || event.message || event.phase || '';
+    if (event.type === 'run:start') {
+      bar.hidden = false;
+      bar.classList.remove('progress-error', 'progress-done');
+      mount(
+        bar,
+        h('div', { class: 'progress-inner' },
+          h('div', { class: 'spinner' }),
+          h('span', { class: 'progress-text', text: text || '开始分析…' }),
+          h('button', { class: 'link-btn', onclick: () => app.cancelRun() }, '取消'),
+        ),
+      );
+      return;
+    }
+    if (event.type === 'phase' || event.type === 'analyze:progress' || event.type === 'read:progress' || event.type === 'fetch:progress') {
+      bar.hidden = false;
+      const detail =
+        event.type === 'analyze:progress'
+          ? `AI 分析 ${event.done}/${event.total} 封`
+          : event.type === 'read:progress'
+            ? `读取正文 ${event.done}/${event.total}`
+            : event.type === 'fetch:progress'
+              ? `拉取 ${event.folder} ${event.done}/${event.total}`
+              : text;
+      const pct =
+        event.total && event.done !== undefined
+          ? Math.round((event.done / event.total) * 100)
+          : event.type === 'phase'
+            ? null
+            : null;
+      mount(
+        bar,
+        h('div', { class: 'progress-inner' },
+          h('div', { class: 'spinner' }),
+          h('span', { class: 'progress-text', text: detail }),
+          pct !== null ? h('span', { class: 'muted small', text: `${pct}%` }) : null,
+          h('button', { class: 'link-btn', onclick: () => app.cancelRun() }, '取消'),
+        ),
+      );
+      return;
+    }
+    if (event.type === 'draft:created') {
+      toast(`已起草：${event.draft.subject}`, 'success', 2600);
+    }
+    if (event.type === 'run:done') {
+      bar.classList.add('progress-done');
+      mount(
+        bar,
+        h('div', { class: 'progress-inner' },
+          h('span', { class: 'progress-text', text: `分析完成：${event.result.analyzed} 封，需回复 ${event.result.needsReply} 封，起草 ${event.result.drafts} 封` }),
+        ),
+      );
+      setTimeout(() => {
+        bar.hidden = true;
+      }, 6000);
+    }
+    if (event.type === 'run:error') {
+      bar.classList.add('progress-error');
+      mount(
+        bar,
+        h('div', { class: 'progress-inner' },
+          h('span', { class: 'progress-text', text: `分析失败：${event.message}` }),
+          h('button', { class: 'link-btn', onclick: () => (bar.hidden = true) }, '关闭'),
+        ),
+      );
+    }
+  },
+
+  async analyze(options = {}) {
+    if (this.running) return toast('已有分析在进行中', 'info');
+    this.running = true;
+    this.paintRunButton();
+    this.showProgress({ type: 'run:start' });
+    try {
+      const res = await api.run({ trigger: options.trigger || 'manual', windowHours: options.windowHours, scope: options.scope });
+      const r = res.result;
+      if (r?.cancelled) {
+        toast('已取消分析', 'info');
+      } else {
+        this.showProgress({ type: 'run:done', result: r });
+        toast(`分析完成：${r.analyzed} 封邮件，起草 ${r.drafts} 封`, 'success', 5000);
+      }
+      await this.refreshCounts();
+      // 跑完分析后所有页面（尤其是草稿页的列表）都必须重新取数
+      this.invalidateAll();
+      await this.reloadCurrent();
+      return r;
+    } catch (err) {
+      this.showProgress({ type: 'run:error', message: err.message });
+      toast(err.message, 'error', 7000);
+      throw err;
+    } finally {
+      this.running = false;
+      this.paintRunButton();
+    }
+  },
+
+  async cancelRun() {
+    try {
+      await api.cancel();
+      toast('已请求取消，等待当前步骤结束', 'info');
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+  },
+
+  /** 对某一封邮件单独起草回复 */
+  async draftFor(key) {
+    const [folder, uid] = String(key).split(':');
+    const res = await api.run({ scope: { folder, uid: Number(uid) }, trigger: 'single' });
+    // 起草会改变「这封邮件有没有草稿」——总览的按钮状态依赖它，必须失效
+    this.invalidateAll();
+    await this.refreshCounts();
+    return res.result;
+  },
+
+  /**
+   * 查看某封邮件的分析详情。
+   *
+   * 走 `/api/mails/:folder/:uid`（不受 24 小时窗口限制），因此「对话查邮件」里检索到的
+   * 上个月的邮件也能打开。三种情况都要有明确出路，不能只弹一句「未找到」：
+   *   - 有分析记录 → 直接展示；
+   *   - 只有归档原文 → 展示原文摘录 + 「立即分析这一封」；
+   *   - 本地什么都没有 → 用检索结果里已有的信息兜底展示，并提示可以现场分析。
+   *
+   * @param {string} key `folder:uid`
+   * @param {object} [fallback] 调用方已知的邮件信息（检索结果行），用于兜底展示
+   * @param {object} [options] { tab: 'analysis' | 'original' }
+   */
+  async showMail(key, fallback = null, options = {}) {
+    const [folder, uidRaw] = String(key || '').split(':');
+    const uid = Number(uidRaw);
+    if (!folder || !Number.isFinite(uid)) return toast('这封邮件的标识不完整，无法打开详情', 'error');
+    try {
+      const detail = await api.mailDetail(folder, uid);
+      showMailModal(detail, fallback, this, options.tab || 'analysis');
+    } catch (err) {
+      // 404（本地没有任何记录）不是错误路径：用已知信息兜底，仍然让用户能操作
+      if (err.status === 404 || err.code === 'ANALYSIS_NOT_FOUND') {
+        showMailModal(
+          { found: false, analyzed: false, mail: { folder, uid }, analysis: null, draft: null, body: null, rawExcerpt: null, note: '' },
+          fallback,
+          this,
+        );
+        return;
+      }
+      toastError(err);
+    }
+  },
+};
+
+/* ------------------------------------------------------------ 弹窗 */
+
+/**
+ * 邮件详情弹窗：两个页签。
+ *
+ *   「AI 分析」 —— 结论、待办、判断依据、关联草稿
+ *   「原始邮件」 —— 邮件头 + **正文全文**（引用历史单独折叠）+ 附件 + 复制
+ *
+ * 为什么要有第二个页签：审稿时最需要的是"对方原话到底怎么说的"。
+ * 只给一句 AI 摘要，用户还得回邮件客户端翻原信——这一步必须省掉。
+ *
+ * 正文只渲染**纯文本**（`<pre>`）：HTML 邮件原样注入会带来 XSS 面，
+ * 而本项目所有分析都基于纯文本，展示纯文本也最忠实。
+ *
+ * @param {object} detail 后端 /api/mails/:folder/:uid 的返回
+ * @param {object|null} fallback 调用方已知的邮件信息（检索结果行）
+ * @param {object} app
+ * @param {string} [initialTab] 'analysis' | 'original'
+ */
+function showMailModal(detail, fallback, app, initialTab = 'analysis') {
+  const analysis = detail.analysis || null;
+  const bodyInfo = detail.body || null;
+  const mail = { ...(fallback || {}), ...(detail.mail || {}) };
+  // 原始邮件头以原文解析结果为准（更权威），列表项只作兜底
+  const original = bodyInfo?.available
+    ? {
+        subject: bodyInfo.subject || mail.subject,
+        from: bodyInfo.from || mail.from,
+        to: bodyInfo.to?.length ? bodyInfo.to : mail.to,
+        cc: bodyInfo.cc?.length ? bodyInfo.cc : mail.cc,
+        date: bodyInfo.date || mail.date,
+        messageId: bodyInfo.messageId || mail.messageId,
+        attachments: bodyInfo.attachments?.length ? bodyInfo.attachments : mail.attachments,
+      }
+    : mail;
+
+  const hasDraft = !!detail.draft;
+  const sent = detail.draft?.status === 'sent';
+  const bodyAvailable = bodyInfo?.available === true;
+  const overlay = h('div', { class: 'modal-overlay' });
+  let closeModal = () => {};
+  const close = () => closeModal();
+  overlay.onclick = (ev) => ev.target === overlay && close();
+
+  /* ---------------------------------------------------------- 主操作 */
+
+  /** 底部主操作：有草稿就去看草稿，没有就现起草。 */
+  function draftAction() {
+    if (hasDraft) {
+      return h(
+        'button',
+        {
+          class: 'btn btn-primary',
+          onclick: () => {
+            close();
+            app.navigate('drafts', { tab: sent ? 'sent' : 'pending', draftId: detail.draft.id });
+          },
+        },
+        sent ? '查看已发送邮件' : '查看草稿',
+      );
+    }
+    return h(
+      'button',
+      {
+        class: 'btn btn-primary',
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          btn.textContent = '起草中…';
+          try {
+            await app.draftFor(`${mail.folder}:${mail.uid}`);
+            close();
+            toast('草稿已生成', 'success');
+            app.navigate('drafts', { tab: 'pending' });
+          } catch (err) {
+            toast(err.message, 'error');
+            btn.disabled = false;
+            btn.textContent = '起草回复';
+          }
+        },
+      },
+      '起草回复',
+    );
+  }
+
+  /** 没有分析记录时的补救入口：就地把这一封拉下来分析。 */
+  function analyzeAction() {
+    if (analysis) return null;
+    return h(
+      'button',
+      {
+        class: 'btn',
+        onclick: async (ev) => {
+          const btn = ev.currentTarget;
+          btn.disabled = true;
+          btn.textContent = '分析中…';
+          try {
+            const result = await app.draftFor(`${mail.folder}:${mail.uid}`);
+            // 单封分析同时会走一遍起草逻辑：如果这封确实需要回复，会顺手生成草稿
+            if (result?.drafts > 0) {
+              toast('已分析这一封，并生成了回复草稿', 'success', 5000);
+              close();
+              app.navigate('drafts', { tab: 'pending' });
+              return;
+            }
+            toast('已分析这一封', 'success');
+            close();
+            await app.reloadCurrent();
+          } catch (err) {
+            toast(err.message, 'error');
+            btn.disabled = false;
+            btn.textContent = '立即分析这一封';
+          }
+        },
+      },
+      '立即分析这一封',
+    );
+  }
+
+  /* ---------------------------------------------------------- 页签内容 */
+
+  function analysisPanel() {
+    return h(
+      'div',
+      { class: 'panel-body' },
+      !analysis ? h('div', { class: 'alert alert-info' }, detail.note || '这封邮件还没有做过 AI 分析。') : null,
+      analysis?.summary ? h('blockquote', { class: 'quote', text: analysis.summary }) : null,
+      analysis?.actions?.length
+        ? h(
+            'div',
+            { class: 'panel-section' },
+            h('div', { class: 'panel-label' }, '待办'),
+            h('ul', { class: 'action-list' }, ...analysis.actions.map((a) => h('li', { text: a }))),
+          )
+        : null,
+      analysis?.reason ? h('p', { class: 'muted small', text: `判断依据：${analysis.reason}` }) : null,
+      analysis
+        ? h(
+            'p',
+            { class: 'muted small' },
+            `类型：${analysis.typeLabel || '—'}　优先级：${analysis.priorityLabel || '—'}　` +
+              `收件方式：${analysis.recipientKind === 'cc' ? '仅抄送我' : analysis.recipientKind === 'direct' ? '直接发我' : '未知'}`,
+          )
+        : null,
+      detail.draft
+        ? h(
+            'p',
+            { class: 'muted small' },
+            `关联草稿：${sent ? `已于 ${fmtFull(detail.draft.sentAt)} 发送` : '待审核'}（${detail.draft.subject}）` +
+              (detail.draft.quoted ? '　·　已带原文引文' : '　·　未带原文引文'),
+          )
+        : null,
+      mail.snippet && !analysis ? h('p', { text: mail.snippet }) : null,
+    );
+  }
+
+  function originalPanel() {
+    const atts = original.attachments || [];
+    const head = h(
+      'dl',
+      { class: 'mail-head-list' },
+      metaRow('发件人', fmtAddress(original.from)),
+      metaRow('收件人', (original.to || []).map(fmtAddress).join('、') || '—'),
+      (original.cc || []).length ? metaRow('抄送', original.cc.map(fmtAddress).join('、')) : null,
+      metaRow('时间', fmtFull(original.date)),
+      original.messageId ? metaRow('Message-ID', original.messageId, { mono: true }) : null,
+    );
+
+    if (!bodyAvailable) {
+      return h(
+        'div',
+        { class: 'panel-body' },
+        head,
+        h('div', { class: 'alert alert-warn' }, bodyInfo?.reason || '本地没有这封邮件的原文，无法显示全文。'),
+      );
+    }
+
+    const textBlock = h('pre', { class: 'mail-body-text', text: bodyInfo.text || '（正文为空）' });
+    const quotedBlock = bodyInfo.quoted
+      ? h(
+          'details',
+          { class: 'mail-quoted' },
+          h('summary', { text: `查看引用历史（${bodyInfo.quoted.length} 字）` }),
+          h('pre', { class: 'mail-body-text muted small', text: bodyInfo.quoted }),
+        )
+      : null;
+
+    return h(
+      'div',
+      { class: 'panel-body' },
+      head,
+      atts.length ? attachmentList(atts) : null,
+      h(
+        'div',
+        { class: 'panel-toolbar' },
+        h('span', { class: 'muted small', text: `${bodyInfo.chars} 字${bodyInfo.source === 'imap' ? '　·　刚刚从服务器取回' : '　·　来自本地归档'}` }),
+        copyButton(() => bodyInfo.text || '', { label: '复制正文', title: '复制原始邮件正文' }),
+      ),
+      textBlock,
+      quotedBlock,
+    );
+  }
+
+  /**
+   * 附件清单。
+   *
+   * 关键点：**序号必须与后端下载接口用的一致**。两边都用
+   * `visibleAttachments()` 过滤内嵌图片，所以这里的下标可以直接当接口参数。
+   * 附件内容本来就随原文存在本地归档里，点「保存」不会再去连邮箱。
+   */
+  function attachmentList(atts) {
+    return h(
+      'div',
+      { class: 'attachment-list' },
+      h(
+        'div',
+        { class: 'panel-label' },
+        `附件（${atts.length}）`,
+        h('span', { class: 'muted small', text: '　保存在本机，不会自动下载' }),
+      ),
+      ...atts.map((a, i) => {
+        const name = a.filename || `附件-${i + 1}`;
+        return h(
+          'div',
+          { class: 'attachment-row' },
+          h('span', { class: 'attachment-icon', text: '📎' }),
+          h(
+            'span',
+            { class: 'attachment-name', title: name },
+            name,
+          ),
+          h('span', { class: 'attachment-meta', text: attachmentMeta(a) }),
+          attachmentButton(() => api.attachmentUrl(mail.folder, mail.uid, i), name),
+        );
+      }),
+    );
+  }
+
+  /** 附件的大小与类型提示。 */
+  function attachmentMeta(a) {
+    const size = typeof a.size === 'number' && a.size > 0 ? fmtBytes(a.size) : '';
+    const type = String(a.contentType || '').split(';')[0].replace('application/', '').replace('image/', '');
+    return [type, size].filter(Boolean).join(' · ');
+  }
+
+  function metaRow(label, value, { mono = false } = {}) {
+    return h(
+      'div',
+      { class: 'mail-head-row' },
+      h('dt', { text: label }),
+      h('dd', { class: mono ? 'mono' : '', text: value || '—' }),
+    );
+  }
+
+  /* ---------------------------------------------------------- 组装 */
+
+  const tabs = [
+    { id: 'analysis', label: 'AI 分析' },
+    { id: 'original', label: '原始邮件', disabled: false },
+  ];
+  let active = tabs.some((t) => t.id === initialTab) ? initialTab : 'analysis';
+  const tabBar = h('div', { class: 'tabs tabs-inline modal-tabs', role: 'tablist' });
+  const panel = h('div', { class: 'modal-panel' });
+
+  const paintTabs = () => {
+    mount(
+      tabBar,
+      ...tabs.map((t) =>
+        h(
+          'button',
+          {
+            class: `tab ${active === t.id ? 'active' : ''}`,
+            role: 'tab',
+            'aria-selected': active === t.id ? 'true' : 'false',
+            onclick: () => {
+              active = t.id;
+              paintTabs();
+            },
+          },
+          t.label,
+          t.id === 'original' && bodyAvailable ? h('span', { class: 'tab-badge', text: `${bodyInfo.chars} 字` }) : null,
+        ),
+      ),
+    );
+    mount(panel, active === 'original' ? originalPanel() : analysisPanel());
+  };
+  paintTabs();
+
+  const modal = h(
+    'div',
+    { class: 'modal modal-wide modal-mail', role: 'dialog', 'aria-modal': 'true' },
+    h(
+      'div',
+      { class: 'modal-head' },
+      h('h3', { class: 'modal-title', text: original.subject || mail.subject || analysis?.subject || '(无主题)' }),
+      h('div', { class: 'modal-head-actions' }, copyButton(() => String(original.messageId || ''), { label: '复制 Message-ID', className: 'btn btn-small btn-quiet' })),
+    ),
+    tabBar,
+    panel,
+    h('div', { class: 'modal-actions' }, h('button', { class: 'btn', onclick: close }, '关闭'), analyzeAction(), draftAction()),
+  );
+  overlay.append(modal);
+  closeModal = openModal(overlay);
+}
+
+/* ------------------------------------------------------------ 启动 */
+
+/** 品牌名。改这里一处即可（顶栏、标题、页脚都引用它）。 */
+export const BRAND = '轻效 | Ease & Effect';
+
+function buildShell(root) {
+  const navButtons = VIEWS.map((v) =>
+    h('button', { class: 'nav-btn', dataset: { view: v.id }, onclick: () => app.navigate(v.id) }, v.label),
+  );
+  const progress = h('div', { class: 'progress-bar', hidden: true });
+
+  /*
+   * 返回顶部。
+   *
+   * 页面本身（window/document）才是滚动容器：`.main` 没有 overflow，
+   * 所以长列表（例如「值得知悉」展开一百多封）会把整个页面撑长。
+   * 因此监听 window 的滚动，超过一屏的一半才出现，避免在短页面里打扰。
+   */
+  const backToTop = h(
+    'button',
+    {
+      class: 'back-to-top',
+      type: 'button',
+      title: '返回顶部',
+      'aria-label': '返回顶部',
+      hidden: true,
+      onclick: () => scrollPageToTop(),
+    },
+    h('span', { class: 'back-to-top-arrow', text: '↑' }),
+    h('span', { class: 'back-to-top-text', text: '顶部' }),
+  );
+
+  // 右上角品牌标志（Logo 图片 + 名称）。分析入口只保留在「邮件总览」页内，这里不再放「分析最近 24 小时」。
+  const logo = h(
+    'div',
+    { class: 'brand-lockup', title: `${BRAND} · 邮箱与日历数字人` },
+    h('img', { class: 'topbar-logo', src: './assets/logo.png', alt: BRAND }),
+    h('span', { class: 'topbar-brand-name', text: BRAND }),
+  );
+
+  const shell = h(
+    'div',
+    { class: 'app' },
+    h(
+      'header',
+      { class: 'topbar' },
+      h(
+        'div',
+        { class: 'brand' },
+        h('span', { class: 'brand-mark', text: '✉' }),
+        h(
+          'div',
+          {},
+          h('div', { class: 'brand-name', text: '邮箱与日历数字人' }),
+          h('div', { class: 'brand-sub', text: 'IMAP/SMTP · Google 日历 · 按对话意图取数' }),
+        ),
+      ),
+      h('nav', { class: 'nav', role: 'tablist' }, ...navButtons),
+      h('div', { class: 'topbar-actions' }, themeSwitcher(), logo),
+    ),
+    progress,
+    h('main', { class: 'main', id: 'main' }),
+    backToTop,
+    h(
+      'footer',
+      { class: 'footer' },
+      h('span', { text: '邮件草稿与日程写入都需你逐封确认；数据只保存在本机。© 2026 mail.wwu@gmail.com' }),
+    ),
+  );
+
+  mount(root, shell);
+  app.els = { navButtons, progress, main: shell.querySelector('#main'), backToTop };
+  bindBackToTop(backToTop);
+}
+
+/**
+ * 返回顶部按钮的滚动联动。
+ *
+ * 用 `passive` 监听并只在**跨越阈值时**改一次 DOM：滚动事件每秒可能触发几十次，
+ * 每次都写 hidden/class 会造成明显的滚动掉帧。
+ */
+function bindBackToTop(button) {
+  if (!button) return;
+  const THRESHOLD = 320;
+  let shown = false;
+  const sync = () => {
+    const y = window.scrollY || document.documentElement?.scrollTop || 0;
+    const next = y > THRESHOLD;
+    if (next === shown) return;
+    shown = next;
+    button.hidden = !next;
+    button.classList.toggle('is-visible', next);
+  };
+  window.addEventListener('scroll', sync, { passive: true });
+  window.addEventListener('resize', sync, { passive: true });
+  sync();
+  app.syncBackToTop = sync;
+}
+
+/**
+ * 平滑回到页面顶部。
+ *
+ * 先判存在再调用：最小 DOM 环境（测试用的 linkedom）没有 `window.scrollTo`，
+ * 而"回退到无参调用"会把 TypeError 再抛一次——这个坑之前在 scrollToEl 上踩过一次。
+ */
+export function scrollPageToTop() {
+  if (typeof window?.scrollTo !== 'function') return;
+  try {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  } catch {
+    /* 不支持对象参数时忽略，下面的兜底会处理 */
+  }
+  // 某些环境下平滑滚动不生效（或被 prefers-reduced-motion 关掉），兜一次底
+  setTimeout(() => {
+    try {
+      if ((window.scrollY || 0) > 4) window.scrollTo(0, 0);
+    } catch {
+      /* 忽略 */
+    }
+  }, 400);
+}
+
+/**
+ * 外观模式切换（浅色 / 深色 / 绿色）。
+ *
+ * 三个按钮常驻顶栏：外观是随时可能想调的东西，埋进设置页反而找不到。
+ * 点击即生效并记住；没点过的时候跟随系统（老用户升级后外观不会突变）。
+ */
+function themeSwitcher() {
+  const buttons = [];
+  const paint = () => {
+    const active = effectiveTheme();
+    for (const btn of buttons) {
+      const on = btn.dataset.theme === active;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+    }
+  };
+  const group = h('div', { class: 'theme-switch', role: 'group', 'aria-label': '外观模式' });
+  for (const theme of THEMES) {
+    const btn = h(
+      'button',
+      {
+        class: 'theme-btn',
+        dataset: { theme: theme.id },
+        title: `${theme.label}（${theme.hint}）`,
+        onclick: () => {
+          applyTheme(theme.id);
+          paint();
+        },
+      },
+      h('span', { class: 'theme-icon', 'aria-hidden': 'true', text: theme.icon }),
+      theme.label,
+    );
+    buttons.push(btn);
+    group.append(btn);
+  }
+  paint();
+  app.els.themeButtons = buttons;
+  app.paintTheme = paint;
+  return group;
+}
+
+export function boot() {
+  const root = document.getElementById('root');
+  // 外观模式要在渲染外壳之前定下来，否则切换按钮的选中态会对不上。
+  // initTheme() 返回取消监听函数（系统外观变化时自动跟随）。
+  app.stopThemeWatch = initTheme();
+  buildShell(root);
+
+  subscribeProgress((event) => app.onProgressEvent(event));
+
+  window.addEventListener('hashchange', () => {
+    const id = location.hash.replace(/^#\/?/, '') || 'overview';
+    if (id !== app.viewId) app.navigate(id);
+  });
+
+  const initial = location.hash.replace(/^#\/?/, '') || 'overview';
+  app.viewId = VIEWS.some((v) => v.id === initial) ? initial : 'overview';
+  app.paintNav();
+  app.renderView();
+  app.refreshCounts();
+  setInterval(() => app.refreshCounts(), 20_000);
+
+  // 取一次展示时区：界面所有时间都按邮箱/日历所在时区渲染，而不是浏览器时区
+  api
+    .meta()
+    .then((meta) => {
+      if (meta?.timeZone) {
+        setDisplayTimeZone(meta.timeZone);
+        app.timeZone = meta.timeZone;
+        // 时区变了意味着所有已渲染的时间都要重画
+        app.invalidateAll();
+        app.reloadCurrent();
+      }
+    })
+    .catch(() => {});
+
+  /*
+   * 桌面通知是否开启由**服务端配置**说了算（设置页里的开关），
+   * 这里只在启动时读一次；浏览器权限由设置页在打开开关时申请。
+   */
+  api
+    .getConfig()
+    .then((res) => {
+      app.notifyBrowser = res?.config?.notify?.browser === true;
+    })
+    .catch(() => {});
+}

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>轻效 | Ease &amp; Effect · 邮箱与日历数字人</title>
+    <!--
+      外观模式必须在这里就定下来：等 JS 模块加载完再设置会先闪一下默认主题（FOUC）。
+      取值逻辑与 web/theme.js 保持一致（显式选择优先，否则跟随系统）。
+    -->
+    <script>
+      (function () {
+        try {
+          var t = localStorage.getItem('mailbot.theme');
+          if (t !== 'light' && t !== 'dark' && t !== 'green') {
+            t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+          }
+          document.documentElement.setAttribute('data-theme', t);
+          document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="/styles.css" />
+    <link rel="icon" type="image/png" href="/assets/logo.png" />
+  </head>
+  <body>
+    <div id="root" class="root"></div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

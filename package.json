@@ -1,0 +1,32 @@
+{
+  "name": "mailbot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "邮箱与日历数字人：IMAP/SMTP 分析邮件并起草回复，Google 日历对话建日程与日程分析",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node cli.js serve",
+    "serve": "node cli.js serve --open",
+    "dev": "node --watch server/index.js",
+    "scan": "node cli.js scan",
+    "doctor": "node cli.js doctor",
+    "test": "node test/selftest.js && node test/calendar-selftest.js && node test/fresh-install.js && node test/smoke-e2e.js && node test/ui-render.js",
+    "test:unit": "node test/selftest.js",
+    "test:calendar": "node test/calendar-selftest.js",
+    "test:fresh": "node test/fresh-install.js",
+    "test:e2e": "node test/smoke-e2e.js",
+    "test:ui": "node test/ui-render.js"
+  },
+  "dependencies": {
+    "imapflow": "^2.0.7",
+    "mailparser": "^3.7.4",
+    "nodemailer": "^10.0.10"
+  },
+  "devDependencies": {
+    "linkedom": "^0.18.12"
+  }
+}

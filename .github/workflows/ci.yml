@@ -1,0 +1,71 @@
+# 持续集成：每次 push / PR 都在**干净机器**上跑一遍全部测试。
+#
+# 为什么这个项目适合上 CI：
+#   5 个测试套件**完全离线**——mock IMAP / SMTP / 大模型 / Google，加上临时数据目录，
+#   所以 CI 里**不需要邮箱授权码、不需要 Google 令牌、不花一毛 token**。
+#   本地跑要 1~2 分钟、5 套命令，很容易漏跑一套；交给 CI 就不会漏。
+#
+# 覆盖矩阵刻意选了 Windows + Linux：本项目主要在 Windows 上开发，
+# 但路径分隔符、大小写、换行符这类问题只有跨平台跑才暴露得出来。
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时，取消上一次还在跑的构建（省额度，也能更快看到最新结果）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }} / node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: '20'
+          - os: windows-latest
+            node: '20'
+          # 顺手验一下更新的 LTS，防止将来升级 Node 时才炸
+          - os: ubuntu-latest
+            node: '22'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # 用 ci 而不是 install：严格按照 lockfile 安装，能发现依赖漂移
+      - name: 安装依赖
+        run: npm ci
+
+      # 一条命令跑完 5 套：单元 / 日历 / 全新安装 / 端到端冒烟 / 前端渲染
+      - name: 运行全部测试
+        run: npm test
+
+      # ---------------------------------------------------------------
+      # 防泄漏闸门：一旦有人不小心把 data/ 之类的运行数据提交进来，
+      # 这里会直接失败——比事后重写历史便宜得多。
+      # ---------------------------------------------------------------
+      - name: 检查是否误提交了运行数据或凭据
+        shell: bash
+        run: |
+          set -e
+          bad=$(git ls-files | grep -E '^(data/|\.env$)|google-token|audit\.jsonl|\.eml$' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::仓库里出现了不应提交的运行数据/凭据："
+            echo "$bad"
+            exit 1
+          fi
+          echo "✅ 未发现被提交的运行数据或凭据"
