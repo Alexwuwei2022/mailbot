@@ -1250,7 +1250,8 @@ function securityPanel() {
           'div',
           { class: 'storage-row' },
           h('span', { class: `tag ${levelTag[c.level] || ''}`, text: c.level === 'ok' ? '正常' : c.level === 'warn' ? '注意' : '风险' }),
-          h('span', { class: 'storage-label', text: c.title }),
+          /* 需要处理的项，标题也用红色：一排标签里光标签变色，眼睛还得逐行找 */
+          h('span', { class: `storage-label${c.level === 'ok' ? '' : ' is-warn'}`, text: c.title }),
           h('span', { class: 'muted small storage-hint', text: c.detail }),
         ),
       ),

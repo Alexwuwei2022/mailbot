@@ -25,6 +25,7 @@
   --ok: #1f7a4d;
   --ok-soft: #e9f6ef;
   --warn: #9a6b00;
+  --danger: #c0392b;
   --warn-soft: #fdf6e3;
   --radius: 10px;
   --radius-sm: 7px;
@@ -56,6 +57,7 @@
   --ok: #6ee7a8;
   --ok-soft: #1c3226;
   --warn: #e8c46a;
+  --danger: #ff6b6b;
   --warn-soft: #332b17;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
   --shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
@@ -87,6 +89,7 @@
   --ok: #6ee7a8;
   --ok-soft: #14301f;
   --warn: #e9c46a;
+  --danger: #ff6b6b;
   --warn-soft: #2f2711;
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
   --shadow: 0 4px 18px rgba(0, 0, 0, 0.5);
@@ -115,6 +118,7 @@
     --ok: #6ee7a8;
     --ok-soft: #1c3226;
     --warn: #e8c46a;
+  --danger: #ff6b6b;
     --warn-soft: #332b17;
     --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
     --shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
@@ -1131,13 +1135,19 @@ body {
   white-space: nowrap;
 }
 
-.tag-ok {
+/*
+ * 状态色必须写成 .tag.tag-xxx（两个类名）：
+ * 基础规则 .tag 在后面出现，两者都是一类名、优先级相同，
+ * 于是后出现的 .tag 会把状态色覆盖掉——状态标签因此**从来没红过**。
+ * 提高一级特异性后，无论顺序如何都不会再被盖住。
+ */
+.tag.tag-ok {
   color: var(--ok);
   border-color: color-mix(in srgb, var(--ok) 45%, transparent);
   background: color-mix(in srgb, var(--ok) 10%, transparent);
 }
 
-.tag-warn {
+.tag.tag-warn {
   /* 「风险」这类标签用红色：它说的是"要你处理"，不是"顺带一提" */
   color: var(--danger, #e5534b);
   border-color: color-mix(in srgb, var(--danger, #e5534b) 45%, transparent);
@@ -1145,7 +1155,7 @@ body {
 }
 
 /* 已经出错（而不只是有风险）：底色加重，一眼能从一排标签里挑出来 */
-.tag-error {
+.tag.tag-error {
   color: #fff;
   border-color: var(--danger, #e5534b);
   background: var(--danger, #e5534b);
@@ -1306,6 +1316,11 @@ body {
 
 .storage-label {
   font-weight: 560;
+}
+
+/* 需要处理的那一项，标题也用红色：一排标签里光标签变色，眼睛仍要逐行找 */
+.storage-label.is-warn {
+  color: var(--danger, #e5534b);
 }
 
 .storage-count,
