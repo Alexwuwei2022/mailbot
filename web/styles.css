@@ -156,7 +156,15 @@ body {
 
 /* ------------------------------------------------------------ 顶栏 */
 
+/* 窄屏：收紧留白与字号，尽量把导航留在一行 */
+@media (max-width: 1280px) {
+  .topbar { gap: 12px; padding: 10px 14px; }
+  .brand-sub { display: none; }
+  .nav-btn { padding: 6px 9px; font-size: 13px; }
+}
+
 .topbar {
+  flex-wrap: nowrap;
   position: sticky;
   top: 0;
   z-index: 20;
@@ -169,11 +177,13 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+/* 品牌区可收缩：min-width 会把导航挤到换行 */
 .brand {
   display: flex;
   align-items: center;
   gap: 10px;
-  min-width: 210px;
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
 .brand-mark {
@@ -197,11 +207,20 @@ body {
   font-size: 11.5px;
 }
 
+/*
+ * 导航必须**单行**：挤不下时横向滚动，而不是折成两行。
+ * 折行会把顶栏顶高一倍、把内容区往下推，看起来像"菜单乱了"。
+ */
 .nav {
   display: flex;
   gap: 2px;
-  flex: 1;
+  flex: 1 1 auto;
+  min-width: 0;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.nav::-webkit-scrollbar { display: none; }
 
 .nav-btn {
   position: relative;

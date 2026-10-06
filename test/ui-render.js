@@ -557,9 +557,20 @@ await step('外观模式：浅色 / 深色 / 绿色三个选项，切换立即�
   const { app } = await import('../web/app.js');
   const theme = await import('../web/theme.js');
 
-  const btns = [...document.querySelectorAll('.theme-btn')];
+  /*
+   * 外观模式已从顶栏挪到**设置页**（顶栏放三个按钮会挤得导航在普通宽度下换行）。
+   * 所以这里先把设置页渲染出来，再断言三个选项 —— 顺带验证"顶栏不再有它"。
+   */
+  check(document.querySelectorAll('.topbar .theme-btn').length === 0, '顶栏不该再放外观模式按钮（会把导航挤到换行）');
+  const settingsView = await import('../web/views/settings.js');
+  const settingsRoot = document.createElement('div');
+  document.body.append(settingsRoot);
+  settingsView.renderSettings(settingsRoot, app);
+  await new Promise((r) => setTimeout(r, 120));
+
+  const btns = [...settingsRoot.querySelectorAll('.theme-btn')];
   const labels = btns.map((b) => b.textContent.replace(/[^\u4e00-\u9fa5]/g, '').trim());
-  checkEqual(labels.join('/'), '浅色/深色/绿色', '应有且仅有浅色、深色、绿色三个选项');
+  checkEqual(labels.join('/'), '浅色/深色/绿色', '设置页应有且仅有浅色、深色、绿色三个选项');
 
   // 默认（未选择过）跟随系统；测试环境的 matchMedia 不存在 → 按深色
   checkEqual(document.documentElement.getAttribute('data-theme'), 'dark', '未选择时应跟随系统（无 matchMedia 时按深色）');
@@ -582,6 +593,7 @@ await step('外观模式：浅色 / 深色 / 绿色三个选项，切换立即�
   // 切回深色，避免影响后续步骤的截图/断言
   btns[1].dispatchEvent(new window.Event('click', { bubbles: true }));
   checkEqual(document.documentElement.getAttribute('data-theme'), 'dark', '可以切回深色');
+  settingsRoot.remove();
 
   // 三种主题都必须在 CSS 里真实定义（否则切过去只是「名字变了」）
   const css = readFileSync(path.join(root, 'web/styles.css'), 'utf8');

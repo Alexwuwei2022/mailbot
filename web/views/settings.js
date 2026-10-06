@@ -1,6 +1,12 @@
 /** 设置页：邮箱实例（服务器/端口/账号/授权码独立配置）、行为策略、大模型、自检。 */
 
 import { api, getToken, setToken } from '../api.js';
+/*
+ * 主题切换从顶栏挪到了这里。
+ * 与 app.js 存在循环依赖，但 themeSwitcher 是**函数声明**（会被提升），
+ * 且只在渲染时调用，所以不会踩到 TDZ。
+ */
+import { themeSwitcher } from '../app.js';
 import { confirmDialog, fmtBytes, fmtFull, h, mount, toast, toastError } from '../dom.js';
 import { renderInto, viewState } from '../view-state.js';
 
@@ -423,6 +429,33 @@ export function renderSettings(root, app) {
         ),
       ),
 
+      /* ---------------- 外观 ---------------- */
+      h(
+        'section',
+        { class: 'block' },
+        h(
+          'div',
+          { class: 'block-head' },
+          h('h3', { text: '外观' }),
+          h('span', { class: 'muted small', text: '浅色 / 深色 / 绿色' }),
+        ),
+        h(
+          'div',
+          { class: 'pad' },
+          h('div', { class: 'row-actions' }, themeSwitcher()),
+          h('p', { class: 'muted small mt-2' }, '点击即生效并记住；没选过时跟随系统设置。'),
+          h(
+            'p',
+            { class: 'muted small' },
+            '想重看首次配置？',
+            h(
+              'button',
+              { class: 'btn btn-small', onclick: () => app.navigate('setup') },
+              '打开「开始使用」向导',
+            ),
+          ),
+        ),
+      ),
       /* ---------------- 数据去向（隐私） ---------------- */
       h(
         'section',

@@ -208,6 +208,11 @@ const app = {
       const id = btn.dataset.view;
       btn.classList.toggle('active', id === this.viewId);
       /*
+       * 「开始使用」是**向导**：配置完成后它对用户就是噪音，直接隐藏。
+       * 但设置页里仍留一个入口（「重新看一遍首次配置」），不让人找不回来。
+       */
+      if (id === 'setup') btn.hidden = this.health?.ready === true;
+      /*
        * 「开始使用」在配置未完成时给一个提示点：全新装好后用户第一眼看到的是空页面，
        * 导航上得有个明确的地方告诉他"还没配完"。
        */
@@ -870,7 +875,11 @@ function buildShell(root) {
         ),
       ),
       h('nav', { class: 'nav', role: 'tablist' }, ...navButtons),
-      h('div', { class: 'topbar-actions' }, themeSwitcher(), logo),
+      /*
+       * 顶栏只留品牌标识与进度：外观模式挪到了设置页。
+       * 顶栏挤太多东西会让导航在普通宽度下换行（外观三连按钮本身要占约 200px）。
+       */
+      h('div', { class: 'topbar-actions' }, logo),
     ),
     progress,
     h('main', { class: 'main', id: 'main' }),
@@ -940,7 +949,8 @@ export function scrollPageToTop() {
  * 三个按钮常驻顶栏：外观是随时可能想调的东西，埋进设置页反而找不到。
  * 点击即生效并记住；没点过的时候跟随系统（老用户升级后外观不会突变）。
  */
-function themeSwitcher() {
+/** 导出给设置页复用（顶栏已不再放它，避免窄屏换行）。 */
+export function themeSwitcher() {
   const buttons = [];
   const paint = () => {
     const active = effectiveTheme();
