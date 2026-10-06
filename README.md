@@ -946,8 +946,8 @@ mailbot/
 ├── test/
 │   ├── mocks.js                模拟 IMAP / SMTP / 大模型（真实协议）
 │   ├── mocks-google.js         模拟 Google Calendar / OAuth（真实 REST 语义）
-│   ├── selftest.js             40 项邮件侧自检
-│   ├── calendar-selftest.js    56 项日历侧自检
+│   ├── selftest.js             88 项邮件侧自检（含 ZIP 与备份）
+│   ├── calendar-selftest.js    80 项日历侧自检（含备份/体检接口）
 │   ├── smoke-e2e.js            端到端：真实 HTTP + 模拟邮箱
 │   └── ui-render.js            前端渲染自检
 └── data/                       运行时生成（已 gitignore）
@@ -966,9 +966,9 @@ mailbot/
 
 ```powershell
 npm test              # 全部：邮件单元 + 日历单元 + 全新安装 + 端到端 + 前端渲染
-npm run test:unit     # 40 项：解析/组装/模型/分类/起草/IMAP/SMTP/引擎/发送/签名/详情/配置/HTTP
-npm run test:calendar # 60 项：时区换算/OAuth/REST CRUD/对话建日程/邮件转日程/日程分析/检索回补/代理转发
-npm run test:fresh    # 13 项：全新机器首启（空数据目录 + 清空环境变量 + start.cmd 格式 + .env 自动生成）
+npm run test:unit     # 88 项：解析/组装/模型/分类/起草/IMAP/SMTP/引擎/发送/签名/详情/配置/HTTP/ZIP/备份
+npm run test:calendar # 80 项：时区换算/OAuth/REST CRUD/对话建日程/邮件转日程/日程分析/检索回补/代理转发/备份与体检接口
+npm run test:fresh    # 14 项：全新机器首启（空数据目录 + 清空环境变量 + 首次上手判定 + start.cmd 格式 + .env 自动生成）
 npm run test:e2e      # 端到端：真实 HTTP 服务 + 模拟邮箱，走完整 Web 路径
 npm run test:ui       # 前端：八个页面渲染（含配置向导）+ 品牌外壳 + 跳转 + API 调用路径（需 linkedom）
 ```

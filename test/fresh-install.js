@@ -153,6 +153,39 @@ try {
     return '总览与知识库均为空但不报错';
   });
 
+  /**
+   * 这一条测的就是「交付给别人」的第一个画面。
+   *
+   * 别人装完打开，看到的必须是**明确的下一步**，而不是空页面 + 一堆"未配置"；
+   * 向导靠 /api/health 判断落点，所以这里断言全新机器上它确实判定为"全新"。
+   */
+  await test('首次上手：全新机器上判定为 fresh，并指出第一步是「连接邮箱」', async () => {
+    const res = await fetch(`${url}/api/health`);
+    assertEqual(res.status, 200, '体检接口应可用');
+    const h = await res.json();
+    assertEqual(h.fresh, true, '全新机器应判定为 fresh（界面据此直接进向导）');
+    assertEqual(h.ready, false, '没配完就不能说"可以用了"');
+    assertEqual(h.nextStepId, 'mailbox', '第一步必须是「连接邮箱」');
+    assertEqual(h.steps.length, 3, '应是三步');
+    assertEqual(
+      h.steps.map((s) => s.id).join(','),
+      'mailbox,llm,calendar',
+      '步骤顺序：邮箱 → 大模型 → 日历',
+    );
+    assertEqual(
+      h.steps.filter((s) => s.required).length,
+      2,
+      '必需项只有两个（日历可选，不用日历的人不该被卡住）',
+    );
+    // 每一步都要说清"差什么"，否则用户只知道没配好、不知道配什么
+    for (const s of h.steps.filter((x) => x.required)) {
+      assert(s.detail && s.detail.length > 0, `步骤「${s.title}」必须给出原因`);
+      assertEqual(s.done, false, `全新机器上「${s.title}」不应是已完成`);
+    }
+    assert(typeof h.version === 'string' && h.version.length > 0, '应带版本号（报问题时要附上）');
+    return `fresh，下一步=mailbox，版本 ${h.version}`;
+  });
+
   await test('未配置：运行分析时给出中文原因而不是堆栈', async () => {
     const res = await fetch(`${url}/api/runs`, {
       method: 'POST',
