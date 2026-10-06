@@ -117,6 +117,9 @@ export const api = {
   /** 定时任务（主动性）：状态 + 立即试一次 */
   scheduleStatus: () => request('GET', '/api/schedule'),
   runScheduleNow: () => request('POST', '/api/schedule/run', {}),
+  /** 一屏体检（纯本地、不连网）：回答"能不能开始用、还差哪一步" */
+  health: () => request('GET', '/api/health'),
+
   /** 存储占用体检 + 归档清理（清理不可逆，接口侧强制 confirm） */
   storage: () => request('GET', '/api/storage'),
   storageCleanup: (payload) => request('POST', '/api/storage/cleanup', { confirm: true, ...payload }),

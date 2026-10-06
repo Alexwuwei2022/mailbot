@@ -914,6 +914,57 @@ body {
   gap: 6px;
 }
 
+/* ------------------------------------------------------------ 首次配置向导 */
+
+.setup-steps-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+/* 三步进度（点哪一步就跳到哪一步） */
+.setup-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.setup-chip:hover {
+  border-color: var(--accent);
+}
+
+.setup-chip-done {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.setup-chip-active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.setup-chip-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: color-mix(in srgb, currentColor 18%, transparent);
+  font-size: 11px;
+  font-weight: 700;
+}
+
 /* ------------------------------------------------------------ 关于（版本信息） */
 
 .about-grid {

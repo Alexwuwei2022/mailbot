@@ -20,6 +20,8 @@ export function renderOverview(root, app) {
     loading: true,
     data: null,
     error: null,
+    /** /api/health 的结果：未完成配置时顶部要给引导横幅 */
+    health: null,
     showAll: false,
     /** 「需要你关注」是否展开全部（默认只显示 5 条） */
     attentionShowAll: false,
@@ -74,6 +76,35 @@ export function renderOverview(root, app) {
     // （放在后面声明会触发 TDZ：Cannot access 'attention' before initialization）
     const attention = Array.isArray(d.attention) ? d.attention : [];
     const analyzed = stats.total > 0;
+
+    /*
+     * 配置没配完时，页面顶部先给一条明确的出路。
+     *
+     * 全新安装第一眼看到的是空列表 + 几行"尚未配置"，用户并不知道先做什么；
+     * 这条横幅直接指出还差哪一步，并跳到向导。
+     */
+    if (state.health && state.health.ready === false) {
+      container.append(
+        h(
+          'div',
+          { class: 'alert alert-info block-lead' },
+          h('b', { text: '还没配置完，现在还不能分析邮件。' }),
+          h(
+            'div',
+            { class: 'small mt-1' },
+            (state.health.steps || [])
+              .filter((s) => s.required && !s.done)
+              .map((s) => `${s.title}：${s.detail}`)
+              .join('；') || '请完成首次配置',
+          ),
+          h(
+            'div',
+            { class: 'row-actions mt-2' },
+            h('button', { class: 'btn btn-small btn-primary', onclick: () => app.navigate('setup') }, '开始使用（约 2 分钟）'),
+          ),
+        ),
+      );
+    }
 
     container.append(
       h(
@@ -454,6 +485,19 @@ export function renderOverview(root, app) {
       state.data = await api.overview({ hours: state.windowHours });
       state.lastPreview = null;
       markLoaded(app, 'overview');
+      /*
+       * 体检顺带取一次（纯本地、很快）：配置没配完时顶部要显示引导横幅。
+       * 失败不影响总览本身——横幅只是锦上添花。
+       */
+      api
+        .health()
+        .then((health) => {
+          state.health = health;
+          app.health = health;
+          app.paintNav?.();
+          paint();
+        })
+        .catch(() => {});
     } catch (err) {
       state.error = err.message;
     } finally {

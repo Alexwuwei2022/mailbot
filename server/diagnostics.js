@@ -2,13 +2,97 @@
  * 自检：逐项验证邮箱配置与大模型连通性，给出可读的中文结论。
  */
 
-import { getConfig, getInstance, validateInstance, validateLlm } from './config/index.js';
+import { getConfig, getInstance, getPaths, validateInstance, validateLlm } from './config/index.js';
 import { LlmClient, pingLlm } from './llm/client.js';
 import { connect, findDraftsMailbox, listMailboxes, safeLogout } from './mail/imap.js';
 import { verifyTransport } from './mail/smtp.js';
-import { hoursAgo } from './lib/util.js';
+import { APP_VERSION, hoursAgo } from './lib/util.js';
 import { describeNetworkError, httpRequest, resolveProxyFor } from './lib/http.js';
+import { connectionStatus, validateGoogleConfig } from './calendar/google-auth.js';
 
+/**
+ * 一屏体检（**纯本地、不发任何网络请求**）。
+ *
+ * 与 `runDiagnostics` 的分工：那个会真的连一次 IMAP、调一次大模型，慢且依赖凭据，
+ * 用于「运行自检」与排查；这个只回答"**现在能不能开始用**、还差哪一步"，
+ * 供首次配置向导与总览横幅高频调用（每次进页面都会要）。
+ */
+export function configHealth() {
+  const config = getConfig();
+  const instance = (config.instances || []).find((i) => i.id === config.defaultInstanceId) || config.instances?.[0] || null;
+  const instanceProblems = instance ? validateInstance(instance) : ['尚未配置邮箱实例'];
+  const llmProblems = validateLlm(config);
+  const calendar = config.calendar || {};
+  const gstatus = calendar.enabled ? connectionStatus() : null;
+  const gproblems = calendar.enabled ? validateGoogleConfig().problems || [] : [];
+
+  const mailbox = {
+    ok: instanceProblems.length === 0,
+    problems: instanceProblems,
+    label: instance?.label || null,
+    address: instance?.identity?.email || instance?.imap?.authUser || null,
+  };
+  const llm = { ok: llmProblems.length === 0, problems: llmProblems, model: config.llm?.model || null };
+  const gcal = {
+    enabled: !!calendar.enabled,
+    configured: !calendar.enabled || !!gstatus?.configured,
+    connected: !calendar.enabled || !!gstatus?.connected,
+    needsReauth: !!gstatus?.needsReauth,
+    problems: gproblems,
+  };
+
+  /** 步骤清单：向导与总览横幅共用这一份口径，避免两处各说一套 */
+  const steps = [
+    {
+      id: 'mailbox',
+      title: '连接邮箱',
+      required: true,
+      done: mailbox.ok,
+      detail: mailbox.ok ? `已配置：${mailbox.address || ''}` : instanceProblems[0] || '未完成',
+    },
+    {
+      id: 'llm',
+      title: '配置大模型',
+      required: true,
+      done: llm.ok,
+      detail: llm.ok ? `已配置：${llm.model || ''}` : llmProblems[0] || '未完成',
+    },
+    {
+      id: 'calendar',
+      title: '连接 Google 日历（可选）',
+      required: false,
+      done: !!calendar.enabled && gcal.connected && !gcal.needsReauth,
+      skipped: !calendar.enabled,
+      detail: !calendar.enabled
+        ? '未启用（不用日历可以跳过）'
+        : gcal.needsReauth
+          ? '授权已失效，需要重新连接'
+          : gcal.connected
+            ? '已连接'
+            : '已启用但未授权',
+    },
+  ];
+
+  return {
+    version: APP_VERSION,
+    node: process.version,
+    dataDir: getPaths().dataDir,
+    timeZone: calendar.timeZone || 'Asia/Shanghai',
+    steps,
+    /** 必需项都完成 → 可以开始使用 */
+    ready: steps.filter((s) => s.required).every((s) => s.done),
+    /** 一个都还没配 → 全新安装，界面应直接引导到向导 */
+    fresh: !mailbox.ok && !llm.ok && !calendar.enabled,
+    nextStepId: (steps.find((s) => s.required && !s.done) || {}).id || null,
+    mailbox,
+    llm,
+    gcal,
+  };
+}
+
+/**
+ * @param {object} options { instanceId, deep }
+ */
 /**
  * 探测本机到 Google 的网络出口。
  *
@@ -45,6 +129,8 @@ function safeProxyInfo(proxy) {
 }
 
 /**
+ * 逐项验证邮箱配置与大模型连通性（**会真的连出去**，用于「运行自检」）。
+ *
  * @param {object} options { instanceId, deep }
  */
 export async function runDiagnostics({ instanceId, deep = false } = {}) {

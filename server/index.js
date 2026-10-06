@@ -21,7 +21,7 @@ import {
 } from './config/index.js';
 import { LLM_PRESETS, PRESETS } from './config/defaults.js';
 import { AppError, APP_VERSION, hoursAgo, log, safeJson, toErrorPayload } from './lib/util.js';
-import { runDiagnostics } from './diagnostics.js';
+import { configHealth, runDiagnostics } from './diagnostics.js';
 import { LlmClient, pingLlm } from './llm/client.js';
 import { currentRun, clampWindowHours, isRunning, previewScan, progressBus, runScan, cancelRun } from './ai/engine.js';
 import { runScheduledScan, schedulerStatus, setNotifyEmitter, startScheduler, stopScheduler } from './schedule.js';
@@ -625,6 +625,16 @@ async function handleApi(req, res, url, actualPort) {
   /** 导入前的自动备份列表（可回滚）。 */
   if (route === 'GET /api/backup/list') {
     return sendJson(res, 200, { ok: true, backups: listSafetyBackups() });
+  }
+
+  /**
+   * 一屏体检：**纯本地、不连网**，回答"现在能不能开始用、还差哪一步"。
+   *
+   * 与「运行自检」（会真的连 IMAP / 调模型）分工不同：这个每次进页面都会调用，
+   * 必须快且不受凭据影响。
+   */
+  if (route === 'GET /api/health') {
+    return sendJson(res, 200, { ok: true, ...configHealth() });
   }
 
   /** 存储占用体检（含"孤儿归档"：没有任何分析记录指向的原文）。 */

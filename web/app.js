@@ -10,6 +10,7 @@ import { renderSearch } from './views/search.js';
 import { renderCalendar } from './views/calendar.js';
 import { renderKnowledge } from './views/knowledge.js';
 import { renderRecords } from './views/records.js';
+import { renderSetup } from './views/setup.js';
 import { renderSettings } from './views/settings.js';
 
 const VIEWS = [
@@ -19,6 +20,7 @@ const VIEWS = [
   { id: 'calendar', label: '日历' },
   { id: 'knowledge', label: '知识库' },
   { id: 'records', label: '运行与记录' },
+  { id: 'setup', label: '开始使用' },
   { id: 'settings', label: '设置' },
 ];
 
@@ -88,6 +90,7 @@ const app = {
       calendar: renderCalendar,
       knowledge: renderKnowledge,
       records: renderRecords,
+      setup: renderSetup,
       settings: renderSettings,
     }[view.id];
     this.current = factory(this.els.main, this) || null;
@@ -196,12 +199,19 @@ const app = {
     for (const btn of this.els.navButtons) {
       const id = btn.dataset.view;
       btn.classList.toggle('active', id === this.viewId);
+      /*
+       * 「开始使用」在配置未完成时给一个提示点：全新装好后用户第一眼看到的是空页面，
+       * 导航上得有个明确的地方告诉他"还没配完"。
+       */
+      const setupTodo = this.health?.ready === false ? 1 : 0;
       const badge =
         id === 'drafts'
           ? this.counts?.pendingDrafts
           : id === 'overview'
             ? this.counts?.needsReply
-            : 0;
+            : id === 'setup'
+              ? setupTodo
+              : 0;
       let dot = btn.querySelector('.nav-badge');
       if (badge) {
         if (!dot) {
@@ -889,6 +899,21 @@ export function boot() {
     .getConfig()
     .then((res) => {
       app.notifyBrowser = res?.config?.notify?.browser === true;
+    })
+    .catch(() => {});
+
+  /*
+   * 体检一次：配置没配完时（全新安装）自动把用户送到「开始使用」向导，
+   * 并在导航上留下提示点。这是交付给他人时最关键的第一次体验。
+   */
+  api
+    .health()
+    .then((health) => {
+      app.health = health;
+      app.paintNav();
+      if (!health?.ready && (health?.fresh || !location.hash.replace(/^#\/?/, ''))) {
+        app.navigate('setup');
+      }
     })
     .catch(() => {});
 }

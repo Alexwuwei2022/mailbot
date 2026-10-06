@@ -525,6 +525,8 @@ await step('boot()：外壳与导航渲染', async () => {
   check(html.includes('邮件草稿'), '缺少草稿导航');
   check(html.includes('日历'), '缺少日历导航');
   check(html.includes('知识库'), '缺少知识库导航');
+  check(html.includes('运行与记录'), '缺少运行与记录导航');
+  check(html.includes('开始使用'), '缺少开始使用（配置向导）导航');
   check(html.includes('设置'), '缺少设置导航');
 });
 
@@ -2638,6 +2640,153 @@ await step('日历页：授权失效时给出「重新连接」按钮（而不�
     api.calendarInsight = realInsight;
     api.calendarAuthUrl = realAuthUrl;
     delete globalThis.open;
+    container.remove();
+  }
+});
+
+await step('开始使用向导：三步进度、未完成时给引导、配好后能进下一步', async () => {
+  const setup = await import('../web/views/setup.js');
+  const container = document.createElement('div');
+  document.body.append(container);
+  const { api } = await import('../web/api.js');
+  const realHealth = api.health;
+  const realDiag = api.diagnostics;
+  const realSave = api.saveConfig;
+  const calls = [];
+
+  const healthOf = (over) => ({
+    ok: true,
+    version: '1.0.0',
+    node: 'v20.0.0',
+    dataDir: 'D:\\data',
+    timeZone: 'Asia/Shanghai',
+    ready: false,
+    fresh: true,
+    nextStepId: 'mailbox',
+    steps: [
+      { id: 'mailbox', title: '连接邮箱', required: true, done: false, detail: 'IMAP 服务器地址为空' },
+      { id: 'llm', title: '配置大模型', required: true, done: false, detail: '大模型 API Key 为空' },
+      { id: 'calendar', title: '连接 Google 日历（可选）', required: false, done: false, skipped: true, detail: '未启用（不用日历可以跳过）' },
+    ],
+    ...over,
+  });
+
+  try {
+    globalThis.__forceResponses = {
+      '/api/health': healthOf({}),
+      '/api/config': {
+        ok: true,
+        presets: [],
+        config: {
+          defaultInstanceId: 'default',
+          instances: [{ id: 'default', label: '企业邮箱', enabled: true, imap: { host: '', port: 993, secure: true, authUser: '', authPass: '' }, smtp: { host: '', port: 465, secure: true, authUser: '', authPass: '' }, identity: { email: '', name: '' } }],
+          llm: { baseUrl: '', model: '', apiKey: '' },
+          web: {},
+          calendar: { enabled: false, timeZone: 'Asia/Shanghai', google: {} },
+        },
+      },
+      '/api/meta': { ok: true, timeZone: 'Asia/Shanghai', version: '1.0.0', llmPresets: [{ id: 'deepseek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' }] },
+    };
+    api.diagnostics = (instanceId, deep) => {
+      calls.push({ kind: 'diagnostics', instanceId, deep });
+      return Promise.resolve({ ok: true, checks: [{ id: 'imap-connect', label: 'IMAP 连接', status: 'ok', message: '正常' }] });
+    };
+    api.saveConfig = (patch) => {
+      calls.push({ kind: 'save', patch });
+      return Promise.resolve({ ok: true, config: patch });
+    };
+
+    setup.renderSetup(container, { viewStates: {}, navigate() {}, paintNav() {}, invalidateAll() {} });
+    await new Promise((r) => setTimeout(r, 200));
+
+    const text = container.textContent;
+    check(/开始使用/.test(text), '应有「开始使用」标题');
+    check(/连接邮箱/.test(text) && /配置大模型/.test(text) && /Google 日历/.test(text), '应显示三步');
+    check(/IMAP 服务器地址为空/.test(text) === false, '步骤详情来自 health（这里是当前步表单，不重复显示其它步骤的原因）');
+    // 默认落在第一个未完成步骤：邮箱
+    check(/收信（IMAP）/.test(text) && /发信（SMTP）/.test(text), '应默认落在「连接邮箱」这步');
+    check(/授权码/.test(text), '应有授权码字段');
+
+    // 填好并点「保存并测试」→ 必须真的保存 + 真的测一次
+    const inputs = [...container.querySelectorAll('input[type=text]')];
+    const setVal = (el, v) => {
+      el.value = v;
+      el.dispatchEvent(new window.Event('input', { bubbles: true }));
+    };
+    setVal(inputs[0], 'imap.example.com');
+    const pw = container.querySelector('input[type=password]');
+    setVal(pw, 'auth-code');
+    const saveBtn = [...container.querySelectorAll('button')].find((b) => /保存并测试/.test(b.textContent));
+    check(saveBtn, '应有「保存并测试」');
+    saveBtn.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 220));
+    check(calls.some((c) => c.kind === 'save'), '应保存配置');
+    const saved = calls.find((c) => c.kind === 'save');
+    checkEqual(saved.patch.instances[0].imap.host, 'imap.example.com', '应把填的服务器写进 patch');
+    checkEqual(saved.patch.instances[0].imap.authPass, 'auth-code', '应把授权码写进 patch');
+    check(calls.some((c) => c.kind === 'diagnostics'), '保存后应立刻验证一次（不把问题推到后面）');
+    check(/验证通过|已保存/.test(container.textContent), `应给出验证结果（实际「${container.textContent.slice(0, 120)}」）`);
+
+    // 切到「配置大模型」：预设下拉应可用
+    const llmChip = [...container.querySelectorAll('.setup-chip')].find((b) => /配置大模型/.test(b.textContent));
+    llmChip.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 80));
+    const select = container.querySelector('select');
+    check(select, '大模型步骤应有服务商下拉');
+    check([...select.querySelectorAll('option')].some((o) => /DeepSeek/.test(o.textContent)), '下拉里应有预设');
+
+    // 配好后：进入「可以用了」
+    globalThis.__forceResponses['/api/health'] = healthOf({
+      ready: true,
+      fresh: false,
+      nextStepId: null,
+      steps: [
+        { id: 'mailbox', title: '连接邮箱', required: true, done: true, detail: '已配置：u@x.cn' },
+        { id: 'llm', title: '配置大模型', required: true, done: true, detail: '已配置：deepseek-chat' },
+        { id: 'calendar', title: '连接 Google 日历（可选）', required: false, done: false, skipped: true, detail: '未启用（不用日历可以跳过）' },
+      ],
+    });
+    const refresh = [...container.querySelectorAll('button')].find((b) => b.textContent === '刷新状态');
+    refresh.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 220));
+    check(/可以用了|可以开始用了/.test(container.textContent), `配好后应显示完成态（实际「${container.textContent.slice(0, 120)}」）`);
+  } finally {
+    api.health = realHealth;
+    api.diagnostics = realDiag;
+    api.saveConfig = realSave;
+    delete globalThis.__forceResponses;
+    container.remove();
+  }
+});
+
+await step('总览页：配置没配完时顶部给出「开始使用」引导', async () => {
+  const overview = await import('../web/views/overview.js');
+  const container = document.createElement('div');
+  document.body.append(container);
+  const { api } = await import('../web/api.js');
+  const realHealth = api.health;
+  let navigated = null;
+  try {
+    api.health = () =>
+      Promise.resolve({
+        ok: true,
+        ready: false,
+        steps: [
+          { id: 'mailbox', title: '连接邮箱', required: true, done: false, detail: 'IMAP 服务器地址为空' },
+          { id: 'llm', title: '配置大模型', required: true, done: false, detail: '大模型 API Key 为空' },
+        ],
+      });
+    overview.renderOverview(container, { viewStates: {}, navigate: (v) => (navigated = v), paintNav() {} });
+    await new Promise((r) => setTimeout(r, 240));
+    const text = container.textContent;
+    check(/还没配置完/.test(text), `应给出未配置完的横幅（实际「${text.slice(0, 100)}」）`);
+    check(/IMAP 服务器地址为空/.test(text), '横幅应说明还差哪一步（而不是只说"未配置"）');
+    const btn = [...container.querySelectorAll('button')].find((b) => /开始使用/.test(b.textContent));
+    check(btn, '横幅应给出直达向导的按钮');
+    btn.dispatchEvent(new window.Event('click', { bubbles: true }));
+    checkEqual(navigated, 'setup', '点按钮应跳到「开始使用」');
+  } finally {
+    api.health = realHealth;
     container.remove();
   }
 });
