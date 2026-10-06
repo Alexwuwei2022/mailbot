@@ -2477,6 +2477,54 @@ await test('HTTP：备份 导出 → 检查 → 导入 全链路，且跨源一�
   }
 });
 
+await test('HTTP：/api/health 一屏体检（纯本地，含三步与下一步）', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  try {
+    const t0 = Date.now();
+    const res = await fetch(`${url}/api/health`);
+    const elapsed = Date.now() - t0;
+    assertEqual(res.status, 200, '体检应返回 200');
+    const h = await res.json();
+    assertEqual(h.ok, true, 'ok 应为 true');
+    assert(typeof h.version === 'string' && h.version.length > 0, '应带版本号');
+    assert(typeof h.node === 'string', '应带 Node 版本');
+    assertEqual(h.steps.length, 3, '应有三步');
+    assertEqual(
+      h.steps.map((s) => s.id).join(','),
+      'mailbox,llm,calendar',
+      '步骤顺序应是 邮箱 → 大模型 → 日历',
+    );
+    assertEqual(
+      h.steps.filter((s) => s.required).length,
+      2,
+      '只有邮箱与大模型是必需项（日历可跳过）',
+    );
+    assert(typeof h.ready === 'boolean', 'ready 应是布尔');
+    // 必需项没配完时，必须指出下一步是哪一步（否则向导不知道落哪）
+    if (!h.ready) assert(h.nextStepId, '未就绪时必须给出 nextStepId');
+    // 纯本地判断：不该慢到像在连邮箱
+    assert(elapsed < 2000, `体检应当很快（实际 ${elapsed}ms）`);
+    /*
+     * 关键不变量：日历是**可选**步骤，无论它是否启用/是否已授权，
+     * 都不能影响"必需项都完成了吗"这个结论（否则用户不用日历就永远显示未就绪）。
+     */
+    assertEqual(
+      h.steps.find((s) => s.id === 'calendar').required,
+      false,
+      '日历必须是可选步骤',
+    );
+    assertEqual(
+      h.ready,
+      h.steps.filter((s) => s.required).every((s) => s.done),
+      'ready 必须只由必需项决定',
+    );
+    assertEqual(h.nextStepId === null, h.ready, 'ready 与 nextStepId 必须一致（就绪则没有下一步）');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await google.close();
