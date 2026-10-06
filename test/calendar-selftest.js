@@ -2527,6 +2527,59 @@ await test('HTTP：/api/health 一屏体检（纯本地，含三步与下一步�
   }
 });
 
+await test('HTTP：/api/secrets 能报告密钥在哪，且迁移未确认时一律拒绝', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  try {
+    const res = await fetch(`${url}/api/secrets`);
+    assertEqual(res.status, 200, '密钥状态接口应可用');
+    const s = await res.json();
+    assertEqual(s.ok, true, 'ok 应为 true');
+    assert(typeof s.mode === 'string', '应报告当前模式');
+    assert(Array.isArray(s.backends) && s.backends.length >= 4, '应列出各平台后端及其可用性');
+    assert(Array.isArray(s.items) && s.items.length >= 3, '应逐项报告每个密钥在哪');
+    // 每一项都要能回答"在哪"，否则界面上没法让人放心
+    for (const item of s.items) {
+      assert(item.label, '每项应有名称');
+      assert(
+        ['config', 'envFile', 'envReal', 'vault', 'none'].includes(item.location),
+        `位置取值应可识别（实际 ${item.location}）`,
+      );
+    }
+    assert(typeof s.plaintextCount === 'number', '应给出明文残留数量');
+
+    // 迁移/迁回都会改配置文件：没有 confirm 必须拒绝（428）
+    const noConfirm = await fetch(`${url}/api/secrets/migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ mode: 'file' }),
+    });
+    assertEqual(noConfirm.status, 428, '迁移未确认应返回 428');
+    const noConfirmRevert = await fetch(`${url}/api/secrets/revert`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assertEqual(noConfirmRevert.status, 428, '迁回未确认应返回 428');
+    // 非法后端名要明确报错，而不是"默默用别的"
+    const badMode = await fetch(`${url}/api/secrets/migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirm: true, mode: 'nonsense' }),
+    });
+    assert(badMode.status >= 400, `非法后端应被拒绝（实际 ${badMode.status}）`);
+    // 跨源同样必须被拒（它能改变密钥存放方式）
+    const evil = await fetch(`${url}/api/secrets/migrate`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example.com' },
+      body: JSON.stringify({ confirm: true, mode: 'file' }),
+    });
+    assertEqual(evil.status, 403, '跨源迁移应被拒绝');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await google.close();

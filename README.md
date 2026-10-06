@@ -975,7 +975,7 @@ mailbot/
 ```powershell
 npm test              # 全部：邮件单元 + 日历单元 + 全新安装 + 端到端 + 前端渲染
 npm run test:unit     # 88 项：解析/组装/模型/分类/起草/IMAP/SMTP/引擎/发送/签名/详情/配置/HTTP/ZIP/备份
-npm run test:calendar # 80 项：时区换算/OAuth/REST CRUD/对话建日程/邮件转日程/日程分析/检索回补/代理转发/备份与体检接口
+npm run test:calendar # 81 项：时区换算/OAuth/REST CRUD/对话建日程/邮件转日程/日程分析/检索回补/代理转发/备份与体检与密钥接口
 npm run test:fresh    # 14 项：全新机器首启（空数据目录 + 清空环境变量 + 首次上手判定 + start.cmd 格式 + .env 自动生成）
 npm run test:e2e      # 端到端：真实 HTTP 服务 + 模拟邮箱，走完整 Web 路径
 npm run test:ui       # 前端：八个页面渲染（含配置向导）+ 品牌外壳 + 跳转 + API 调用路径（需 linkedom）
