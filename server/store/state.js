@@ -17,7 +17,7 @@ import { AppError, fnv1a, log, newId, safeJson } from '../lib/util.js';
  * 有版本号就必须有**迁移函数**，否则升级后老用户的数据要么缺字段、
  * 要么被静默丢掉。`migrateState` 负责把任意历史版本补齐到当前版本。
  */
-export const STATE_VERSION = 3;
+export const STATE_VERSION = 4;
 /** 兼容旧测试里的名字；生产代码请直接用 STATE_VERSION。 */
 export const STATE_VERSION_FOR_TEST = STATE_VERSION;
 /** 分析记录上限的默认值（实际以 `retention.maxAnalyses` 为准，见 maxAnalysesLimit） */
@@ -45,6 +45,8 @@ function emptyState() {
      * 由扫描产生（逻辑见 server/followup.js），状态语义与 tasks 一致。
      */
     followUps: {},
+    /** 项目登记表：key → { key, name, aliases[], createdAt }（合并后旧名进 aliases） */
+    projects: {},
   };
 }
 
@@ -63,12 +65,22 @@ export function migrateState(s) {
     notes.push('v1→v2：新增 tasks（待办状态）');
   }
 
+  if (from < 4) {
+    /*
+     * v3→v4：新增 projects（项目登记表，用于时间线的重命名/合并）。
+     * 只补空表，不预填任何内容——项目清单是从分析记录里的 project 标签推导出来的。
+     */
+    if (!s.projects || typeof s.projects !== 'object' || Array.isArray(s.projects)) s.projects = {};
+    notes.push('v3→v4：新增 projects（项目登记表）');
+  }
+
   if (from < 3) {
     /*
      * v2→v3：新增 followUps（跟催：我承诺了什么 / 等谁回复）。
      * 只补空表，不预填任何内容——第一次扫描才会产生记录。
      */
     if (!s.followUps || typeof s.followUps !== 'object' || Array.isArray(s.followUps)) s.followUps = {};
+  if (!s.projects || typeof s.projects !== 'object' || Array.isArray(s.projects)) s.projects = {};
     notes.push('v2→v3：新增 followUps（跟催跟踪）');
   }
 
@@ -82,6 +94,7 @@ export function migrateState(s) {
   if (!s.tasks || typeof s.tasks !== 'object' || Array.isArray(s.tasks)) s.tasks = {};
   if (!s.schedule || typeof s.schedule !== 'object' || Array.isArray(s.schedule)) s.schedule = {};
   if (!s.followUps || typeof s.followUps !== 'object' || Array.isArray(s.followUps)) s.followUps = {};
+  if (!s.projects || typeof s.projects !== 'object' || Array.isArray(s.projects)) s.projects = {};
   // 会话可能因崩溃残留 pending 字段，统一兜底
   for (const session of s.calendar.sessions) {
     if (!Array.isArray(session.messages)) session.messages = [];
@@ -263,6 +276,46 @@ export function listFollowUps({ kind, status } = {}) {
       if (ad !== bd) return ad - bd;
       return new Date(b.since || b.createdAt || 0) - new Date(a.since || a.createdAt || 0);
     });
+}
+
+export function getProjectRegistry() {
+  return getState().projects || {};
+}
+
+/** 整体替换项目登记表（合并后写回）。 */
+export function replaceProjects(registry) {
+  const s = getState();
+  s.projects = registry && typeof registry === 'object' ? registry : {};
+  persistState();
+  return Object.keys(s.projects).length;
+}
+
+/** 批量改写标签（合并项目时用）：返回改了多少条。 */
+export function rewriteProjectTags({ from, to }) {
+  const s = getState();
+  const key = (v) =>
+    String(v || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[\s·・,，.。:：;；\-—_/\\|()（）[\]【】]+/g, '');
+  const want = key(from);
+  const target = String(to || '').trim();
+  if (!want || !target) return 0;
+  let moved = 0;
+  for (const a of Object.values(s.analyses || {})) {
+    if (key(a?.project) === want) {
+      a.project = target;
+      moved += 1;
+    }
+  }
+  for (const d of s.drafts || []) {
+    if (key(d?.project) === want) d.project = target;
+  }
+  for (const f of Object.values(s.followUps || {})) {
+    if (key(f?.project) === want) f.project = target;
+  }
+  persistState();
+  return moved;
 }
 
 export function getFollowUpMap() {

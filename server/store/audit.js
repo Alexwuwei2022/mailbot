@@ -52,6 +52,8 @@ export const AUDIT_ACTIONS = {
   /** 跟催：扫描与状态变更 */
   'followup.scan': { label: '扫描跟催', group: '跟催' },
   'followup.status': { label: '跟催状态变更', group: '跟催' },
+  /** 项目重命名/合并：会改写历史记录的标签 */
+  'project.rename': { label: '项目重命名或合并', group: '跟催' },
 };
 
 function auditPath() {

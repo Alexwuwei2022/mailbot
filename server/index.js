@@ -51,6 +51,7 @@ import {
 import { resolveTls } from './lib/tls.js';
 import { egressReport } from './lib/privacy.js';
 import { followUpConfig, runFollowUpScan } from './followup.js';
+import { buildTimeline, listProjects, mergeProjects } from './timeline.js';
 import { LlmClient, pingLlm } from './llm/client.js';
 import { currentRun, clampWindowHours, isRunning, previewScan, progressBus, runScan, cancelRun } from './ai/engine.js';
 import { runScheduledScan, schedulerStatus, setNotifyEmitter, startScheduler, stopScheduler } from './schedule.js';
@@ -904,6 +905,77 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     }
   }
 
+  /* ---- 按项目时间线 ---- */
+
+  /** 项目清单：从分析记录/草稿/跟催里的 project 标签 + 用户登记表推导。 */
+  if (route === 'GET /api/projects') {
+    const projects = listProjects({
+      analyses: store.listAnalyses({ limit: 5000 }),
+      drafts: store.listDrafts({}),
+      followUps: store.getFollowUpMap(),
+      registry: store.getProjectRegistry(),
+    });
+    const listed = store.listAnalyses({ limit: 5000 });
+    const unclassified = listed.filter((a) => !a.project).length;
+    return sendJson(res, 200, { ok: true, projects, unclassified });
+  }
+
+  /** 一个项目的时间线（邮件 + 我发出的 + 跟催 + 日程）。 */
+  if (route === 'GET /api/timeline') {
+    const project = url.searchParams.get('project') || '';
+    const entries = buildTimeline({
+      project,
+      analyses: store.listAnalyses({ limit: 5000 }),
+      drafts: store.listDrafts({}),
+      followUps: store.getFollowUpMap(),
+      audit: listAudit({ limit: 2000 }).items || [],
+    });
+    return sendJson(res, 200, {
+      ok: true,
+      project,
+      entries,
+      counts: entries.reduce((acc, e) => ({ ...acc, [e.kind]: (acc[e.kind] || 0) + 1 }), {}),
+      /** 日程只来自本地操作留痕：别人直接在日历服务上建的看不到，界面要如实说明 */
+      calendarNote: '日程来自本程序的操作记录；别人在 Google 日历上直接创建的日程不会出现在这里',
+    });
+  }
+
+  /** 重命名 / 合并项目：会改写历史记录，并要求确认。 */
+  if (route === 'POST /api/projects/rename') {
+    const body = await readJsonBody(req);
+    const from = String(body.from || '').trim();
+    const to = String(body.to || '').trim();
+    if (!from || !to) throw new AppError('请同时提供原项目名 from 与目标项目名 to', { code: 'PROJECT_NAME_REQUIRED', status: 400 });
+    if (body.confirm !== true) {
+      throw new AppError('合并会改写历史记录的标签：请传入 confirm=true', { code: 'CONFIRM_REQUIRED', status: 428 });
+    }
+    const moved = store.rewriteProjectTags({ from, to });
+    const merged = mergeProjects({
+      from,
+      to,
+      analyses: [],
+      drafts: [],
+      followUps: {},
+      registry: store.getProjectRegistry(),
+    });
+    store.replaceProjects(merged.registry);
+    appendAudit('project.rename', {
+      target: `${from} → ${to}`,
+      source: '界面操作',
+      extra: { movedAnalyses: moved },
+    });
+    return sendJson(res, 200, {
+      ok: true,
+      moved,
+      message: moved ? `已把「${from}」的 ${moved} 条记录并入「${to}」，并把旧名记成别名` : `已把「${from}」记成「${to}」的别名（当前没有需要改写的记录）`,
+      projects: listProjects({
+        analyses: store.listAnalyses({ limit: 5000 }),
+        drafts: store.listDrafts({}),
+        followUps: store.getFollowUpMap(),
+        registry: store.getProjectRegistry(),
+      }),
+    });
+  }
   /* ---- 密钥存储（系统钥匙串） ---- */
 
   /** 密钥现状：每一项**现在在哪**、是不是明文、有没有降级。 */
