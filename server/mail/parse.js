@@ -9,6 +9,31 @@ import { normalizeWhitespace, stripHtml, truncate } from '../lib/util.js';
  * @param {Buffer|string} source RFC822 原文
  * @returns {Promise<object>}
  */
+/**
+ * 只取原始 HTML 正文（给"渲染 HTML"用）。
+ *
+ * 为什么不把 html 塞进 parseMessage 的返回值：那个结果会被**写进分析记录**，
+ * 邮件 HTML 动辄几十 KB，全量存进 state.json 会让它迅速膨胀。
+ * 所以这里单独开一个函数，由详情接口按需调用（用户点"渲染 HTML"时才取）。
+ *
+ * @returns {{html: string, hasHtml: boolean}}
+ */
+export async function extractHtmlBody(raw) {
+  if (!raw) return { html: '', hasHtml: false };
+  try {
+    const parsed = await simpleParser(raw, {
+      skipHtmlToText: true,
+      skipTextToHtml: true,
+      skipImageLinks: true,
+    });
+    const html = typeof parsed.html === 'string' ? parsed.html : '';
+    return { html, hasHtml: !!html.trim() };
+  } catch {
+    // 解析失败就当作没有 HTML：界面会退回纯文本，不影响阅读
+    return { html: '', hasHtml: false };
+  }
+}
+
 export async function parseMessage(source) {
   const parsed = await simpleParser(source, {
     skipHtmlToText: false,

@@ -1243,6 +1243,7 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     const detail = await buildMailDetail({
       folder: decodeURIComponent(mailDetailMatch[1]),
       uid: Number(mailDetailMatch[2]),
+
       instanceId: instanceIdFrom(url),
       // 正文按需加载：列表页不需要，详情弹窗才要（避免每次都去解析归档/回源 IMAP）
       withBody: url.searchParams.get('body') !== '0',

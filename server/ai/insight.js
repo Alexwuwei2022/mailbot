@@ -338,11 +338,13 @@ export async function loadMailBody({ folder, uid, instanceId, maxChars = 40_000 
   try {
     const parsed = await parseMessage(raw);
     const { fresh, quoted } = splitQuoted(parsed.body);
+
     const limit = Number(maxChars) > 0 ? Number(maxChars) : 40_000;
     const truncated = fresh.length > limit;
     return {
       available: true,
       source,
+
       text: truncated ? `${fresh.slice(0, limit)}\n…（正文较长，已截断显示）` : fresh,
       quoted,
       truncated,
