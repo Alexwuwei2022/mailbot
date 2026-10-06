@@ -35,6 +35,11 @@ export function renderSettings(root, app) {
     secrets: null,
     secretsBusy: false,
     secretsPick: null,
+    /** 访问与安全现状（/api/security） */
+    security: null,
+    securityBusy: false,
+    /** 数据去向（/api/egress） */
+    egress: null,
     /** 上次保存后的配置快照，用于判断是否有未保存改动 */
     savedSnapshot: null,
     activeInstance: null,
@@ -416,6 +421,32 @@ export function renderSettings(root, app) {
           ),
           scheduleStatusLine(),
         ),
+      ),
+
+      /* ---------------- 数据去向（隐私） ---------------- */
+      h(
+        'section',
+        { class: 'block' },
+        h(
+          'div',
+          { class: 'block-head' },
+          h('h3', { text: '数据去向' }),
+          h('span', { class: 'muted small', text: '哪些内容会离开这台电脑' }),
+        ),
+        h('div', { class: 'pad' }, state.egress ? egressPanel() : h('p', { class: 'muted small', text: '加载中…' })),
+      ),
+
+      /* ---------------- 访问与安全 ---------------- */
+      h(
+        'section',
+        { class: 'block' },
+        h(
+          'div',
+          { class: 'block-head' },
+          h('h3', { text: '访问与安全' }),
+          h('span', { class: 'muted small', text: '谁能连上、要不要登录、有没有加密' }),
+        ),
+        h('div', { class: 'pad' }, state.security ? securityPanel() : h('p', { class: 'muted small', text: '加载中…' })),
       ),
 
       /* ---------------- 密钥存储 ---------------- */
@@ -1098,6 +1129,421 @@ async function loadBackups() {
 }
 
 /**
+ * 数据去向面板。
+ *
+ * 内容全部来自服务端按当前配置推导的结果（`/api/egress`），
+ * 所以改了模型地址或代理，这里显示的**目的地**会跟着变——不会出现"文档说一套、实际做一套"。
+ */
+function egressPanel() {
+  const e = state.egress;
+  const llm = state.config?.llm || {};
+
+  const kindLabel = { loopback: '本机', lan: '局域网另一台机器', public: '公网服务', mail: '邮件', proxy: '代理', invalid: '地址无效' };
+
+  return h(
+    'div',
+    {},
+    /* 仅本地模式 */
+    h(
+      'label',
+      { class: 'form-check form-check-strong' },
+      h('input', {
+        type: 'checkbox',
+        checked: llm.localOnly === true,
+        onchange: (ev) => {
+          llm.localOnly = ev.target.checked;
+          paint();
+        },
+      }),
+      h('b', { text: '仅本地模式：邮件内容只发给本机模型' }),
+    ),
+    h(
+      'p',
+      { class: 'muted small' },
+      '打开后，任何指向**局域网另一台机器**或**公网服务**的模型地址都会被直接拒绝（不是提醒，是拒绝）。' +
+        '适合用 Ollama 等本机模型的人。注意：局域网地址（192.168.x.x 等）也算"离开本机"。',
+    ),
+    e.blocked
+      ? h(
+          'p',
+          { class: 'error small' },
+          `⚠️ 当前配置下模型调用会被拒绝：模型地址是 ${e.llmHost || '（空）'}（${kindLabel[e.llmKind] || '未知'}）。` +
+            '要么把它改成 http://127.0.0.1:11434 这类本机地址，要么关掉本开关。',
+        )
+      : null,
+
+    /* 逐项去向 */
+    h(
+      'div',
+      { class: 'storage-table mt-2' },
+      ...(e.items || []).map((it) =>
+        h(
+          'div',
+          { class: 'storage-row' },
+          h('span', { class: `tag ${it.enabled ? (it.destinationKind === 'loopback' ? 'tag-ok' : 'tag-warn') : ''}`, text: it.enabled ? '会发送' : '未启用' }),
+          h('span', { class: 'storage-label', text: it.feature }),
+          h(
+            'span',
+            { class: 'muted small storage-hint' },
+            it.enabled
+              ? `→ ${it.destination}${it.destinationKind && kindLabel[it.destinationKind] ? `（${kindLabel[it.destinationKind]}）` : ''}｜发送：${it.sends.join('、')}${it.notSends?.length ? `｜**不发**：${it.notSends.join('、')}` : ''}`
+              : '（未启用，不会发送任何内容）',
+          ),
+        ),
+      ),
+    ),
+
+    h('h4', { class: 'form-section', text: '永远不离开这台电脑' }),
+    h(
+      'ul',
+      { class: 'small muted' },
+      ...(e.stays || []).map((s) => h('li', { text: s })),
+    ),
+
+    h(
+      'div',
+      { class: 'row-actions mt-3' },
+      h(
+        'button',
+        {
+          class: 'btn btn-primary',
+          disabled: state.securityBusy,
+          onclick: (ev) => saveEgress(ev.currentTarget),
+        },
+        state.securityBusy ? '保存中…' : '保存隐私设置',
+      ),
+      h('button', { class: 'btn', disabled: state.securityBusy, onclick: loadEgress }, '刷新去向'),
+    ),
+  );
+}
+
+/** 保存隐私设置（只提交 llm 里的隐私相关字段，避免把 API Key 一起写坏）。 */
+async function saveEgress(btn) {
+  const llm = state.config?.llm || {};
+  state.securityBusy = true;
+  if (btn) btn.textContent = '保存中…';
+  paint();
+  try {
+    await api.saveConfig({ llm: { localOnly: llm.localOnly === true } });
+    state.egress = await api.egress();
+    toast('已保存隐私设置', 'success', 6000);
+  } catch (err) {
+    toastError(err);
+  } finally {
+    state.securityBusy = false;
+    if (btn) btn.textContent = '保存隐私设置';
+    paint();
+  }
+}
+
+async function loadEgress() {
+  try {
+    state.egress = await api.egress();
+  } catch (err) {
+    state.egress = null;
+    toastError(err);
+  }
+  paint();
+}
+
+/**
+ * 访问与安全面板。
+ *
+ * 立场是"把风险说出来"，不是给个绿灯：监听地址、令牌强度、HTTPS、域名白名单、
+ * 会话策略逐项列出结论；任何一项是 error 就顶上一条红字。
+ */
+function securityPanel() {
+  const s = state.security;
+  const cfg = state.config || {};
+  const web = cfg.web || {};
+  const https = web.https || {};
+
+  const levelTag = { ok: 'tag-ok', warn: 'tag-warn', error: 'tag-warn' };
+
+  return h(
+    'div',
+    {},
+    s.worst === 'error'
+      ? h('p', { class: 'error small' }, '⚠️ 下面有需要处理的问题（标红项）：现在的设置存在真实风险。')
+      : null,
+    h(
+      'div',
+      { class: 'storage-table' },
+      ...(s.checks || []).map((c) =>
+        h(
+          'div',
+          { class: 'storage-row' },
+          h('span', { class: `tag ${levelTag[c.level] || ''}`, text: c.level === 'ok' ? '正常' : c.level === 'warn' ? '注意' : '风险' }),
+          h('span', { class: 'storage-label', text: c.title }),
+          h('span', { class: 'muted small storage-hint', text: c.detail }),
+        ),
+      ),
+    ),
+
+    /* 访问令牌 */
+    h('h4', { class: 'form-section', text: '访问令牌' }),
+    h(
+      'p',
+      { class: 'muted small' },
+      '相当于这个服务的密码。登录后浏览器**只保存一个短期会话**（HttpOnly Cookie），不再保存令牌本身。',
+    ),
+    h(
+      'div',
+      { class: 'row-actions' },
+      h(
+        'button',
+        {
+          class: 'btn',
+          disabled: state.securityBusy,
+          onclick: (ev) => setToken2(ev.currentTarget, '__generate__', '生成一个新的强令牌'),
+        },
+        '生成新令牌',
+      ),
+      h(
+        'button',
+        {
+          class: 'btn',
+          disabled: state.securityBusy,
+          onclick: (ev) => setToken2(ev.currentTarget, '', '清空访问令牌（任何能连上的人都能直接使用）'),
+        },
+        '清空令牌（不推荐）',
+      ),
+      h(
+        'button',
+        {
+          class: 'btn btn-small',
+          disabled: state.securityBusy,
+          onclick: async () => {
+            await api.logout();
+            location.reload();
+          },
+        },
+        '退出登录',
+      ),
+    ),
+    h(
+      'p',
+      { class: 'muted small' },
+      `当前令牌：${web.authToken ? '已设置（掩码显示，改它请用上面的按钮）' : '**未设置**'}　·　` +
+        `强度：${s.token?.strength === 'strong' ? '强' : s.token?.strength === 'ok' ? '可用' : '弱'}　·　已登录设备 ${s.sessions?.count || 0} 个`,
+    ),
+
+    /* 会话策略 */
+    h('h4', { class: 'form-section', text: '会话策略' }),
+    h(
+      'div',
+      { class: 'form-row' },
+      numField('空闲多久过期（小时）', web.sessionIdleHours ?? 12, (v) => (web.sessionIdleHours = v)),
+      numField('最长多少天必须重新登录', web.sessionAbsoluteDays ?? 7, (v) => (web.sessionAbsoluteDays = v)),
+    ),
+    h(
+      'p',
+      { class: 'muted small' },
+      '重启服务会让所有会话立即失效（会话只存在内存里，这是刻意的：省掉一个必须防篡改的落盘文件）。',
+    ),
+
+    /* 监听与域名 */
+    h('h4', { class: 'form-section', text: '监听地址与域名白名单' }),
+    h(
+      'div',
+      { class: 'form-row' },
+      field(
+        '监听地址',
+        selectInput(
+          [
+            { value: '127.0.0.1', label: '仅本机（推荐）' },
+            { value: '0.0.0.0', label: '所有网卡（局域网可访问）' },
+            { value: '__custom__', label: '指定地址…' },
+          ],
+          ['127.0.0.1', '0.0.0.0'].includes(web.host) ? web.host : '__custom__',
+          (v) => {
+            web.host = v === '__custom__' ? web.hostCustom || '' : v;
+            paint();
+          },
+        ),
+        '改完要重启服务才生效',
+      ),
+      !['127.0.0.1', '0.0.0.0'].includes(web.host)
+        ? field('自定义监听地址', textInput(web.host, (v) => ((web.host = v), (web.hostCustom = v))))
+        : null,
+    ),
+    field(
+      '允许的域名（逗号分隔）',
+      textInput((web.allowedHosts || []).join(', '), (v) => (web.allowedHosts = v.split(',').map((x) => x.trim()).filter(Boolean))),
+      '仅当你用域名（反向代理/内网域名）访问时才需要填。域名可被解析到任意地址，正是 DNS rebinding 的载体，所以默认一个都不放',
+    ),
+
+    /* HTTPS */
+    h('h4', { class: 'form-section', text: 'HTTPS' }),
+    h(
+      'label',
+      { class: 'form-check' },
+      h('input', { type: 'checkbox', checked: https.enabled === true, onchange: (e) => ((https.enabled = e.target.checked), paint()) }),
+      '启用 HTTPS（改完要重启服务）',
+    ),
+    https.enabled
+      ? h(
+          'div',
+          {},
+          h('label', { class: 'form-check' }, h('input', { type: 'checkbox', checked: https.selfSigned !== false, onchange: (e) => ((https.selfSigned = e.target.checked), paint()) }), '没有正式证书时使用自签证书'),
+          https.selfSigned === false
+            ? h(
+                'div',
+                {},
+                field('证书文件（PEM）', textInput(https.certFile || '', (v) => (https.certFile = v)), '可以是绝对路径，或相对程序目录'),
+                field('私钥文件（PEM）', textInput(https.keyFile || '', (v) => (https.keyFile = v))),
+              )
+            : h(
+                'p',
+                { class: 'muted small' },
+                '自签证书只保证**传输加密**，浏览器仍会提示"不受信任"（点继续访问即可）。要免警告就填自己的证书。',
+              ),
+          s.tls?.fingerprint256
+            ? h('p', { class: 'muted small' }, `当前证书指纹 SHA-256：${s.tls.fingerprint256}${s.tls.notAfter ? `（有效期至 ${fmtFull(new Date(s.tls.notAfter))}）` : ''}`)
+            : null,
+        )
+      : h('p', { class: 'muted small' }, s.loopbackOnly ? '只监听本机时明文不出本机，可以不开。' : '⚠️ 当前监听范围不止本机，建议开启：否则令牌与邮件内容在局域网链路上是明文。'),
+
+    h(
+      'div',
+      { class: 'row-actions mt-3' },
+      h(
+        'button',
+        {
+          class: 'btn btn-primary',
+          disabled: state.securityBusy,
+          onclick: (ev) => saveSecurity(ev.currentTarget),
+        },
+        state.securityBusy ? '保存中…' : '保存访问与安全设置',
+      ),
+      h('button', { class: 'btn', disabled: state.securityBusy, onclick: loadSecurity }, '刷新状态'),
+    ),
+    h('p', { class: 'muted small mt-2' }, '改动监听地址与 HTTPS 需要**重启服务**才生效（会话策略与令牌立即生效）。'),
+  );
+}
+
+/** 改访问令牌（可传 __generate__ 让服务端生成）。 */
+async function setToken2(btn, value, what) {
+  const ok = await confirmDialog({
+    title: `确定要${what}？`,
+    message: h(
+      'div',
+      {},
+      h('p', { class: 'small', text: '所有已登录的设备会立即掉线，需要用新令牌重新登录。' }),
+      value === ''
+        ? h('p', { class: 'error small', text: '清空后**任何能访问这个地址的人都能直接使用**，包括读取邮件与发信。' })
+        : h('p', { class: 'small', text: '新令牌会显示一次，请复制保存（界面里之后只显示掩码）。' }),
+    ),
+    confirmText: '确定',
+    danger: value === '',
+  });
+  if (!ok) return;
+  state.securityBusy = true;
+  if (btn) btn.disabled = true;
+  paint();
+  try {
+    const out = await api.setAuthToken(value);
+    state.security = await api.security();
+    if (out.authToken) {
+      await confirmDialog({
+        title: '新令牌（请复制保存）',
+        message: h(
+          'div',
+          {},
+          h('code', { class: 'token-reveal', text: out.authToken }),
+          h('p', { class: 'muted small', text: '这个值只显示这一次；之后界面只显示掩码。' }),
+          h('p', { class: 'small', text: '保存后请用新令牌重新登录本页面。' }),
+        ),
+        confirmText: '我已复制',
+        cancelText: '知道了',
+      });
+      await api.logout();
+      location.reload();
+      return;
+    }
+    toast(out.message, 'success', 8000);
+  } catch (err) {
+    toastError(err);
+  } finally {
+    state.securityBusy = false;
+    paint();
+  }
+}
+
+/** 保存访问与安全设置（只提交这一块字段）。 */
+async function saveSecurity(btn) {
+  const web = state.config?.web || {};
+  state.securityBusy = true;
+  if (btn) btn.textContent = '保存中…';
+  paint();
+  try {
+    await api.saveConfig({
+      web: {
+        host: web.host,
+        allowedHosts: web.allowedHosts || [],
+        sessionIdleHours: web.sessionIdleHours,
+        sessionAbsoluteDays: web.sessionAbsoluteDays,
+        https: {
+          enabled: web.https?.enabled === true,
+          selfSigned: web.https?.selfSigned !== false,
+          certFile: web.https?.certFile || '',
+          keyFile: web.https?.keyFile || '',
+          altNames: web.https?.altNames || [],
+        },
+      },
+    });
+    state.security = await api.security();
+    toast('已保存（改监听地址与 HTTPS 需要重启服务生效）', 'success', 8000);
+  } catch (err) {
+    toastError(err);
+  } finally {
+    state.securityBusy = false;
+    if (btn) btn.textContent = '保存访问与安全设置';
+    paint();
+  }
+}
+
+async function loadSecurity() {
+  try {
+    state.security = await api.security();
+  } catch (err) {
+    state.security = null;
+    toastError(err);
+  }
+  paint();
+}
+
+/** 数字输入。 */
+function numField(label, value, oninput) {
+  return field(
+    label,
+    h('input', { class: 'input', type: 'number', min: 1, value: value ?? '', oninput: (e) => oninput(Number(e.target.value)) }),
+  );
+}
+
+function textInput(value, oninput) {
+  return h('input', { class: 'input', type: 'text', value: value ?? '', oninput: (e) => oninput(e.target.value) });
+}
+
+function selectInput(options, value, onchange) {
+  return h(
+    'select',
+    { class: 'input', onchange: (e) => onchange(e.target.value) },
+    ...options.map((o) => h('option', { value: o.value, selected: o.value === value }, o.label)),
+  );
+}
+
+function field(label, control, hint) {
+  return h(
+    'label',
+    { class: 'form-field' },
+    h('span', { class: 'form-label', text: label }),
+    control,
+    hint ? h('span', { class: 'muted small', text: hint }) : null,
+  );
+}
+
+/**
  * 密钥存储面板。
  *
  * 三件事必须一眼看清，否则用户会一直猜：
@@ -1743,6 +2189,18 @@ function field(label, control, hint) {
         state.secrets = await api.secrets();
       } catch {
         state.secrets = null;
+      }
+      // 访问与安全现状
+      try {
+        state.security = await api.security();
+      } catch {
+        state.security = null;
+      }
+      // 数据去向
+      try {
+        state.egress = await api.egress();
+      } catch {
+        state.egress = null;
       }
       try {
         state.safetyBackups = (await api.backups()).backups || [];

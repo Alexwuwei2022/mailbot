@@ -4,6 +4,7 @@
  */
 
 import { AppError, extractJson, isRetryableNetworkError, log, retry, safeJson, truncate } from '../lib/util.js';
+import { assertEgressAllowed } from '../lib/privacy.js';
 
 const RETRY_HINT = '（服务端返回 429/5xx，已自动重试；若持续失败请检查额度或稍后再试）';
 
@@ -17,6 +18,12 @@ export class LlmClient {
     this.timeoutMs = config.timeoutMs ?? 120_000;
     this.maxRetries = config.maxRetries ?? 3;
     this.jsonMode = config.jsonMode !== false;
+    /*
+     * 仅本地模式的硬拦截放在**构造函数**里：这是所有模型调用唯一的必经之路，
+     * 放在这里就不存在"某个调用点忘了检查"。而且是构造时就抛错——
+     * 用户点「测试」会立刻看到原因，而不是等分析跑到一半才失败。
+     */
+    assertEgressAllowed(config, this.baseUrl);
   }
 
   /**

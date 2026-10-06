@@ -1,7 +1,16 @@
 /**
- * 后端 API 封装。所有请求都会带上本地访问令牌（若配置了）。
+ * 后端 API 封装。
+ *
+ * ## 凭据怎么带
+ *
+ * 浏览器**不再持有访问令牌**：登录时用令牌换一个 HttpOnly 的会话 Cookie，
+ * 之后每个请求靠 Cookie 自动认证。这么做是因为旧做法有三个真问题：
+ * 令牌存在 localStorage 里永不过期；SSE 还得把它拼进 URL（于是进了浏览器历史与代理日志）；
+ * 服务端也无法"登出某一台设备"。
+ *
+ * 下面保留 `getToken/setToken` 只是为了兼容旧版本留在 localStorage 里的令牌：
+ * 若还存在，会在登录时直接用它换会话，然后**立刻从 localStorage 删掉**。
  */
-
 const TOKEN_KEY = 'mailbot.token';
 
 export function getToken() {
@@ -13,13 +22,44 @@ export function setToken(token) {
 }
 
 /**
- * 请求头（带本地访问令牌）。
+ * 请求头。
  *
- * 供不走 `request()` 的地方使用——例如附件下载需要拿到原始二进制，
- * 不能走 JSON 解析那条路径。
+ * 正常情况下**什么都不用带**（Cookie 自动随请求发送）。
+ * 但命令行/脚本场景仍可能用令牌，所以 localStorage 里若还有旧令牌就带上——
+ * 登录成功后会把它清掉，这条路径自然消失。
  */
 export function authHeaders(extra = {}) {
-  return { 'x-mailbot-token': getToken(), ...extra };
+  const legacy = getToken();
+  return { ...(legacy ? { 'x-mailbot-token': legacy } : {}), ...extra };
+}
+
+/** 用访问令牌换一个会话 Cookie；成功后清掉 localStorage 里的旧令牌。 */
+export async function login(token) {
+  const res = await fetch('/api/session', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ token: String(token || '') }),
+  });
+  const payload = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new ApiError(payload?.message || `登录失败（HTTP ${res.status}）`, payload?.code || 'LOGIN_FAILED', res.status);
+  }
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    /* 隐私模式下 localStorage 可能不可写，忽略 */
+  }
+  return payload;
+}
+
+export async function logout() {
+  const res = await fetch('/api/session/logout', { method: 'POST', headers: authHeaders() });
+  return res.json().catch(() => ({ ok: true }));
+}
+
+/** 会话状态：是否需要登录。 */
+export function session() {
+  return request('GET', '/api/session');
 }
 
 export class ApiError extends Error {
@@ -33,7 +73,7 @@ export class ApiError extends Error {
 }
 
 async function request(method, path, body, options = {}) {
-  const headers = { 'x-mailbot-token': getToken() };
+  const headers = authHeaders();
   // rawBody：直接把调用方给的 Blob/File/ArrayBuffer 当请求体发（附件上传用）
   if (options.rawBody) {
     if (options.contentType) headers['content-type'] = options.contentType;
@@ -52,7 +92,14 @@ async function request(method, path, body, options = {}) {
 
   if (!res.ok) {
     const message = (payload && payload.message) || `请求失败（HTTP ${res.status}）`;
-    throw new ApiError(message, payload?.code || 'HTTP_ERROR', res.status, payload?.detail);
+    const err = new ApiError(message, payload?.code || 'HTTP_ERROR', res.status, payload?.detail);
+    /*
+     * 401 要能被上层识别成"该登录了"。
+     * 用状态码 + 由 app 层统一处理，比让每个视图各写一遍友好得多：
+     * 会话过期后用户点任何地方都会自然地回到登录页，而不是看到一堆红色报错。
+     */
+    if (res.status === 401) err.needsLogin = true;
+    throw err;
   }
   return payload;
 }
@@ -117,6 +164,14 @@ export const api = {
   /** 定时任务（主动性）：状态 + 立即试一次 */
   scheduleStatus: () => request('GET', '/api/schedule'),
   runScheduleNow: () => request('POST', '/api/schedule/run', {}),
+  /** 数据去向（按当前配置推导）与仅本地模式开关（走 saveConfig 的 llm.localOnly） */
+  egress: () => request('GET', '/api/egress'),
+
+  /** 会话与安全 */
+  session: () => request('GET', '/api/session'),
+  security: () => request('GET', '/api/security'),
+  setAuthToken: (authToken) => request('POST', '/api/security/token', { authToken }),
+
   /** 密钥存储：现状 / 迁入保管库 / 迁回明文（后两者会改配置文件，接口侧强制 confirm） */
   secrets: () => request('GET', '/api/secrets'),
   secretsMigrate: (mode) => request('POST', '/api/secrets/migrate', { confirm: true, mode }),
@@ -242,11 +297,14 @@ function query(params) {
   return `?${entries.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join('&')}`;
 }
 
-/** 订阅运行进度（SSE），返回取消函数。 */
+/**
+ * 订阅运行进度（SSE），返回取消函数。
+ *
+ * 不再把令牌拼进 URL：EventSource 会自动带上同源的会话 Cookie。
+ * 旧做法（`?token=…`）会让令牌留在浏览器历史与服务端访问日志里。
+ */
 export function subscribeProgress(onEvent) {
-  const token = getToken();
-  const url = `/api/events${token ? `?token=${encodeURIComponent(token)}` : ''}`;
-  const source = new EventSource(url);
+  const source = new EventSource('/api/events');
   source.addEventListener('progress', (ev) => {
     try {
       onEvent(JSON.parse(ev.data));

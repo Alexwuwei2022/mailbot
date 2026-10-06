@@ -39,6 +39,16 @@ export const AUDIT_ACTIONS = {
   /** 密钥搬家：把明文搬进系统保管库、或搬回明文 */
   'secrets.migrate': { label: '密钥迁入保管库', group: '数据' },
   'secrets.revert': { label: '密钥迁回明文', group: '数据' },
+  /**
+   * 认证相关。
+   *
+   * 失败登录也要记：它既是排查"我为什么进不去"的依据，
+   * 也是"有人在试我的令牌"的唯一线索。
+   */
+  'auth.login': { label: '登录成功', group: '安全' },
+  'auth.logout': { label: '登出', group: '安全' },
+  'auth.fail': { label: '登录失败', group: '安全' },
+  'security.token': { label: '修改访问令牌', group: '安全' },
 };
 
 function auditPath() {

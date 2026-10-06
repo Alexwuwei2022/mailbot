@@ -2580,6 +2580,459 @@ await test('HTTP：/api/secrets 能报告密钥在哪，且迁移未确认时一
   }
 });
 
+/**
+ * 发一个**原始** HTTP 请求，可以自由设置 `Host` 头。
+ *
+ * 为什么不能用 fetch：`Host` 在 fetch 规范里是 forbidden header，
+ * undici 会直接忽略它——于是"伪造 Host 攻击"根本测不出来（我第一版就是这么写的，
+ * 结果攻击请求返回 200，看起来像防护失效，其实是测试没生效）。
+ */
+async function rawRequest(target, { method = 'GET', host, headers = {}, body } = {}) {
+  const http = await import('node:http');
+  const u = new URL(target);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        hostname: u.hostname,
+        port: u.port,
+        path: `${u.pathname}${u.search}`,
+        method,
+        headers: { ...(host ? { host } : {}), ...headers },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () =>
+          resolve({ status: res.statusCode, headers: res.headers, text: Buffer.concat(chunks).toString('utf8') }),
+        );
+      },
+    );
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+await test('安全：Host 白名单挡住 DNS rebinding，域名必须显式登记', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  try {
+    // 正常访问：Host 是回环
+    const ok = await rawRequest(`${url}/api/meta`, { host: '127.0.0.1' });
+    assertEqual(ok.status, 200, '回环 Host 应放行');
+
+    /*
+     * DNS rebinding 的关键特征：浏览器连的是 127.0.0.1，但 Host 头是攻击者的域名。
+     * 必须拒——而且**任何**接口都拒（连静态资源也不该被恶意页面加载起来）。
+     */
+    for (const evil of ['evil.example.com', 'evil.example.com:8787', 'attacker.test']) {
+      const res = await rawRequest(`${url}/api/meta`, { host: evil });
+      assertEqual(res.status, 421, `Host=${evil} 应被拒绝（实际 ${res.status}）`);
+      const parsed = JSON.parse(res.text);
+      assertEqual(parsed.code, 'HOST_NOT_ALLOWED', '应给出明确错误码');
+      assertIncludes(parsed.message, 'DNS rebinding', '提示里应说清这类攻击');
+    }
+    // 静态资源也一并挡（否则恶意页面至少能把界面框架加载起来）
+    const staticRes = await rawRequest(`${url}/`, { host: 'evil.example.com' });
+    assertEqual(staticRes.status, 421, '静态资源同样受 Host 校验');
+
+    // IP 字面量永远放行（IP 无法被 DNS rebinding 利用）
+    for (const ip of ['192.168.1.9', '10.0.0.3:8787']) {
+      const res = await rawRequest(`${url}/api/meta`, { host: ip });
+      assertEqual(res.status, 200, `Host=${ip} 应放行`);
+    }
+
+    // 显式登记过的域名要放行（通过配置热更新验一遍）
+    const { saveConfig } = await import('../server/config/index.js');
+    const { getPaths } = await import('../server/config/index.js');
+    const fs = await import('node:fs');
+    const before = fs.readFileSync(getPaths().configFile, 'utf8');
+    try {
+      saveConfig({ web: { allowedHosts: ['mailbot.lan'] } });
+      const allowed = await rawRequest(`${url}/api/meta`, { host: 'mailbot.lan' });
+      assertEqual(allowed.status, 200, '登记过的域名应放行');
+      const stillEvil = await rawRequest(`${url}/api/meta`, { host: 'evil.example.com' });
+      assertEqual(stillEvil.status, 421, '未登记的域名仍应被拒');
+    } finally {
+      fs.writeFileSync(getPaths().configFile, before, 'utf8');
+      (await import('../server/config/index.js')).loadConfig({ rootDir: root, force: true });
+    }
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+await test('安全：安全响应头齐全，且 CSP 不放开 inline 脚本', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  try {
+    const res = await fetch(`${url}/api/meta`);
+    const h = res.headers;
+    assertIncludes(h.get('content-security-policy') || '', "default-src 'self'", 'CSP 应有 default-src');
+    assertIncludes(h.get('content-security-policy') || '', "frame-ancestors 'none'", 'CSP 应禁止被 iframe 嵌套');
+    assertIncludes(h.get('content-security-policy') || '', "script-src 'self'", 'CSP 的 script-src 应是 self');
+    assert(
+      !/script-src[^;]*unsafe-inline/.test(h.get('content-security-policy') || ''),
+      'CSP 不得为脚本放开 unsafe-inline（那等于放弃 XSS 防护）',
+    );
+    assertEqual(h.get('x-content-type-options'), 'nosniff', '应有 nosniff');
+    assertEqual(h.get('x-frame-options'), 'DENY', '应有 X-Frame-Options');
+    assertEqual(h.get('referrer-policy'), 'no-referrer', '应有 Referrer-Policy');
+    // 纯 HTTP 下不能声明 HSTS，否则浏览器会强制升级到打不开
+    assert(!h.get('strict-transport-security'), '未启用 HTTPS 时不应发送 HSTS');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+/**
+ * 会话相关的测试需要"服务端确实配了访问令牌"。
+ * 日历套件的默认配置里令牌是空的（那样任何请求都放行），
+ * 所以这些用例先写入一个测试令牌，结束后还原配置文件。
+ */
+async function withAuthToken(token, fn) {
+  const fs = await import('node:fs');
+  const { saveConfig, getPaths, loadConfig, getConfig } = await import('../server/config/index.js');
+  const cfgFile = getPaths().configFile;
+  const before = fs.readFileSync(cfgFile, 'utf8');
+  try {
+    saveConfig({ web: { authToken: token } });
+    assertEqual(getConfig().web.authToken, token, '测试令牌应已生效');
+    return await fn(token, cfgFile, before);
+  } finally {
+    fs.writeFileSync(cfgFile, before, 'utf8');
+    loadConfig({ rootDir: root, force: true });
+  }
+}
+
+await test('安全：会话 Cookie 取代永久令牌，未登录与登出行为正确', async () => {
+  const { resetSessions } = await import('../server/lib/session.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  resetSessions();
+  resetThrottle();
+  await withAuthToken('test-token-for-session-check-0123456789', async (token) => {
+    const { startServer } = await import('../server/index.js');
+    const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+    try {
+      // 1) 未带任何凭据：明确是"需要登录"，而不是"令牌错误"
+      const anon = await fetch(`${url}/api/overview`);
+      assertEqual(anon.status, 401, '未登录应 401');
+      const anonBody = await anon.json();
+      assertEqual(anonBody.code, 'UNAUTHORIZED', '应是未授权');
+      assertIncludes(anonBody.message, '登录', '提示应指向登录');
+      const status = await (await fetch(`${url}/api/session`)).json();
+      assertEqual(status.needLogin, true, '会话状态应显示需要登录');
+      assertEqual(status.hasToken, true, '应说明已配置令牌');
+
+      // 2) 静态资源必须能匿名加载，否则登录页自己都开不出来（这一条踩过坑）
+      for (const p of ['/', '/main.js', '/styles.css', '/theme-boot.js']) {
+        const res = await fetch(`${url}${p}`);
+        assertEqual(res.status, 200, `${p} 应可匿名加载（登录页依赖它）`);
+      }
+
+      // 3) 用令牌换会话 Cookie
+      const login = await fetch(`${url}/api/session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+      assertEqual(login.status, 200, '登录应成功');
+      const setCookie = login.headers.get('set-cookie') || '';
+      assertIncludes(setCookie, 'mailbot_session=', '应下发会话 Cookie');
+      assertIncludes(setCookie, 'HttpOnly', 'Cookie 必须是 HttpOnly（JS 读不到）');
+      assertIncludes(setCookie, 'SameSite=Strict', 'Cookie 必须是 SameSite=Strict');
+      assert(!/Secure/i.test(setCookie), '纯 HTTP 下不能加 Secure，否则 Cookie 直接失效');
+      const cookie = setCookie.split(';')[0];
+
+      // 4) 带 Cookie 即可访问；且**不带令牌头**
+      const withCookie = await fetch(`${url}/api/overview`, { headers: { cookie } });
+      assertEqual(withCookie.status, 200, '带会话 Cookie 应放行');
+
+      // 5) 登出后该 Cookie 立即失效
+      const logout = await fetch(`${url}/api/session/logout`, { method: 'POST', headers: { cookie } });
+      assertEqual(logout.status, 200, '登出应成功');
+      assertIncludes(logout.headers.get('set-cookie') || '', 'Max-Age=0', '登出应清掉 Cookie');
+      const after = await fetch(`${url}/api/overview`, { headers: { cookie } });
+      assertEqual(after.status, 401, '登出后原 Cookie 应失效');
+    } finally {
+      resetSessions();
+      await new Promise((r) => server.close(r));
+    }
+  });
+});
+
+await test('安全：登录失败限速（错误令牌累计后被临时拒绝）', async () => {
+  const { resetSessions } = await import('../server/lib/session.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  resetSessions();
+  resetThrottle();
+  await withAuthToken('test-token-for-throttle-check-0123456789', async (token) => {
+    const { startServer } = await import('../server/index.js');
+    const { getConfig } = await import('../server/config/index.js');
+    const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+    try {
+      const max = getConfig().web.authMaxFailures;
+      let sawBlocked = false;
+      let attempts = 0;
+      for (let i = 0; i < max; i += 1) {
+        attempts += 1;
+        const res = await fetch(`${url}/api/session`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ token: `wrong-${i}` }),
+        });
+        if (res.status === 429) {
+          sawBlocked = true;
+          assert(res.headers.get('retry-after'), '429 应带 Retry-After');
+          break;
+        }
+        assertEqual(res.status, 401, `第 ${i + 1} 次错误令牌应是 401`);
+      }
+      assert(sawBlocked, `连续输错 ${attempts} 次后应被临时拒绝`);
+
+      // 被限速期间，即使**令牌正确**也应被拒（限速就是限速）
+      const correct = await fetch(`${url}/api/session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token }),
+      });
+      assertEqual(correct.status, 429, '限速期间正确令牌也应被暂时拒绝');
+
+      // 失败要留痕：限速期间连读台账也会被拒，这本身就是"限速生效"的又一处证明
+      const auditBlocked = await fetch(`${url}/api/audit?action=auth.fail`);
+      assertEqual(auditBlocked.status, 429, '限速期间其他接口同样被拒');
+    } finally {
+      resetThrottle();
+      resetSessions();
+      await new Promise((r) => server.close(r));
+    }
+  });
+});
+
+await test('安全：改访问令牌会让所有会话失效，并记入台账', async () => {
+  const { resetSessions } = await import('../server/lib/session.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  resetSessions();
+  resetThrottle();
+  await withAuthToken('test-token-for-rotate-check-0123456789', async (oldToken) => {
+    const { startServer } = await import('../server/index.js');
+    const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+    try {
+      // 先登录拿一个会话
+      const login = await fetch(`${url}/api/session`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ token: oldToken }),
+      });
+      const cookie = (login.headers.get('set-cookie') || '').split(';')[0];
+      assertEqual((await fetch(`${url}/api/overview`, { headers: { cookie } })).status, 200, '登录后应可访问');
+
+      // 用旧令牌改一个新令牌
+      const changed = await fetch(`${url}/api/security/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-mailbot-token': oldToken },
+        body: JSON.stringify({ authToken: '__generate__' }),
+      });
+      assertEqual(changed.status, 200, '改令牌应成功');
+      const out = await changed.json();
+      assert(out.authToken && out.authToken.length >= 32, '应返回一个新生成的强令牌');
+      assert(out.sessionsInvalidated >= 1, `应报告失效的会话数（实际 ${out.sessionsInvalidated}）`);
+
+      // 旧会话必须立刻失效——这正是"改令牌"的意义
+      const afterChange = await fetch(`${url}/api/overview`, { headers: { cookie } });
+      assertEqual(afterChange.status, 401, '改令牌后旧会话必须失效');
+
+      // 太短的令牌要被拒
+      const weak = await fetch(`${url}/api/security/token`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-mailbot-token': out.authToken },
+        body: JSON.stringify({ authToken: '1234' }),
+      });
+      assertEqual(weak.status, 400, '过短的令牌应被拒绝');
+
+      const audit = await (
+        await fetch(`${url}/api/audit?action=security.token`, { headers: { 'x-mailbot-token': out.authToken } })
+      ).json();
+      // 注意字段名是 items（listAudit 的返回结构），不是 entries
+      assert((audit.items || []).length >= 1, `改令牌应记入台账（实际 ${(audit.items || []).length} 条）`);
+      assertEqual(audit.items[0].action, 'security.token', '应记成 security.token');
+    } finally {
+      resetSessions();
+      resetThrottle();
+      await new Promise((r) => server.close(r));
+    }
+  });
+});
+
+await test('隐私：仅本地模式硬拦非本机模型地址，/api/egress 按真实配置说明去向', async () => {
+  const fs = await import('node:fs');
+  const { startServer } = await import('../server/index.js');
+  const { getPaths, loadConfig } = await import('../server/config/index.js');
+  const { LlmClient } = await import('../server/llm/client.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  const { resetSessions } = await import('../server/lib/session.js');
+  resetThrottle();
+  resetSessions();
+  const cfgFile = getPaths().configFile;
+  const before = fs.readFileSync(cfgFile, 'utf8');
+  try {
+    // 1) 纯函数层：判定的边界要清楚
+    const { localOnlyVerdict, isLoopbackHost } = await import('../server/lib/privacy.js');
+    assertEqual(isLoopbackHost('127.0.0.1'), true, '回环应算本机');
+    assertEqual(isLoopbackHost('192.168.1.5'), false, '局域网另一台机器不算本机');
+    assertEqual(localOnlyVerdict('http://127.0.0.1:11434/v1').allowed, true, '本机 Ollama 应放行');
+    assertEqual(localOnlyVerdict('http://192.168.1.50:11434/v1').kind, 'lan', '局域网地址应识别为 lan');
+    assertEqual(localOnlyVerdict('https://api.deepseek.com/v1').kind, 'public', '公网应识别为 public');
+
+    // 2) 客户端层：仅本地模式下必须**抛错**，而不是"提醒一下继续发"
+    let code = null;
+    try {
+      new LlmClient({ baseUrl: 'https://api.deepseek.com/v1', apiKey: 'k', model: 'm', localOnly: true });
+    } catch (err) {
+      code = err.code;
+    }
+    assertEqual(code, 'LLM_LOCAL_ONLY_BLOCKED', '公网地址在仅本地模式下必须被拒绝');
+    // 本机地址要能正常构造
+    const okClient = new LlmClient({ baseUrl: 'http://127.0.0.1:11434/v1', apiKey: '', model: 'qwen', localOnly: true });
+    assert(okClient instanceof LlmClient, '本机地址应可构造');
+    // 关掉开关后公网地址可正常构造（默认行为不变）
+    assert(new LlmClient({ baseUrl: 'https://api.deepseek.com/v1', apiKey: 'k', model: 'm', localOnly: false }), '未开启时不应拦截');
+
+    // 3) HTTP 层：报告要跟着配置走
+    const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+    try {
+      const egress = await (await fetch(`${url}/api/egress`)).json();
+      assertEqual(egress.ok, true, 'egress 应可用');
+      const host = new URL(getConfig().llm.baseUrl).hostname;
+      assertEqual(egress.llmHost, host, '报告里的模型主机名必须来自真实配置');
+      assert(egress.items.length >= 4, '应逐项列出功能');
+      const analyze = egress.items.find((i) => i.feature === '分析邮件');
+      assert(analyze, '应有"分析邮件"一项');
+      assert(
+        analyze.sends.some((s) => /正文/.test(s)),
+        '必须说明正文会被发送（不能含糊）',
+      );
+      assert(
+        analyze.notSends.some((s) => /附件内容/.test(s)),
+        '必须说明附件内容不会被发送（这往往是用户最担心的）',
+      );
+      assert(egress.stays.length >= 3, '应列出永不离开本机的数据');
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  } finally {
+    fs.writeFileSync(cfgFile, before, 'utf8');
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('安全：启用 HTTPS 后真的走 TLS，Cookie 变 Secure，且报告指纹', async () => {
+  const fs = await import('node:fs');
+  const https = await import('node:https');
+  const { startServer } = await import('../server/index.js');
+  const { getPaths, loadConfig, saveConfig, getConfig } = await import('../server/config/index.js');
+  const { resetSessions } = await import('../server/lib/session.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  resetThrottle();
+  resetSessions();
+  const cfgFile = getPaths().configFile;
+  const before = fs.readFileSync(cfgFile, 'utf8');
+  const dataDir = getPaths().dataDir;
+  try {
+    saveConfig({ web: { authToken: 'test-token-for-https-check-0123456789', https: { enabled: true, selfSigned: true } } });
+    const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+    try {
+      assertIncludes(url, 'https://', '启动地址应按 HTTPS 显示');
+      assert(fs.existsSync(`${dataDir}/tls/self-signed.crt`), '应生成自签证书文件');
+      assert(fs.existsSync(`${dataDir}/tls/self-signed.key`), '应生成私钥文件');
+      // 私钥权限要收紧（Windows 上这个位不生效，但代码表达了意图；Linux 上 CI 会真正校验）
+      if (process.platform !== 'win32') {
+        const mode = fs.statSync(`${dataDir}/tls/self-signed.key`).mode & 0o777;
+        assertEqual(mode & 0o077, 0, `私钥不应给同组/其他人读（实际 ${mode.toString(8)}）`);
+      }
+
+      // 用 Node 的 TLS 栈连上去（自签所以要关掉校验，这正是浏览器里点"继续访问"对应的行为）
+      const { port } = new URL(url);
+      const agent = new https.Agent({ rejectUnauthorized: false });
+      const token = getConfig().web.authToken;
+      const res = await new Promise((resolve, reject) => {
+        const req = https.request(`${url}/api/meta`, { agent, headers: { 'x-mailbot-token': token } }, (r) => {
+          const chunks = [];
+          r.on('data', (c) => chunks.push(c));
+          r.on('end', () => resolve({ status: r.statusCode, headers: r.headers, text: Buffer.concat(chunks).toString('utf8') }));
+        });
+        req.on('error', reject);
+        req.end();
+      });
+      assertEqual(res.status, 200, 'HTTPS 请求应成功');
+      // HSTS 只在真的走 HTTPS 时才发（HTTP 下发它会把用户困在打不开的地址上）
+      assert(res.headers['strict-transport-security'], 'HTTPS 下应发送 HSTS');
+
+      /*
+       * 证书里必须有 SAN——没有 SAN 的证书现代浏览器直接判为不匹配。
+       * 用 `tls.connect` 直接读对端证书：在 HTTPS 响应的 socket 上取
+       * `getPeerCertificate()` 会因 socket 状态而返回空对象（这一点我踩过）。
+       */
+      const tlsMod = await import('node:tls');
+      const peer = await new Promise((resolve, reject) => {
+        const sock = tlsMod.connect({ host: '127.0.0.1', port: Number(port), rejectUnauthorized: false }, () => {
+          const cert = sock.getPeerCertificate();
+          sock.end();
+          resolve(cert);
+        });
+        sock.on('error', reject);
+      });
+      assertIncludes(peer.subjectaltname || '', '127.0.0.1', '自签证书的 SAN 必须覆盖回环地址');
+      assertIncludes(peer.subjectaltname || '', 'DNS:localhost', '自签证书的 SAN 应含 localhost');
+
+      // HTTPS 下会话 Cookie 必须带 Secure（否则明文回退时会被一起发出去）
+      const login = await new Promise((resolve, reject) => {
+        const req = https.request(
+          `${url}/api/session`,
+          { agent, method: 'POST', headers: { 'content-type': 'application/json' } },
+          (r) => {
+            r.resume();
+            resolve({ status: r.statusCode, setCookie: r.headers['set-cookie'] || '' });
+          },
+        );
+        req.on('error', reject);
+        req.write(JSON.stringify({ token: getConfig().web.authToken }));
+        req.end();
+      });
+      assertEqual(login.status, 200, 'HTTPS 下登录应成功');
+      assertIncludes(login.setCookie.join(';'), 'Secure', 'HTTPS 下会话 Cookie 必须带 Secure');
+
+      // /api/security 要能报告出证书来源与指纹
+      // （注意：这里不能直接用 fetch——自签证书会让它抛 DEPTH_ZERO_SELF_SIGNED_CERT，
+      //   这正是我们要的行为，所以测试里显式用一个关掉校验的 agent）
+      const httpsGetJson = (path, token2) =>
+        new Promise((resolve, reject) => {
+          const req = https.request(`${url}${path}`, { agent, headers: { 'x-mailbot-token': token2 } }, (r) => {
+            const chunks = [];
+            r.on('data', (c) => chunks.push(c));
+            r.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
+          });
+          req.on('error', reject);
+          req.end();
+        });
+      const sec = await httpsGetJson('/api/security', token);
+      assertEqual(sec.https, true, '应报告已启用 HTTPS');
+      assertEqual(sec.tls.selfSigned, true, '应标明这是自签证书');
+      assert(/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(sec.tls.fingerprint256 || ''), `指纹格式应正确（实际 ${sec.tls?.fingerprint256}）`);
+      const httpsCheck = (sec.checks || []).find((c) => /HTTPS/.test(c.title));
+      assert(httpsCheck && httpsCheck.level === 'warn', '自签证书应被标为"注意"而不是"正常"（浏览器会警告）');
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  } finally {
+    fs.writeFileSync(cfgFile, before, 'utf8');
+    loadConfig({ rootDir: root, force: true });
+    resetSessions();
+    resetThrottle();
+    fs.rmSync(`${dataDir}/tls`, { recursive: true, force: true });
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await google.close();

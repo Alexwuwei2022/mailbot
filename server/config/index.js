@@ -292,6 +292,36 @@ export function normalize(raw) {
   config.web.port = clampNumber(config.web.port, 1, 65535, 8787);
   config.web.host = String(config.web.host || '127.0.0.1').trim();
 
+  /*
+   * 访问与安全相关的字段统一在这里归一化。
+   *
+   * 这些值会直接影响"谁能用这个服务"，所以每一条都夹紧范围、去掉可疑输入：
+   * 域名一律小写去空格（Host 头比较是小写化的），时长给下限防止误设成 0（那等于永不过期）。
+   */
+  config.web.allowedHosts = (Array.isArray(config.web.allowedHosts) ? config.web.allowedHosts : [])
+    .map((h) => String(h || '').trim().toLowerCase())
+    .filter((h) => h && !h.includes('/') && !h.includes(' '));
+  config.web.trustProxy = config.web.trustProxy === true;
+  config.web.sessionIdleHours = clampNumber(config.web.sessionIdleHours, 0.1, 24 * 30, 12);
+  config.web.sessionAbsoluteDays = clampNumber(config.web.sessionAbsoluteDays, 1, 365, 7);
+  config.web.sessionMaxCount = clampNumber(config.web.sessionMaxCount, 1, 200, 20);
+  config.web.authMaxFailures = clampNumber(config.web.authMaxFailures, 3, 1000, 10);
+  config.web.authWindowMinutes = clampNumber(config.web.authWindowMinutes, 1, 1440, 5);
+  config.web.authBlockMinutes = clampNumber(config.web.authBlockMinutes, 1, 1440, 5);
+  const https = config.web.https && typeof config.web.https === 'object' ? config.web.https : {};
+  config.web.https = {
+    enabled: https.enabled === true,
+    certFile: String(https.certFile || '').trim(),
+    keyFile: String(https.keyFile || '').trim(),
+    // 默认开启自签：没有正式证书时，HTTPS 至少能提供传输加密
+    selfSigned: https.selfSigned !== false,
+    altNames: (Array.isArray(https.altNames) ? https.altNames : []).map((s) => String(s || '').trim()).filter(Boolean),
+  };
+  // 只给了一个（证书或私钥）等于配了半套，直接说清楚，别等启动时才莫名其妙
+  if (config.web.https.enabled && (config.web.https.certFile ? !config.web.https.keyFile : !!config.web.https.keyFile)) {
+    log.warn('HTTPS 配置不完整：certFile 与 keyFile 必须同时提供，否则会退回自签证书');
+  }
+
   if (config.web.allowSend === null || config.web.allowSend === undefined) {
     // 默认：允许发送，但必须逐封人工确认（draft.sendPolicy === 'confirm'）
     config.web.allowSend = config.draft.sendPolicy !== 'draft_only';

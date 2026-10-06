@@ -9,6 +9,7 @@ import { renderDrafts } from './views/drafts.js';
 import { renderSearch } from './views/search.js';
 import { renderCalendar } from './views/calendar.js';
 import { renderKnowledge } from './views/knowledge.js';
+import { renderLogin } from './views/login.js';
 import { renderRecords } from './views/records.js';
 import { renderSetup } from './views/setup.js';
 import { renderSettings } from './views/settings.js';
@@ -861,6 +862,29 @@ export function boot() {
   // 外观模式要在渲染外壳之前定下来，否则切换按钮的选中态会对不上。
   // initTheme() 返回取消监听函数（系统外观变化时自动跟随）。
   app.stopThemeWatch = initTheme();
+
+  /*
+   * 先问一句"要不要登录"。
+   *
+   * 放在建外壳之前：没登录时整个界面都没有意义（每个接口都会 401），
+   * 直接给一张登录卡片比"先渲染一堆空列表再报错"清楚得多。
+   */
+  if (!app.bootChecked) {
+    app.bootChecked = true;
+    api
+      .session()
+      .then((s) => {
+        if (s?.needLogin) renderLogin(root, app);
+        else bootShellAndViews(root);
+      })
+      .catch(() => bootShellAndViews(root));
+    return;
+  }
+  bootShellAndViews(root);
+}
+
+/** 建外壳、接事件、渲染首屏。 */
+function bootShellAndViews(root) {
   buildShell(root);
 
   subscribeProgress((event) => app.onProgressEvent(event));

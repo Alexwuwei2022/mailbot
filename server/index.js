@@ -5,6 +5,7 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -25,6 +26,30 @@ import {
 import { LLM_PRESETS, PRESETS } from './config/defaults.js';
 import { AppError, APP_VERSION, hoursAgo, log, safeJson, toErrorPayload } from './lib/util.js';
 import { configHealth, runDiagnostics } from './diagnostics.js';
+import {
+  checkHost,
+  checkThrottle,
+  clientIp,
+  generateToken,
+  lanAddresses,
+  recordFailure,
+  recordSuccess,
+  securityHeaders,
+  securityReport,
+  throttleStatus,
+} from './lib/security.js';
+import {
+  clearCookie,
+  createSession,
+  destroyAllSessions,
+  destroySession,
+  readSessionId,
+  sessionCookie,
+  sessionCount,
+  touchSession,
+} from './lib/session.js';
+import { resolveTls } from './lib/tls.js';
+import { egressReport } from './lib/privacy.js';
 import { LlmClient, pingLlm } from './llm/client.js';
 import { currentRun, clampWindowHours, isRunning, previewScan, progressBus, runScan, cancelRun } from './ai/engine.js';
 import { runScheduledScan, schedulerStatus, setNotifyEmitter, startScheduler, stopScheduler } from './schedule.js';
@@ -152,10 +177,110 @@ async function readJsonBody(req) {
 function authorized(req, config, url) {
   const token = config.web.authToken;
   if (!token) return true;
+  // 新路径：短期会话 Cookie（HttpOnly，浏览器 JS 读不到，也不会进 URL/历史）
+  const sessionId = readSessionId(req);
+  if (sessionId && touchSession(sessionId, config)) return true;
+  /*
+   * 兼容路径：授权头 / ?token=。
+   * `?token=` 只保留给 CLI 与脚本（浏览器已改用会话 Cookie）；
+   * 它会把令牌写进浏览器历史与代理日志，所以界面上不再使用。
+   */
   const header = req.headers['x-mailbot-token'] || req.headers.authorization || '';
-  // EventSource 无法自定义头部，允许用查询参数传递
   const provided = String(header).replace(/^Bearer\s+/i, '').trim() || url?.searchParams.get('token') || '';
   return provided && provided === token;
+}
+
+/**
+ * 返回 null 表示放行；否则返回一个"已经能直接发出去"的响应描述。
+ *
+ * 两件事在这里统一做掉，避免每个路由各写一遍：
+ *   ① **Host 白名单**（防 DNS rebinding）——对**所有**请求生效，静态资源也一起；
+ *   ② **令牌校验 + 失败限速**——只对 `/api/*` 生效。
+ *
+ * ② 为什么不能连静态资源一起管：登录页自己就是静态资源（`index.html` + `main.js`），
+ * 如果它们也要令牌，用户就**永远无法登录**（页面都加载不出来，输入框都看不到）。
+ * 静态资源是本程序自己的代码、不含任何用户数据，明文放行没有风险；
+ * 真正需要挡的是下面的 `/api/*`（那里才有邮件、日程与凭据）。
+ * OAuth 回调也必须放行：它是 Google 把浏览器重定向回来的入口，靠 `state` 防 CSRF，
+ * 而不是靠会话（用户可能换了浏览器或会话已过期）。
+ */
+function gateRequest(req, res, url, config) {
+  const hostCheck = checkHost(req, config);
+  if (!hostCheck.ok) {
+    log.warn(`拒绝可疑 Host：${req.headers.host}（${hostCheck.reason}）`);
+    return {
+      status: 421,
+      payload: { ok: false, code: 'HOST_NOT_ALLOWED', message: hostCheck.reason, host: hostCheck.host },
+    };
+  }
+
+  const isApi = url.pathname.startsWith('/api/');
+  /*
+   * 必须放行的三类：
+   *   - OAuth 回调：Google 把浏览器重定向回来的入口，靠 state 防 CSRF；
+   *   - `/api/session`：**登录本身**与会话状态查询。登录页要靠它判断"要不要登录"，
+   *     它要是也要求凭据，就死锁了（没登录 → 401 → 无法登录）；
+   *     这个路由自己会校验令牌并做失败限速。
+   *   - 登出：只是清掉自己的 Cookie，没有副作用可言。
+   */
+  const exempt =
+    url.pathname === '/api/calendar/oauth/callback' ||
+    url.pathname === '/api/session' ||
+    url.pathname === '/api/session/logout';
+  if (!isApi || exempt) return null;
+
+  const token = config.web.authToken;
+  if (!token) return null; // 没设令牌 = 本机随便用（默认只监听 127.0.0.1）
+
+  const ip = clientIp(req, config);
+  const blocked = checkThrottle(ip, config);
+  if (blocked.blocked) {
+    return {
+      status: 429,
+      payload: { ok: false, code: 'TOO_MANY_ATTEMPTS', message: blocked.reason },
+      retryAfterSec: blocked.retryAfterSec,
+    };
+  }
+
+  if (authorized(req, config, url)) {
+    recordSuccess(ip);
+    return null;
+  }
+
+  // 没带任何凭据：不算"猜错"，不计入限速（否则刷新页面就会被自己封掉）
+  const header = req.headers['x-mailbot-token'] || req.headers.authorization || '';
+  const sessionId = readSessionId(req);
+  const hasCredential = !!(String(header).trim() || url?.searchParams.get('token') || sessionId);
+  if (!hasCredential) {
+    return {
+      status: 401,
+      payload: { ok: false, code: 'UNAUTHORIZED', message: '需要先输入访问令牌登录' },
+    };
+  }
+
+  const rec = recordFailure(ip, config);
+  appendAudit('auth.fail', {
+    target: `${req.method} ${url.pathname}`,
+    source: ip,
+    ok: false,
+    extra: { count: rec.count, blocked: rec.blocked },
+  });
+  if (rec.blocked) {
+    log.warn(`来源 ${ip} 连续 ${rec.count} 次令牌错误，已临时拒绝（${rec.retryAfterSec}s）`);
+    return {
+      status: 429,
+      payload: {
+        ok: false,
+        code: 'TOO_MANY_ATTEMPTS',
+        message: `令牌连续输错 ${rec.count} 次，已暂时拒绝来自 ${ip} 的请求，请 ${Math.ceil(rec.retryAfterSec / 60)} 分钟后再试`,
+      },
+      retryAfterSec: rec.retryAfterSec,
+    };
+  }
+  return {
+    status: 401,
+    payload: { ok: false, code: 'UNAUTHORIZED', message: `访问令牌不正确（已失败 ${rec.count} 次，超过 ${throttleStatus(config).config.maxFailures} 次将临时拒绝）` },
+  };
 }
 
 /**
@@ -407,7 +532,9 @@ function serveStatic(req, res, pathname) {
 
 /* ------------------------------------------------------------ 路由 */
 
-async function handleApi(req, res, url, actualPort) {
+async function handleApi(req, res, url, actualPort, ctx = {}) {
+  // ctx：{ https, tls } —— 由 createServer 传入，避免这个函数去引用它拿不到的 server 变量
+  const isHttps = ctx.https === true;
   const config = getConfig();
   const method = req.method.toUpperCase();
   const route = `${method} ${url.pathname}`;
@@ -569,6 +696,135 @@ async function handleApi(req, res, url, actualPort) {
       stats: auditStats(),
       actions: AUDIT_ACTIONS,
     });
+  }
+
+  /* ---- 会话（浏览器用短期 Cookie 取代永久令牌） ---- */
+
+  /** 会话状态：是否需要登录、当前会话数、策略。 */
+  if (route === 'GET /api/session') {
+    const needLogin = !!config.web.authToken && !(readSessionId(req) && touchSession(readSessionId(req), config));
+    return sendJson(res, 200, {
+      ok: true,
+      needLogin,
+      hasToken: !!config.web.authToken,
+      sessions: sessionCount(config),
+      policy: {
+        idleHours: config.web.sessionIdleHours,
+        absoluteDays: config.web.sessionAbsoluteDays,
+        max: config.web.sessionMaxCount,
+      },
+    });
+  }
+
+  /**
+   * 用访问令牌换一个会话 Cookie。
+   *
+   * 令牌只在这一步出现一次，之后浏览器只带 HttpOnly Cookie：
+   * 令牌不再进 localStorage、不进 URL、不进浏览器历史。
+   */
+  if (route === 'POST /api/session') {
+    const body = await readJsonBody(req);
+    const token = String(body.token || '');
+    const expected = config.web.authToken;
+    if (!expected) {
+      return sendJson(res, 200, { ok: true, message: '未设置访问令牌，无需登录', needLogin: false });
+    }
+    const ip = clientIp(req, config);
+    const blocked = checkThrottle(ip, config);
+    if (blocked.blocked) {
+      const res2 = { ok: false, code: 'TOO_MANY_ATTEMPTS', message: blocked.reason };
+      res.setHeader('retry-after', String(blocked.retryAfterSec));
+      return sendJson(res, 429, res2);
+    }
+    if (token !== expected) {
+      const rec = recordFailure(ip, config);
+      appendAudit('auth.fail', { target: 'POST /api/session', source: ip, ok: false, extra: { count: rec.count } });
+      /*
+       * 达到阈值后必须返回 **429**（而不是继续 401）：
+       * 状态码是客户端唯一能自动识别的信号——401 会被理解成"令牌错了，再试一次"，
+       * 429 + Retry-After 才表示"别再试了"。只改提示文案而状态码不变，
+       * 等于让暴力破解可以一直试下去。
+       */
+      if (rec.blocked) {
+        res.setHeader('retry-after', String(rec.retryAfterSec));
+        return sendJson(res, 429, {
+          ok: false,
+          code: 'TOO_MANY_ATTEMPTS',
+          message: `令牌连续输错 ${rec.count} 次，已暂时拒绝来自 ${ip} 的登录，请 ${Math.ceil(rec.retryAfterSec / 60)} 分钟后再试`,
+        });
+      }
+      return sendJson(res, 401, {
+        ok: false,
+        code: 'BAD_TOKEN',
+        message: `访问令牌不正确（已失败 ${rec.count} 次，超过 ${throttleStatus(config).config.maxFailures} 次将临时拒绝）`,
+      });
+    }
+    recordSuccess(ip);
+    const s = createSession({ ip, agent: req.headers['user-agent'] || '' }, config);
+    const https = isHttps;
+    res.setHeader(
+      'set-cookie',
+      sessionCookie(s.id, { https, maxAgeSec: Math.floor(Math.min(s.idleMs, s.absoluteMs) / 1000) }),
+    );
+    appendAudit('auth.login', { target: 'POST /api/session', source: ip, extra: { sessions: sessionCount(config) } });
+    return sendJson(res, 200, { ok: true, message: '已登录', needLogin: false });
+  }
+
+  /** 登出（只影响当前浏览器）。 */
+  if (route === 'POST /api/session/logout' || route === 'DELETE /api/session') {
+    const id = readSessionId(req);
+    const gone = destroySession(id);
+    res.setHeader('set-cookie', clearCookie({ https: isHttps }));
+    if (gone) appendAudit('auth.logout', { target: 'POST /api/session/logout', source: clientIp(req, config) });
+    return sendJson(res, 200, { ok: true, message: gone ? '已登出' : '当前没有登录会话' });
+  }
+
+  /** 安全状态：绑定地址、暴露风险、令牌强度、会话、HTTPS。 */
+  if (route === 'GET /api/security') {
+    return sendJson(res, 200, { ok: true, ...securityReport({ config, port: actualPort, https: isHttps, tls: ctx.tls || null }) });
+  }
+
+  /**
+   * 设置/重新生成访问令牌。
+   *
+   * 这是**唯一**能改令牌的接口，改动后：
+   *   - 所有已登录会话立即失效（旧浏览器不该还能用）；
+   *   - 新令牌写进配置（走 saveConfig，于是也会遵守密钥保管策略）；
+   *   - 当前这次请求的浏览器**不**自动登录，必须用新令牌重新登录——
+   *     否则"改了令牌却只有自己还连着"，会让人误以为改动没生效。
+   */
+  if (route === 'POST /api/security/token') {
+    const body = await readJsonBody(req);
+    const want = body.authToken === undefined || body.authToken === null ? '' : String(body.authToken);
+    const next = want === '__generate__' ? generateToken() : want.trim();
+    if (next && next.length < 8) {
+      throw new AppError('访问令牌太短（至少 8 位）；建议直接用「生成新令牌」', { code: 'TOKEN_TOO_WEAK', status: 400 });
+    }
+    saveConfig({ web: { authToken: next } });
+    const killed = destroyAllSessions();
+    res.setHeader('set-cookie', clearCookie({ https: isHttps }));
+    appendAudit('security.token', {
+      target: next ? '已设置访问令牌' : '已清空访问令牌',
+      source: clientIp(req, getConfig()),
+      extra: { sessionsInvalidated: killed, length: next.length },
+    });
+    return sendJson(res, 200, {
+      ok: true,
+      authToken: next,
+      sessionsInvalidated: killed,
+      message: next
+        ? `已更新访问令牌，${killed} 个已登录会话已失效，请用新令牌重新登录`
+        : '已清空访问令牌：此后任何能访问该地址的人都可以直接使用（不建议在局域网暴露时这么做）',
+    });
+  }
+
+  /**
+   * 数据去向：按**当前配置**逐项说明哪些内容会离开这台机器、发到哪里。
+   *
+   * 这不是一份写死的说明书——模型地址、代理、日历开关一变，报告内容跟着变。
+   */
+  if (route === 'GET /api/egress') {
+    return sendJson(res, 200, { ok: true, ...egressReport({ config }) });
   }
 
   /* ---- 密钥存储（系统钥匙串） ---- */
@@ -1366,26 +1622,41 @@ function handleEvents(req, res, url) {
 
 /* ------------------------------------------------------------ 入口 */
 
-export function createServer({ rootDir } = {}) {
+/**
+ * 建 HTTP 服务。
+ *
+ * `tls` 传入证书材料时用 HTTPS，否则用 HTTP——**由调用方决定**，
+ * 这里不自己读配置：证书解析失败必须让启动失败，而不是悄悄退回明文。
+ */
+export function createServer({ rootDir, tls = null } = {}) {
   // rootDir 只在启动早期用于定位数据目录；已经有内存配置时不要重置，否则会丢掉 CLI/测试注入的配置
   if (rootDir && !isConfigLoaded()) loadConfig({ rootDir });
   ensureDirs();
   store.loadState({ force: true });
 
-  const server = http.createServer(async (req, res) => {
+  const handler = async (req, res) => {
     const started = Date.now();
     const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
     const config = getConfig();
     // 实际监听端口（port=0 时由系统分配），用于推导回调地址与同源判断
     const actualPort = server.address()?.port || config.web.port;
 
-    // 允许本机浏览器直连（同源），无需 CORS；仅对 SSE 做必要处理
+    // 安全响应头：所有响应都带（含静态资源与错误页）
+    for (const [k, v] of Object.entries(securityHeaders({ https: server.__mailbotHttps === true }))) {
+      res.setHeader(k, v);
+    }
+
     try {
+      // Host 白名单 + 登录失败限速：放在最前面，静态资源也一并受保护
+      const gate = gateRequest(req, res, url, config);
+      if (gate) {
+        if (gate.retryAfterSec) res.setHeader('retry-after', String(gate.retryAfterSec));
+        sendJson(res, gate.status, gate.payload);
+        return;
+      }
+
+      // 允许本机浏览器直连（同源），无需 CORS；仅对 SSE 做必要处理
       if (url.pathname === '/api/events') {
-        if (!authorized(req, config, url)) {
-          sendJson(res, 401, { ok: false, code: 'UNAUTHORIZED', message: '访问令牌不正确' });
-          return;
-        }
         handleEvents(req, res, url);
         return;
       }
@@ -1419,11 +1690,7 @@ export function createServer({ rootDir } = {}) {
           });
           return;
         }
-        if (!authorized(req, config, url)) {
-          sendJson(res, 401, { ok: false, code: 'UNAUTHORIZED', message: '访问令牌不正确' });
-          return;
-        }
-        const handled = await handleApi(req, res, url, actualPort);
+        const handled = await handleApi(req, res, url, actualPort, { https: server.__mailbotHttps, tls: server.__mailbotTls });
         if (handled === null) {
           sendJson(res, 404, { ok: false, code: 'NOT_FOUND', message: `接口不存在：${req.method} ${url.pathname}` });
         }
@@ -1447,7 +1714,13 @@ export function createServer({ rootDir } = {}) {
       if (!res.headersSent) return;
       log.debug(`${req.method} ${url.pathname} ${res.statusCode} ${Date.now() - started}ms`);
     }
-  });
+  };
+
+  const server = tls
+    ? https.createServer({ key: tls.key, cert: tls.cert }, handler)
+    : http.createServer(handler);
+  server.__mailbotHttps = !!tls;
+  server.__mailbotTls = tls;
 
   server.on('clientError', (err, socket) => {
     if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
@@ -1459,9 +1732,22 @@ export function createServer({ rootDir } = {}) {
 
 export async function startServer({ rootDir, port, host } = {}) {
   const config = getConfig();
-  const server = createServer({ rootDir });
   const listenPort = port ?? config.web.port;
   const listenHost = host ?? config.web.host;
+
+  /*
+   * HTTPS：在监听之前就把证书定下来。
+   *
+   * 这里刻意**不做任何降级**：配置了 HTTPS 却拿不到证书/私钥就抛错、启动失败。
+   * "以为走的是 HTTPS、其实在明文传令牌"是比"启动不起来"严重得多的结果。
+   */
+  let tls = null;
+  try {
+    tls = resolveTls({ config, dataDir: getPaths().dataDir, rootDir: getPaths().rootDir });
+  } catch (err) {
+    throw new AppError(`HTTPS 启动失败：${err.message}`, { code: 'TLS_SETUP_FAILED' });
+  }
+  const server = createServer({ rootDir, tls });
 
   await new Promise((resolve, reject) => {
     server.once('error', (err) => {
@@ -1486,8 +1772,23 @@ export async function startServer({ rootDir, port, host } = {}) {
   });
 
   const actualPort = server.address().port;
-  const url = `http://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${actualPort}`;
+  const scheme = server.__mailbotHttps ? 'https' : 'http';
+  const url = `${scheme}://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${actualPort}`;
   log.info(`邮箱与日历数字人已启动：${url}`);
+  /*
+   * 监听地址不止本机时**必须**在日志里说清楚：这是"别人也能连上"的那一刻，
+   * 用户不该靠翻设置页才发现。
+   */
+  if (listenHost === '0.0.0.0' || listenHost === '::') {
+    const lans = lanAddresses();
+    log.warn(`正在监听所有网卡（${listenHost}）：同一网络内的设备都能访问这个服务`);
+    for (const l of lans) log.warn(`  局域网可达：${scheme}://${l.address}:${actualPort}（网卡 ${l.iface}）`);
+    if (!config.web.authToken) log.error('  ⚠️ 当前**没有设置访问令牌**：任何能连上的人都能直接使用，请立刻在设置里生成一个');
+    if (!server.__mailbotHttps) log.warn('  局域网内流量是明文（含访问令牌），建议在「访问与安全」里启用 HTTPS');
+  }
+  if (server.__mailbotHttps && server.__mailbotTls?.selfSigned) {
+    log.warn('HTTPS 用的是自签证书：浏览器会提示"不受信任"，选择继续访问即可（传输仍是加密的）');
+  }
   if (!config.llm.apiKey) log.warn('尚未配置大模型 API Key，分析功能不可用（可在 .env 设置 DEEPSEEK_API_KEY）');
   if (!config.instances.some((i) => i.imap.authPass)) log.warn('尚未配置邮箱授权码，请到界面「邮箱设置」中填写');
 

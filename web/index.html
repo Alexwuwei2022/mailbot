@@ -7,22 +7,10 @@
     <title>轻效 | Ease &amp; Effect · 邮箱与日历数字人</title>
     <!--
       外观模式必须在这里就定下来：等 JS 模块加载完再设置会先闪一下默认主题（FOUC）。
-      取值逻辑与 web/theme.js 保持一致（显式选择优先，否则跟随系统）。
+      刻意用**外部同步脚本**而不是内联脚本——这样 CSP 才能保持毫不放水
+      （不放开 script-src 'unsafe-inline'）。详见 web/theme-boot.js。
     -->
-    <script>
-      (function () {
-        try {
-          var t = localStorage.getItem('mailbot.theme');
-          if (t !== 'light' && t !== 'dark' && t !== 'green') {
-            t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
-          }
-          document.documentElement.setAttribute('data-theme', t);
-          document.documentElement.style.colorScheme = t === 'light' ? 'light' : 'dark';
-        } catch (e) {
-          document.documentElement.setAttribute('data-theme', 'dark');
-        }
-      })();
-    </script>
+    <script src="/theme-boot.js"></script>
     <link rel="stylesheet" href="/styles.css" />
     <link rel="icon" type="image/png" href="/assets/logo.png" />
   </head>

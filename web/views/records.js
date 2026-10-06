@@ -15,7 +15,14 @@ import { api } from '../api.js';
 import { fmtFull, h, mount, toast, toastError } from '../dom.js';
 import { markLoaded, needsReload, renderInto, viewState } from '../view-state.js';
 
-const GROUPS = ['邮件', '日历'];
+/**
+ * 类别筛选。
+ *
+ * 必须与 `server/store/audit.js` 里的 group 取值一致——旧版本这里只写了「邮件/日历」，
+ * 后来新增的「数据」（清理、备份、密钥保管）与「安全」（登录、改令牌）在界面上
+ * **筛不到**，等于白记了台账。
+ */
+const GROUPS = ['邮件', '日历', '数据', '安全'];
 
 function fmtTime(value) {
   if (!value) return '—';

@@ -116,13 +116,55 @@ export const DEFAULTS = {
     maxRetries: 3,
     /** 是否用 JSON 输出模式 */
     jsonMode: true,
+    /**
+     * 仅本地模式：**只允许**把邮件内容发给本机（回环地址）上的模型。
+     *
+     * 打开后，任何指向局域网另一台机器或公网服务的模型地址都会被**直接拒绝**，
+     * 而不是"提醒一下继续发"。默认关闭（保持原行为，升级上来的人不受影响）。
+     *
+     * 判断与提示见 server/lib/privacy.js——那里刻意不允许 192.168.x.x 之类私有网段：
+     * 那是另一台电脑，数据已经离开了本机。
+     */
+    localOnly: false,
   },
 
   web: {
     host: '127.0.0.1',
     port: 8787,
-    /** 非空时，所有 /api 请求需带 x-mailbot-token 或 Bearer */
+    /** 非空时，所有 /api 请求需带 x-mailbot-token 或 Bearer（浏览器改用会话 Cookie） */
     authToken: '',
+    /**
+     * Host 白名单（防 DNS rebinding）。
+     *
+     * 服务只接受回环名（localhost / 127.0.0.1 / ::1）与 IP 字面量；
+     * 想通过**域名**访问（反向代理、内网域名）就必须在这里登记。
+     * 域名可以随时被解析到任意地址，正是 DNS rebinding 的载体，所以默认一个都不放。
+     */
+    allowedHosts: [],
+    /** 信任 X-Forwarded-For：只有在反向代理后面才该打开，否则来源 IP 可被伪造 */
+    trustProxy: false,
+    /** 会话：空闲多久过期 / 最长多久必须重新登录 / 最多同时几个设备 */
+    sessionIdleHours: 12,
+    sessionAbsoluteDays: 7,
+    sessionMaxCount: 20,
+    /** 登录失败限速：窗口内失败多少次后、拒绝多久 */
+    authMaxFailures: 10,
+    authWindowMinutes: 5,
+    authBlockMinutes: 5,
+    /**
+     * HTTPS。默认关闭——只在本机访问时 HTTP 足够，且自签证书会让浏览器警告。
+     * 一旦要把服务暴露到局域网，就该打开它（否则令牌与邮件内容在链路上是明文）。
+     */
+    https: {
+      enabled: false,
+      /** 用自己的证书（推荐，浏览器不会警告）；两个都要填 */
+      certFile: '',
+      keyFile: '',
+      /** 没有正式证书时用自签证书（会在 data/tls 下生成并复用） */
+      selfSigned: true,
+      /** 额外的证书备用名（域名或 IP），用于自签证书 */
+      altNames: [],
+    },
     /** 等价于 web.authToken，便于环境变量覆盖 */
     allowSend: null,
   },
