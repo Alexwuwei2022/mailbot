@@ -17,7 +17,7 @@ import { AppError, fnv1a, log, newId, safeJson } from '../lib/util.js';
  * 有版本号就必须有**迁移函数**，否则升级后老用户的数据要么缺字段、
  * 要么被静默丢掉。`migrateState` 负责把任意历史版本补齐到当前版本。
  */
-export const STATE_VERSION = 2;
+export const STATE_VERSION = 3;
 /** 兼容旧测试里的名字；生产代码请直接用 STATE_VERSION。 */
 export const STATE_VERSION_FOR_TEST = STATE_VERSION;
 /** 分析记录上限的默认值（实际以 `retention.maxAnalyses` 为准，见 maxAnalysesLimit） */
@@ -40,6 +40,11 @@ function emptyState() {
     calendar: { sessions: [] },
     /** 待办闭环：`folder:uid` → { status, snoozeUntil, note, updatedAt } */
     tasks: {},
+    /**
+     * 跟催：id → { kind: 'mine'|'waiting', title, dueAt, counterparty, status, ... }
+     * 由扫描产生（逻辑见 server/followup.js），状态语义与 tasks 一致。
+     */
+    followUps: {},
   };
 }
 
@@ -58,6 +63,15 @@ export function migrateState(s) {
     notes.push('v1→v2：新增 tasks（待办状态）');
   }
 
+  if (from < 3) {
+    /*
+     * v2→v3：新增 followUps（跟催：我承诺了什么 / 等谁回复）。
+     * 只补空表，不预填任何内容——第一次扫描才会产生记录。
+     */
+    if (!s.followUps || typeof s.followUps !== 'object' || Array.isArray(s.followUps)) s.followUps = {};
+    notes.push('v2→v3：新增 followUps（跟催跟踪）');
+  }
+
   // 结构兜底（与版本无关，防止手改/崩溃后的畸形数据把界面弄崩）
   if (!Array.isArray(s.drafts)) s.drafts = [];
   if (!Array.isArray(s.runs)) s.runs = [];
@@ -67,6 +81,7 @@ export function migrateState(s) {
   if (!Array.isArray(s.calendar.sessions)) s.calendar.sessions = [];
   if (!s.tasks || typeof s.tasks !== 'object' || Array.isArray(s.tasks)) s.tasks = {};
   if (!s.schedule || typeof s.schedule !== 'object' || Array.isArray(s.schedule)) s.schedule = {};
+  if (!s.followUps || typeof s.followUps !== 'object' || Array.isArray(s.followUps)) s.followUps = {};
   // 会话可能因崩溃残留 pending 字段，统一兜底
   for (const session of s.calendar.sessions) {
     if (!Array.isArray(session.messages)) session.messages = [];
@@ -224,6 +239,80 @@ export function setTask(key, patch = {}) {
   s.tasks[key] = next;
   persistState();
   return next;
+}
+
+/* ------------------------------------------------------------ 跟催（follow-up） */
+
+/**
+ * 跟催项使用的状态集合**与待办完全一致**（open/done/snoozed/ignored）。
+ *
+ * 刻意不另造一套：用户已经在「需要你处理」里学过这四个状态的含义，
+ * 再发明一套"已跟催/已催办"只会让人困惑；界面上也能复用同一批按钮与样式。
+ */
+export const FOLLOWUP_STATUSES = TASK_STATUSES;
+
+export function listFollowUps({ kind, status } = {}) {
+  const all = Object.values(getState().followUps || {});
+  return all
+    .filter((f) => (kind ? f.kind === kind : true))
+    .filter((f) => (status ? f.status === status : true))
+    .sort((a, b) => {
+      // 有截止时间的排前面（最紧急）；其余按"发生时间"倒序
+      const ad = a.dueAt ? new Date(a.dueAt).getTime() : Infinity;
+      const bd = b.dueAt ? new Date(b.dueAt).getTime() : Infinity;
+      if (ad !== bd) return ad - bd;
+      return new Date(b.since || b.createdAt || 0) - new Date(a.since || a.createdAt || 0);
+    });
+}
+
+export function getFollowUpMap() {
+  return getState().followUps || {};
+}
+
+/**
+ * 整体替换跟催表（扫描后写回）。
+ *
+ * 用"整体替换"而不是逐条 upsert：扫描本身已经做了合并（保留用户状态、幂等键），
+ * 逐条写反而容易在中途留下半个状态。
+ */
+export function replaceFollowUps(map) {
+  const s = getState();
+  s.followUps = map && typeof map === 'object' ? map : {};
+  persistState();
+  return Object.keys(s.followUps).length;
+}
+
+/** 设置一条跟催的状态（与 setTask 同样的语义）。 */
+export function setFollowUp(id, patch = {}) {
+  const s = getState();
+  if (!s.followUps) s.followUps = {};
+  const prev = s.followUps[id];
+  if (!prev) return null;
+  const status = FOLLOWUP_STATUSES.includes(patch.status) ? patch.status : 'open';
+  const next = {
+    ...prev,
+    status,
+    updatedAt: new Date().toISOString(),
+    doneAt: status === 'done' ? new Date().toISOString() : null,
+    snoozeUntil: status === 'snoozed' ? patch.snoozeUntil || prev.snoozeUntil || null : null,
+    closeReason: status === 'done' ? String(patch.closeReason || prev.closeReason || '手动标记完成').slice(0, 200) : null,
+  };
+  // 与待办不同：跟催记录是扫描出来的事实，撤销标记只回到 open，不能把记录本身删掉
+  s.followUps[id] = status === 'open' ? { ...next, doneAt: null, closeReason: null } : next;
+  persistState();
+  return s.followUps[id];
+}
+
+export function summarizeFollowUps(now = Date.now()) {
+  const all = Object.values(getState().followUps || {});
+  const open = all.filter((f) => f.status === 'open');
+  return {
+    total: all.length,
+    open: open.length,
+    mine: open.filter((f) => f.kind === 'mine').length,
+    waiting: open.filter((f) => f.kind === 'waiting').length,
+    overdue: open.filter((f) => f.dueAt && new Date(f.dueAt).getTime() < now).length,
+  };
 }
 
 /* ------------------------------------------------------------ 分析记录 */

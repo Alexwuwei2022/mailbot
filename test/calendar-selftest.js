@@ -3033,6 +3033,92 @@ await test('安全：启用 HTTPS 后真的走 TLS，Cookie 变 Secure，且报�
   }
 });
 
+await test('HTTP：跟催 列表 / 扫描（需确认）/ 改状态', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { resetThrottle } = await import('../server/lib/security.js');
+  const store = await import('../server/store/state.js');
+  resetThrottle();
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  const saved = JSON.parse(JSON.stringify(store.getFollowUpMap()));
+  const savedDrafts = store.getState().drafts.slice();
+  try {
+    // 造一封"发出去 50 小时没回"的邮件（这是本地推导的输入）
+    store.addDraft({
+      id: 'fu-http-1',
+      status: 'sent',
+      sentAt: new Date(Date.now() - 50 * 3600_000).toISOString(),
+      subject: '报价确认',
+      body: '麻烦确认下价格，谢谢',
+      to: ['li@client.com'],
+      messageId: '<fu-http-1@x>',
+    });
+
+    const list0 = await (await fetch(`${url}/api/followups`)).json();
+    assertEqual(list0.ok, true, '列表应可用');
+    assert(typeof list0.summary?.open === 'number', '应带计数');
+    assert(list0.config, '应带功能配置（界面据此说明"不等多久不算"）');
+
+    // 扫描会调模型 → 未确认必须拒绝（与"分析邮件"同样的规矩）
+    const noConfirm = await fetch(`${url}/api/followups/scan`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assertEqual(noConfirm.status, 428, '未确认应返回 428');
+
+    // 带确认（测试环境没有可用的大模型 Key，所以只会跑本地的"等对方回复"那半）
+    const scan = await fetch(`${url}/api/followups/scan`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ confirm: true }),
+    });
+    assertEqual(scan.status, 200, '扫描应成功');
+    const out = await scan.json();
+    assert(out.waiting >= 1, `应至少找出 1 条"等对方回复"（实际 ${out.waiting}）`);
+    assertIncludes(out.message, '等回复', '返回信息要说清扫出了什么');
+
+    const after = await (await fetch(`${url}/api/followups?kind=waiting`)).json();
+    assert(after.items.length >= 1, '列表里应能按 kind 过滤到它');
+    const target = after.items.find((f) => f.draftId === 'fu-http-1');
+    assert(target, '应能找到刚扫出来的那条');
+    assertEqual(target.kind, 'waiting', '类型应是等对方回复');
+    assert(target.waitingHours >= 49, `应算出等待时长（实际 ${target.waitingHours}）`);
+
+    // 改状态
+    const patched = await fetch(`${url}/api/followups/${encodeURIComponent(target.id)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'done' }),
+    });
+    assertEqual(patched.status, 200, '改状态应成功');
+    const pj = await patched.json();
+    assertEqual(pj.item.status, 'done', '状态应变为已完成');
+    assertEqual(pj.summary.open, 0, '计数应随之变化（这条不再算未完成）');
+
+    // 不存在的 id
+    const missing = await fetch(`${url}/api/followups/nope-not-exist`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ status: 'done' }),
+    });
+    assertEqual(missing.status, 404, '不存在的跟催应 404');
+
+    // 跨源同样被拒（改状态是写操作）
+    const evil = await fetch(`${url}/api/followups/${encodeURIComponent(target.id)}`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example.com' },
+      body: JSON.stringify({ status: 'ignored' }),
+    });
+    assertEqual(evil.status, 403, '跨源改跟催状态应被拒绝');
+  } finally {
+    store.replaceFollowUps(saved);
+    store.getState().drafts.length = 0;
+    store.getState().drafts.push(...savedDrafts);
+    store.persistState();
+    await new Promise((r) => server.close(r));
+  }
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await google.close();

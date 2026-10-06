@@ -9,6 +9,7 @@ import { renderDrafts } from './views/drafts.js';
 import { renderSearch } from './views/search.js';
 import { renderCalendar } from './views/calendar.js';
 import { renderKnowledge } from './views/knowledge.js';
+import { renderFollowUps } from './views/followups.js';
 import { renderLogin } from './views/login.js';
 import { renderRecords } from './views/records.js';
 import { renderSetup } from './views/setup.js';
@@ -20,6 +21,7 @@ const VIEWS = [
   { id: 'search', label: '对话查邮件' },
   { id: 'calendar', label: '日历' },
   { id: 'knowledge', label: '知识库' },
+  { id: 'followups', label: '跟催' },
   { id: 'records', label: '运行与记录' },
   { id: 'setup', label: '开始使用' },
   { id: 'settings', label: '设置' },
@@ -90,6 +92,7 @@ const app = {
       search: renderSearch,
       calendar: renderCalendar,
       knowledge: renderKnowledge,
+      followups: renderFollowUps,
       records: renderRecords,
       setup: renderSetup,
       settings: renderSettings,
@@ -205,14 +208,20 @@ const app = {
        * 导航上得有个明确的地方告诉他"还没配完"。
        */
       const setupTodo = this.health?.ready === false ? 1 : 0;
+      /*
+       * 跟催徽标只显示**超期**数（不是未完成总数）：跟催项会慢慢积累，
+       * 全算上的话徽标一直挂个数字，久了就没人看了——与「需留意」同样的取舍。
+       */
       const badge =
         id === 'drafts'
           ? this.counts?.pendingDrafts
           : id === 'overview'
             ? this.counts?.needsReply
-            : id === 'setup'
-              ? setupTodo
-              : 0;
+            : id === 'followups'
+              ? this.counts?.followUpOverdue
+              : id === 'setup'
+                ? setupTodo
+                : 0;
       let dot = btn.querySelector('.nav-badge');
       if (badge) {
         if (!dot) {

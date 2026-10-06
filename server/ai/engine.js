@@ -12,6 +12,7 @@ import { EventEmitter } from 'node:events';
 import { getConfig, getInstance, getPaths, validateInstance } from '../config/index.js';
 import { AppError, hoursAgo, log, mapLimit, truncate } from '../lib/util.js';
 import { LlmClient } from '../llm/client.js';
+import { runFollowUpScan } from '../followup.js';
 import { REPORT_SYSTEM, buildReportPrompt } from '../llm/prompts.js';
 import { classifyMails, draftReply, sortByPriority, PRIORITY_LABELS, TYPE_LABELS } from '../ai/analyze.js';
 import {
@@ -705,6 +706,21 @@ export async function runScan({ instanceId, windowHours, force = false, trigger 
       meta: { windowHours: hours, total: stats.total, needsReply: stats.needsReply, drafts: draftRecords.length, skippedDrafts: skippedDraftCount },
     });
 
+    /*
+     * 跟催扫描：放在分析之后。
+     *
+     * 「等谁回复」是纯本地线程匹配（免费）；「我承诺了什么」要用模型读我发出的邮件。
+     * **它失败不能影响整次分析**——分析结果与报告已经落盘了，
+     * 这里只把失败如实记进 run 的 errors，让用户看得到但不至于白跑一趟。
+     */
+    let followUp = null;
+    try {
+      followUp = await runFollowUpScan({ client, store, config });
+    } catch (err) {
+      errors.push({ stage: 'followup', message: err?.message || String(err) });
+      log.warn(`跟催扫描失败（不影响本次分析结果）：${err?.message || err}`);
+    }
+
     const result = {
       runId: run.id,
       instanceId: instance.id,
@@ -725,6 +741,8 @@ export async function runScan({ instanceId, windowHours, force = false, trigger 
       /** 取信被上限截断时的如实说明（空数组表示没有截断） */
       truncation,
       reportId: report.id,
+      /** 跟催扫描结果（null = 未启用或未跑） */
+      followUp,
       errors,
     };
     store.updateRun(run.id, {

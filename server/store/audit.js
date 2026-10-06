@@ -49,6 +49,9 @@ export const AUDIT_ACTIONS = {
   'auth.logout': { label: '登出', group: '安全' },
   'auth.fail': { label: '登录失败', group: '安全' },
   'security.token': { label: '修改访问令牌', group: '安全' },
+  /** 跟催：扫描与状态变更 */
+  'followup.scan': { label: '扫描跟催', group: '跟催' },
+  'followup.status': { label: '跟催状态变更', group: '跟催' },
 };
 
 function auditPath() {

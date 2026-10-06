@@ -2759,6 +2759,81 @@ await step('开始使用向导：三步进度、未完成时给引导、配好�
   }
 });
 
+await step('跟催：我承诺的 / 等对方回复 两栏，状态按钮与超期高亮', async () => {
+  const fu = await import('../web/views/followups.js');
+  const container = document.createElement('div');
+  document.body.append(container);
+  const { api } = await import('../web/api.js');
+  const real = { followups: api.followups, scan: api.followUpsScan, set: api.setFollowUpStatus };
+  const calls = [];
+  try {
+    const items = [
+      {
+        id: 'mine_1',
+        kind: 'mine',
+        title: '周三前把报价发给李总',
+        status: 'open',
+        dueAt: '2020-01-01T00:00:00.000Z', // 故意过期
+        counterparty: 'li@client.com',
+        subject: '报价',
+        since: '2026-10-04T09:00:00.000Z',
+      },
+      {
+        id: 'wait_1',
+        kind: 'waiting',
+        title: '合同条款确认',
+        status: 'open',
+        waitingHours: 51,
+        counterparty: 'a@client.com',
+        subject: '合同',
+        since: '2026-10-04T09:00:00.000Z',
+        replyTrackable: true,
+      },
+      { id: 'done_1', kind: 'mine', title: '已完成的事', status: 'done', closeReason: '对方已回复' },
+    ];
+    api.followups = () => Promise.resolve({ ok: true, items: items.filter((i) => i.status === 'open'), all: items, summary: { open: 2, mine: 1, waiting: 1, overdue: 1 }, config: { enabled: true, waitHours: 24, extractCommitments: true } });
+    api.setFollowUpStatus = (id, status) => {
+      calls.push({ id, status });
+      return Promise.resolve({ ok: true, summary: {} });
+    };
+
+    fu.renderFollowUps(container, { viewStates: {}, navigate() {}, refreshCounts() {}, invalidateAll() {}, paintNav() {} });
+    await new Promise((r) => setTimeout(r, 200));
+
+    const text = container.textContent;
+    check(/我承诺的/.test(text), `应有「我承诺的」分组（实际「${text.slice(0, 200)}」）`);
+    check(/等对方回复/.test(text), '应有「等对方回复」分组');
+    check(/周三前把报价发给李总/.test(text), '应显示承诺内容');
+    check(/等 51 小时/.test(text), '应显示已等待时长');
+    check(/已超期/.test(text), `超期项要高亮（实际「${text.slice(0, 120)}」）`);
+    check(/已完成 \/ 已忽略（1）/.test(text), '终态应折叠成一组');
+    check(/立即扫描/.test(text), '应有扫描按钮');
+    check(/li@client.com/.test(text) && /a@client.com/.test(text), '应显示对端');
+
+    // 点「已完成」→ 必须真的调用接口
+    const doneBtn = [...container.querySelectorAll('.followup-actions button')].find((b) => b.textContent === '已完成');
+    check(doneBtn, '应有「已完成」按钮');
+    doneBtn.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 120));
+    check(calls.some((c) => c.status === 'done'), '点「已完成」应调用状态接口');
+
+    // 空状态：没有任何跟催时应说明"扫描会做什么"
+    api.followups = () => Promise.resolve({ ok: true, items: [], all: [], summary: { open: 0 }, config: { enabled: true, waitHours: 24 } });
+    const c2 = document.createElement('div');
+    document.body.append(c2);
+    fu.renderFollowUps(c2, { viewStates: {}, navigate() {}, refreshCounts() {}, invalidateAll() {}, paintNav() {} });
+    await new Promise((r) => setTimeout(r, 200));
+    check(/还没有跟催项/.test(c2.textContent), '空状态应给出引导');
+    check(/最近发出的邮件/.test(c2.textContent), '空状态应说清扫的是什么（而不是只说"没有数据"）');
+    c2.remove();
+  } finally {
+    api.followups = real.followups;
+    api.followUpsScan = real.scan;
+    api.setFollowUpStatus = real.set;
+    container.remove();
+  }
+});
+
 await step('总览页：配置没配完时顶部给出「开始使用」引导', async () => {
   const overview = await import('../web/views/overview.js');
   const container = document.createElement('div');

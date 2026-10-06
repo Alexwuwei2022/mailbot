@@ -22,7 +22,7 @@ import { markLoaded, needsReload, renderInto, viewState } from '../view-state.js
  * 后来新增的「数据」（清理、备份、密钥保管）与「安全」（登录、改令牌）在界面上
  * **筛不到**，等于白记了台账。
  */
-const GROUPS = ['邮件', '日历', '数据', '安全'];
+const GROUPS = ['邮件', '日历', '数据', '安全', '跟催'];
 
 function fmtTime(value) {
   if (!value) return '—';

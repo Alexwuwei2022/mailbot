@@ -914,6 +914,69 @@ body {
   gap: 6px;
 }
 
+/* ------------------------------------------------------------ 跟催 */
+
+.followup-row {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin-bottom: 8px;
+}
+
+.followup-overdue {
+  border-color: color-mix(in srgb, var(--danger, #c0392b) 55%, transparent);
+  background: color-mix(in srgb, var(--danger, #c0392b) 7%, transparent);
+}
+
+.followup-closed {
+  opacity: 0.68;
+}
+
+.followup-main {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.followup-title {
+  font-weight: 560;
+  font-size: 13.5px;
+  word-break: break-word;
+}
+
+.followup-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 4px;
+  line-height: 1.6;
+}
+
+.followup-detail {
+  margin-top: 4px;
+  white-space: pre-wrap;
+}
+
+.followup-actions {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+@media (max-width: 720px) {
+  .followup-row {
+    flex-direction: column;
+  }
+  .followup-actions {
+    justify-content: flex-start;
+  }
+}
+
 /* ------------------------------------------------------------ 登录页 */
 
 .login-wrap {

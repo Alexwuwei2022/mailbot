@@ -50,6 +50,7 @@ import {
 } from './lib/session.js';
 import { resolveTls } from './lib/tls.js';
 import { egressReport } from './lib/privacy.js';
+import { followUpConfig, runFollowUpScan } from './followup.js';
 import { LlmClient, pingLlm } from './llm/client.js';
 import { currentRun, clampWindowHours, isRunning, previewScan, progressBus, runScan, cancelRun } from './ai/engine.js';
 import { runScheduledScan, schedulerStatus, setNotifyEmitter, startScheduler, stopScheduler } from './schedule.js';
@@ -827,6 +828,82 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     return sendJson(res, 200, { ok: true, ...egressReport({ config }) });
   }
 
+  /* ---- 跟催（我承诺了什么 / 等谁回复） ---- */
+
+  /** 列表 + 计数。默认只给未关闭的（终态默认折叠在界面里）。 */
+  if (route === 'GET /api/followups') {
+    const kind = url.searchParams.get('kind') || undefined;
+    const status = url.searchParams.get('status') || undefined;
+    const items = store.listFollowUps({ kind, status });
+    return sendJson(res, 200, {
+      ok: true,
+      items,
+      summary: store.summarizeFollowUps(),
+      /** 全部状态都要给：界面上要能折叠显示"已完成/已忽略" */
+      all: store.listFollowUps(),
+      config: followUpConfig(),
+    });
+  }
+
+  /**
+   * 跑一次跟催扫描。
+   *
+   * 会调用模型（仅用于从我发出的邮件里提取承诺），所以要求显式确认——
+   * 与"分析邮件"同样的规矩：花钱的动作必须先让用户知道。
+   */
+  if (route === 'POST /api/followups/scan') {
+    const body = await readJsonBody(req);
+    const cfg = followUpConfig();
+    if (!cfg.enabled) throw new AppError('跟催功能已在设置里关闭', { code: 'FOLLOWUP_DISABLED', status: 400 });
+    const willCallLlm = cfg.extractCommitments && !!config.llm.apiKey;
+    if (willCallLlm && body.confirm !== true) {
+      return sendJson(res, 428, {
+        ok: false,
+        code: 'CONFIRM_REQUIRED',
+        message: '扫描会用模型读你最近发出的邮件来提取承诺（"等谁回复"部分不花钱）：请传入 confirm=true',
+      });
+    }
+    // 「等谁回复」不需要模型；只有提取承诺才构造客户端
+    const client = willCallLlm ? new LlmClient(config.llm) : null;
+    const out = await runFollowUpScan({ client, store });
+    appendAudit('followup.scan', {
+      target: `新增 ${out.created} 条 / 自动关闭 ${out.autoClosed} 条`,
+      source: '界面扫描',
+      extra: { waiting: out.waiting, commitments: out.commitments, llmError: out.llmError },
+    });
+    return sendJson(res, 200, {
+      ok: true,
+      ...out,
+      summary: store.summarizeFollowUps(),
+      message:
+        `扫描完成：在等回复 ${out.waiting} 条、我的承诺 ${out.commitments} 条` +
+        (out.created ? `，新增 ${out.created} 条` : '，没有新增') +
+        (out.autoClosed ? `，自动关闭 ${out.autoClosed} 条（对方已回复）` : '') +
+        (out.llmError ? `；但提取承诺失败：${out.llmError}` : ''),
+    });
+  }
+
+  /** 改一条跟催的状态（复用待办的四个状态）。 */
+  if (req.method === 'PATCH' || req.method === 'PUT') {
+    const m = /^\/api\/followups\/([^/]+)$/.exec(url.pathname);
+    if (m) {
+      const body = await readJsonBody(req);
+      const id = decodeURIComponent(m[1]);
+      const next = store.setFollowUp(id, {
+        status: body.status,
+        snoozeUntil: body.snoozeUntil,
+        closeReason: body.closeReason,
+      });
+      if (!next) throw new AppError('找不到这条跟催记录（可能已被清理）', { code: 'FOLLOWUP_NOT_FOUND', status: 404 });
+      appendAudit('followup.status', {
+        target: next.title || id,
+        source: '界面操作',
+        extra: { status: next.status, kind: next.kind, snoozeUntil: next.snoozeUntil || null },
+      });
+      return sendJson(res, 200, { ok: true, item: next, summary: store.summarizeFollowUps() });
+    }
+  }
+
   /* ---- 密钥存储（系统钥匙串） ---- */
 
   /** 密钥现状：每一项**现在在哪**、是不是明文、有没有降级。 */
@@ -1564,6 +1641,20 @@ function countsPayload() {  const config = getConfig();
     needsAction = 0;
   }
 
+  /*
+   * 跟催徽标只显示**超期**数，而不是"未完成总数"。
+   *
+   * 跟催项天然是"慢慢积累"的（我答应的事、我在等的回复），
+   * 把全部未完成都算成徽标会让它永远挂着一个数字——和"需留意不能变成第二个收件箱"
+   * 同一个道理：**只在该提醒的时候提醒**，超期才是真的该动手了。
+   */
+  let followUpOverdue = 0;
+  try {
+    followUpOverdue = store.summarizeFollowUps().overdue;
+  } catch {
+    followUpOverdue = 0;
+  }
+
   return {
     analyses: Object.keys(state.analyses).length,
     needsAction,
@@ -1573,6 +1664,7 @@ function countsPayload() {  const config = getConfig();
     pendingDrafts: pendingDrafts.length,
     sentDrafts: state.drafts.filter((d) => d.status === 'sent').length,
     runs: state.runs.length,
+    followUpOverdue,
   };
 }
 
@@ -1771,7 +1863,25 @@ export async function startServer({ rootDir, port, host } = {}) {
     server.listen(listenPort, listenHost, resolve);
   });
 
-  const actualPort = server.address().port;
+  /*
+   * 取实际端口。
+   *
+   * `listen(0)` 时端口由系统分配，理论上回调触发时就已经写进 `address()`；
+   * 但实测（Windows + 连续多次起停）偶发拿到 null / 0，于是返回的 URL 会是
+   * `http://127.0.0.1:0`，下游 fetch 只会报一句莫名其妙的 "bad port"。
+   * 这里等一下再取一次，仍取不到就**明确报错**，而不是交出一个坏 URL。
+   */
+  let addr = server.address();
+  for (let i = 0; i < 20 && (!addr || !addr.port); i += 1) {
+    await new Promise((r) => setTimeout(r, 10));
+    addr = server.address();
+  }
+  if (!addr || !addr.port) {
+    throw new AppError('服务已监听但拿不到端口号（可能是系统资源紧张）：请重试，或改用固定端口', {
+      code: 'PORT_UNRESOLVED',
+    });
+  }
+  const actualPort = addr.port;
   const scheme = server.__mailbotHttps ? 'https' : 'http';
   const url = `${scheme}://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${actualPort}`;
   log.info(`邮箱与日历数字人已启动：${url}`);

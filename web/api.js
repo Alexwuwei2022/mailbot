@@ -167,6 +167,12 @@ export const api = {
   /** 数据去向（按当前配置推导）与仅本地模式开关（走 saveConfig 的 llm.localOnly） */
   egress: () => request('GET', '/api/egress'),
 
+  /** 跟催：列表 / 扫描（会调模型，接口侧要求 confirm）/ 改状态 */
+  followups: (params) => request('GET', `/api/followups${query(params || {})}`),
+  followUpsScan: () => request('POST', '/api/followups/scan', { confirm: true }),
+  setFollowUpStatus: (id, status, snoozeUntil) =>
+    request('PATCH', `/api/followups/${encodeURIComponent(id)}`, { status, snoozeUntil }),
+
   /** 会话与安全 */
   session: () => request('GET', '/api/session'),
   security: () => request('GET', '/api/security'),

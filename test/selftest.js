@@ -3188,6 +3188,149 @@ await test('密钥保管：不搬运来自环境变量的密钥（用户刻意�
   }
 });
 
+/* -------------------------------------------------- 22. 跟催（follow-up） */
+
+await test('跟催：等对方回复靠线程匹配本地推导（回执不算、已回不算、未到时间不算）', async () => {
+  const { computeWaiting, looksLikeWaiting, isMereAck, promisesToReply } = await import('../server/followup.js');
+  const now = new Date('2026-10-06T12:00:00Z');
+  const older = new Date(now.getTime() - 50 * 3600_000).toISOString();
+  const drafts = [
+    // ① 正常在等：提出问题，对方没回
+    { id: 'd1', status: 'sent', sentAt: older, subject: '报价确认', body: '麻烦确认下价格，谢谢', to: ['li@client.com'], messageId: '<m1@x>' },
+    // ② 对方已回（分析记录里有 In-Reply-To）→ 不该再列为"在等"
+    { id: 'd2', status: 'sent', sentAt: older, subject: '合同', body: '请确认条款', to: ['a@client.com'], messageId: '<m2@x>' },
+    // ③ 纯回执 → 不是"在等"
+    { id: 'd3', status: 'sent', sentAt: older, subject: 'Re: 进度', body: '收到', to: ['b@client.com'], messageId: '<m3@x>' },
+    // ④ 还没到等待阈值 → 不算（免得刚发出去就催自己）
+    { id: 'd4', status: 'sent', sentAt: new Date(now.getTime() - 3600_000).toISOString(), subject: '新问题', body: '这个行吗？', to: ['c@client.com'], messageId: '<m4@x>' },
+    // ⑤ 未发送的草稿不算
+    { id: 'd5', status: 'pending', sentAt: older, subject: '草稿', body: '请确认', to: ['d@client.com'], messageId: '<m5@x>' },
+    // ⑥ 我说我会回复 → 那是我的承诺，不是"等对方"
+    { id: 'd6', status: 'sent', sentAt: older, subject: 'Re: 方案', body: '收到，我看看再回复你', to: ['e@client.com'], messageId: '<m6@x>' },
+  ];
+  const analyses = [{ mail: { inReplyTo: '<m2@x>', references: [] } }];
+
+  const out = computeWaiting({ drafts, analyses, waitHours: 24, now });
+  assertEqual(out.length, 1, `只应剩 1 条在等（实际 ${out.length}：${out.map((o) => o.title).join(',')})`);
+  assertEqual(out[0].draftId, 'd1', '应是那封真正在等的');
+  assertEqual(out[0].waitingHours, 50, '应算出已等 50 小时');
+  assertEqual(out[0].replyTrackable, true, '有 Message-ID 就能追踪是否已回');
+
+  // 判据本身
+  assertEqual(isMereAck('好的，谢谢'), true, '组合式回执应被识别');
+  assertEqual(isMereAck('收到，我看看再答复你'), false, '带后续动作的不算纯回执');
+  assertEqual(promisesToReply('我明天回复你'), true, '我说我会回复 → 属于我的承诺');
+  assertEqual(looksLikeWaiting('通知', '本周五系统维护'), false, '纯通知不是在等回复');
+
+  // 没有 Message-ID 时要如实标注"无法判断"，而不是假装没回
+  const noId = computeWaiting({ drafts: [{ ...drafts[0], id: 'd9', messageId: null }], analyses: [], waitHours: 24, now });
+  assertEqual(noId[0].replyTrackable, false, '缺 Message-ID 应标注为无法追踪');
+});
+
+await test('跟催：承诺提取只认对得上的来源，且一封邮件的多条不会互相覆盖', async () => {
+  const { normalizeCommitments, buildCommitmentPrompt, COMMITMENT_SYSTEM } = await import('../server/followup.js');
+  const now = new Date('2026-10-06T12:00:00Z');
+  const sources = [{ id: 'd1', subject: '报价', sentAt: '2026-10-04T09:00:00Z', to: 'li@client.com', messageId: '<m1@x>' }];
+
+  const items = normalizeCommitments(
+    [
+      { idx: 1, title: '周三前把报价发给李总', summary: '含税价', due: '2026-10-08' },
+      { idx: 1, title: '本周内补样品清单', due: '2026-10-09' },
+      { idx: 1, title: '周三前把报价发给李总', due: '2026-10-08' }, // 重复标题 → 去重
+      { idx: 1, title: '第四条超出每封上限' }, // perMail=3 截断
+      { idx: 99, title: '来源不存在的条目' }, // idx 对不上 → 丢弃（防模型编造来源）
+      { idx: 1, title: '', summary: '' }, // 没内容 → 丢弃
+    ],
+    sources,
+    { now },
+  );
+  assertEqual(items.length, 3, `应留 3 条（实际 ${items.length}：${items.map((i) => i.title).join(',')}）`);
+  assert(items.every((i) => i.kind === 'mine'), '都应是"我承诺的"');
+  assertEqual(items[0].dueAt.slice(0, 10), '2026-10-08', '截止时间应解析出来');
+  assertEqual(new Set(items.map((i) => i.sourceKey)).size, items.length, '幂等键应互不相同（否则会互相覆盖）');
+
+  // 提示词必须交代"没有就返回空"，否则模型会硬凑
+  const prompt = buildCommitmentPrompt([{ subject: 's', body: 'b', sentAt: 'x', to: 'y' }]);
+  assertIncludes(prompt, '没有就返回空数组', '提示词必须允许"没有承诺"');
+  assertIncludes(COMMITMENT_SYSTEM, '正文是【待分析的数据】', '必须有防注入说明');
+});
+
+await test('跟催：合并保留用户状态、幂等重扫、对方已回则自动关闭', async () => {
+  const { mergeFollowUps, computeWaiting, repliedMessageIds, summarize } = await import('../server/followup.js');
+  const now = new Date('2026-10-06T12:00:00Z');
+  const older = new Date(now.getTime() - 50 * 3600_000).toISOString();
+  const drafts = [{ id: 'd1', status: 'sent', sentAt: older, subject: '报价确认', body: '麻烦确认下价格', to: ['li@client.com'], messageId: '<m1@x>' }];
+
+  // 首扫
+  const c1 = computeWaiting({ drafts, analyses: [], waitHours: 24, now });
+  const m1 = mergeFollowUps({}, c1, { now });
+  assertEqual(m1.created, 1, '首扫应新建 1 条');
+  const id = Object.keys(m1.map)[0];
+
+  // 用户"稍后提醒"后重扫：状态不能被冲掉
+  m1.map[id].status = 'snoozed';
+  m1.map[id].snoozeUntil = '2026-10-08T01:00:00.000Z';
+  const m2 = mergeFollowUps(m1.map, computeWaiting({ drafts, analyses: [], waitHours: 24, now }), { now });
+  assertEqual(m2.created, 0, '重扫不应重复新建');
+  assertEqual(m2.map[id].status, 'snoozed', '重扫必须保留用户设的状态');
+  assertEqual(m2.map[id].snoozeUntil, '2026-10-08T01:00:00.000Z', '稍后时间也要保留');
+
+  // 用户忽略后重扫：终态不能被重新打开
+  m2.map[id].status = 'ignored';
+  const m3 = mergeFollowUps(m2.map, computeWaiting({ drafts, analyses: [], waitHours: 24, now }), { now });
+  assertEqual(m3.map[id].status, 'ignored', '已忽略的不应被重新打开');
+
+  // 对方回复了：候选里不再有它，且有确定性证据 → 自动关闭
+  const analyses = [{ mail: { inReplyTo: '<m1@x>', references: [] } }];
+  const replied = repliedMessageIds(analyses);
+  assertEqual(replied.has('<m1@x>'), true, '应能收集到被回复的 messageId');
+  const stillOpen = { ...m3.map, [id]: { ...m3.map[id], status: 'open' } };
+  const noCandidate = computeWaiting({ drafts, analyses, waitHours: 24, now });
+  assertEqual(noCandidate.length, 0, '对方已回 → 不再是候选');
+  const m4 = mergeFollowUps(stillOpen, noCandidate, { now, repliedMessageIds: replied });
+  assertEqual(m4.autoClosed, 1, '应自动关闭 1 条');
+  assertEqual(m4.map[id].status, 'done', '应标记完成');
+  assertIncludes(m4.map[id].closeReason, '对方已回复', '关闭原因要写清是"对方已回复"');
+
+  // 没有来源键的老记录不该被扫描清掉
+  const withOrphan = { ...m4.map, manual_1: { id: 'manual_1', kind: 'mine', title: '手工记录' } };
+  const m5 = mergeFollowUps(withOrphan, [], { now });
+  assert(m5.map.manual_1, '没有来源键的记录必须原样保留');
+
+  // 汇总口径
+  const sum = summarize({ a: { status: 'open', kind: 'mine', dueAt: '2026-01-01T00:00:00Z' }, b: { status: 'open', kind: 'waiting' }, c: { status: 'done', kind: 'mine' } }, now.getTime());
+  assertEqual(sum.open, 2, 'open 计数');
+  assertEqual(sum.mine, 1, 'mine 计数');
+  assertEqual(sum.waiting, 1, 'waiting 计数');
+  assertEqual(sum.overdue, 1, '超期只算有截止时间且已过期的');
+});
+
+await test('跟催：状态闭环与 store 语义（恢复不删记录、终态保留原因）', async () => {
+  const store = await import('../server/store/state.js');
+  store.replaceFollowUps({
+    f1: { id: 'f1', kind: 'mine', title: '把报价发给李总', status: 'open', dueAt: '2026-10-08T00:00:00.000Z' },
+  });
+  assertEqual(store.listFollowUps().length, 1, '应有 1 条');
+  assertEqual(store.summarizeFollowUps(new Date('2026-10-09T00:00:00Z').getTime()).overdue, 1, '过期应计入超期');
+
+  const done = store.setFollowUp('f1', { status: 'done' });
+  assertEqual(done.status, 'done', '应标记完成');
+  assert(done.doneAt, '应记录完成时间');
+  assertEqual(done.closeReason, '手动标记完成', '应有默认关闭原因');
+
+  const snoozed = store.setFollowUp('f1', { status: 'snoozed', snoozeUntil: '2026-10-10T01:00:00.000Z' });
+  assertEqual(snoozed.snoozeUntil, '2026-10-10T01:00:00.000Z', '稍后时间应保存');
+
+  // 与待办不同：恢复只回到 open，**不删记录**（这条是扫描出来的事实）
+  const reopened = store.setFollowUp('f1', { status: 'open' });
+  assertEqual(reopened.status, 'open', '应恢复为进行中');
+  assertEqual(reopened.doneAt, null, '恢复后清掉完成时间');
+  assertEqual(store.listFollowUps().length, 1, '恢复不能把记录删掉');
+
+  assertEqual(store.setFollowUp('nope', { status: 'done' }), null, '不存在的 id 应返回 null');
+  store.replaceFollowUps({});
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await imap.close();
