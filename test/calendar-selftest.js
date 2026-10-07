@@ -2059,7 +2059,7 @@ await test('检索列表：信封扫描达到上限时明确暴露「还有更�
     assertEqual(out.stats.backfill?.scanTruncated, true, '达到信封上限时必须标记 scanTruncated');
     assert(out.stats.backfill.unscanned > 0, `应报出未扫描的封数（实际 ${out.stats.backfill.unscanned}）`);
     assertIncludes(out.truncationNote, '信封扫描达到上限', '结论文案应明确说明扫描被截断');
-    assertIncludes(out.truncationNote, '可能不全', '应说明列表可能不全');
+    assertIncludes(out.truncationNote, '上方列表是完整的', '应说明列表上方列表是完整的');
     assertIncludes(out.truncationNote, '缩小时间范围', '应给出可执行的建议');
     // 模型额度没有被放大：仍然受 backfillMax=5 约束
     assert(out.stats.backfill.analyzed <= 5, `模型分析量应仍受回补额度约束（实际 ${out.stats.backfill.analyzed}）`);
