@@ -14,16 +14,17 @@
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { makeTempDir } from './lib/tmp.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 
 /* ------------------------------------------------------------ 干净环境 */
 
-const freshDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-fresh-'));
+const freshDir = makeTempDir('mailbot-fresh-');
 for (const key of Object.keys(process.env)) {
   if (/^(MAILBOT_|DEEPSEEK_|GOOGLE_)/.test(key)) delete process.env[key];
 }
@@ -318,41 +319,33 @@ try {
   });
 
   await test('一键启动：缺 .env 时自动生成，并接着启动服务', async () => {
-    const os = await import('node:os');
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-root-'));
-    try {
-      // 造一个「刚复制过来、还没装依赖、也没有 .env」的项目目录
-      fs.copyFileSync(path.join(root, '.env.example'), path.join(tmpRoot, '.env.example'));
-      fs.mkdirSync(path.join(tmpRoot, 'node_modules', 'imapflow'), { recursive: true });
+    // 这个「刚复制过来」的假项目目录由 test/lib/tmp.js 统一在进程退出时清理
+    const tmpRoot = makeTempDir('mailbot-root-');
+    // 造一个「刚复制过来、还没装依赖、也没有 .env」的项目目录
+    fs.copyFileSync(path.join(root, '.env.example'), path.join(tmpRoot, '.env.example'));
+    fs.mkdirSync(path.join(tmpRoot, 'node_modules', 'imapflow'), { recursive: true });
 
-      const lines = [];
-      let startedWith = null;
-      const result = await runStart({
-        rootDir: tmpRoot,
-        control: {},
-        log: (s = '') => lines.push(String(s)),
-        open: () => {},
-        startServer: async (opts) => {
-          startedWith = opts;
-          return { url: 'http://127.0.0.1:8787/?token=test' };
-        },
-      });
+    const lines = [];
+    let startedWith = null;
+    const result = await runStart({
+      rootDir: tmpRoot,
+      control: {},
+      log: (s = '') => lines.push(String(s)),
+      open: () => {},
+      startServer: async (opts) => {
+        startedWith = opts;
+        return { url: 'http://127.0.0.1:8787/?token=test' };
+      },
+    });
 
-      const out = lines.join('\n');
-      assertIncludes(out, '已生成 .env', '应自动从 .env.example 生成 .env');
-      assert(fs.existsSync(path.join(tmpRoot, '.env')), '.env 应真的落盘');
-      assertEqual(result.started, true, '应继续启动服务');
-      assertEqual(result.url, 'http://127.0.0.1:8787/?token=test', '应返回服务地址');
-      assertIncludes(out, '服务已启动', '应打印启动结果');
-      assert(startedWith && startedWith.rootDir === tmpRoot, '应把 rootDir 传给服务');
-      return '生成 .env + 启动服务';
-    } finally {
-      try {
-        fs.rmSync(tmpRoot, { recursive: true, force: true });
-      } catch {
-        /* ignore */
-      }
-    }
+    const out = lines.join('\n');
+    assertIncludes(out, '已生成 .env', '应自动从 .env.example 生成 .env');
+    assert(fs.existsSync(path.join(tmpRoot, '.env')), '.env 应真的落盘');
+    assertEqual(result.started, true, '应继续启动服务');
+    assertEqual(result.url, 'http://127.0.0.1:8787/?token=test', '应返回服务地址');
+    assertIncludes(out, '服务已启动', '应打印启动结果');
+    assert(startedWith && startedWith.rootDir === tmpRoot, '应把 rootDir 传给服务');
+    return '生成 .env + 启动服务';
   });
 
   await test('文档：需求文档与运行配置文档存在且非空', async () => {
@@ -371,12 +364,7 @@ try {
   });
 } finally {
   await new Promise((r) => server.close(r));
-  // Windows 上刚写过的文件偶尔还被句柄占着（EPERM）；清理失败不应影响测试结论
-  try {
-    fs.rmSync(freshDir, { recursive: true, force: true });
-  } catch {
-    /* ignore */
-  }
+  // 数据目录 freshDir 由 test/lib/tmp.js 在进程退出时统一清理（容忍失败并重试）
 }
 
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项。`);

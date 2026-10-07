@@ -6,13 +6,14 @@
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { makeTempDir } from './lib/tmp.js';
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-selftest-'));
+const tmpDir = makeTempDir('mailbot-selftest-');
 
 // 必须在导入业务模块之前设置环境变量
 process.env.MAILBOT_DATA_DIR = tmpDir;
@@ -3746,11 +3747,41 @@ await imap.close();
 await smtp.close();
 await llm.close();
 
+/* ------------------------------------------------------------ 临时目录助手 */
+
+/*
+ * 这个用例刻意放在所有用例之后（连模拟服务都已关闭）：`cleanupTempDirs()` 会把
+ * 本次运行的数据目录一起删掉，放在前面会把后面用例还要用的 `MAILBOT_DATA_DIR` 删掉。
+ */
+await test('临时目录助手：makeTempDir 建出目录并登记，cleanupTempDirs 删掉全部且可重复调用', async () => {
+  const { makeTempDir: mk, cleanupTempDirs } = await import('./lib/tmp.js');
+  const a = mk('mailbot-tmpcheck-a-');
+  const b = mk('mailbot-tmpcheck-b-');
+  assert(fs.existsSync(a), `makeTempDir 应真的建出目录：${a}`);
+  assert(fs.existsSync(b), `makeTempDir 应真的建出目录：${b}`);
+  assert(fs.existsSync(tmpDir), '此刻本次运行的数据目录应还在（它活到了最后一个用例）');
+
+  cleanupTempDirs();
+  assert(!fs.existsSync(a), `cleanupTempDirs 之后目录不应还存在：${a}`);
+  assert(!fs.existsSync(b), `cleanupTempDirs 之后目录不应还存在：${b}`);
+  assert(!fs.existsSync(tmpDir), `清理应覆盖本次运行的数据目录（这正是「只增不减」的根因）：${tmpDir}`);
+
+  // 幂等：重复调用不报错，也不影响测试结论
+  cleanupTempDirs();
+  cleanupTempDirs();
+
+  // 目录已经不在（比如上一轮清理失败后被人删掉）时，清理同样不能抛错
+  const c = mk('mailbot-tmpcheck-c-');
+  fs.rmSync(c, { recursive: true, force: true });
+  cleanupTempDirs();
+  return '建目录 → 清理全部 → 重复清理 → 容忍已删除';
+});
+
 console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项。`);
 if (failures.length) {
   console.log('\n失败详情：');
   for (const f of failures) console.log(`\n[${f.name}]\n${f.message}`);
 }
-console.log(`\n测试数据目录：${tmpDir}`);
+console.log(`\n测试数据目录：${tmpDir}（已登记，进程退出时自动清理）`);
 
 process.exitCode = failures.length ? 1 : 0;

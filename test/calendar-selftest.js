@@ -8,14 +8,14 @@
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { listenRandom } from './lib/port.js';
+import { makeTempDir } from './lib/tmp.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-cal-'));
+const tmpDir = makeTempDir('mailbot-cal-');
 
 process.env.MAILBOT_DATA_DIR = tmpDir;
 process.env.MAILBOT_LOG_LEVEL = process.env.MAILBOT_LOG_LEVEL || 'warn';
@@ -70,27 +70,6 @@ function assertIncludes(hay, needle, msg) {
 function parseScanNumbers(note) {
   const m = /已扫描约 (\d+) 封，另有约 (\d+) 封未检查/.exec(String(note || ''));
   return m ? { scanned: Number(m[1]), unscanned: Number(m[2]) } : null;
-}
-
-/**
- * 删除临时目录。Windows 上刚写过的文件偶尔还被句柄占着（EPERM），
- * 直接 rmSync 会让「清理失败」变成一个和被测逻辑无关的假失败，因此这里容忍并重试。
- */
-function rmTempDir(dir) {
-  for (let i = 0; i < 3; i += 1) {
-    try {
-      fs.rmSync(dir, { recursive: true, force: true });
-      return;
-    } catch {
-      // 等一小会儿让句柄释放后再试（Atomics.wait 是同步睡眠，不占用 CPU）
-      try {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 120);
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-  // 仍然失败就留给系统临时目录清理：不影响测试结论
 }
 
 /* ------------------------------------------------------------ 环境 */
@@ -2022,8 +2001,6 @@ await test('检索结论：依据条数被如实标注（有界子集，不装�
  * 就能稳定复现「范围太大，信封没扫完」。关键断言是**不静默**。
  */
 await test('检索列表：信封扫描达到上限时明确暴露「还有更多未列出」', async () => {
-  const os = await import('node:os');
-  const path = await import('node:path');
   const { searchEmails } = await import('../server/ai/search.js');
   const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
 
@@ -2046,7 +2023,7 @@ await test('检索列表：信封扫描达到上限时明确暴露「还有更�
   }
   const capImap = await mailMocks.startMockImap({ messages });
   const savedPath = process.env.MAILBOT_DATA_DIR;
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-cap-'));
+  const scratch = makeTempDir('mailbot-cap-');
   try {
     process.env.MAILBOT_DATA_DIR = scratch;
     resetConfigCache();
@@ -2113,7 +2090,6 @@ await test('检索列表：信封扫描达到上限时明确暴露「还有更�
     process.env.MAILBOT_DATA_DIR = savedPath;
     resetConfigCache();
     loadConfig({ rootDir: root, force: true });
-    rmTempDir(scratch);
     await capImap.close();
   }
 });
@@ -2128,8 +2104,6 @@ await test('检索列表：信封扫描达到上限时明确暴露「还有更�
  * 且「上限 / 已扫描 / 未检查 / 取到的 UID 总数」四个数在返回值与界面文案里都对得上。
  */
 await test('检索列表：默认信封预算下候选超过 600 时真的扫满 600 封（不再停在单批 250）', async () => {
-  const os = await import('node:os');
-  const path = await import('node:path');
   const { searchEmails } = await import('../server/ai/search.js');
   const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
 
@@ -2159,7 +2133,7 @@ await test('检索列表：默认信封预算下候选超过 600 时真的扫满
   }
   const imap = await mailMocks.startMockImap({ messages });
   const savedPath = process.env.MAILBOT_DATA_DIR;
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-budget-'));
+  const scratch = makeTempDir('mailbot-budget-');
   try {
     process.env.MAILBOT_DATA_DIR = scratch;
     resetConfigCache();
@@ -2242,14 +2216,11 @@ await test('检索列表：默认信封预算下候选超过 600 时真的扫满
     process.env.MAILBOT_DATA_DIR = savedPath;
     resetConfigCache();
     loadConfig({ rootDir: root, force: true });
-    rmTempDir(scratch);
     await imap.close();
   }
 });
 
 await test('检索列表：本地分析已覆盖该范围（信封缓存命中）时不再重扫邮箱', async () => {
-  const os = await import('node:os');
-  const path = await import('node:path');
   const { searchEmails } = await import('../server/ai/search.js');
   const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
 
@@ -2271,7 +2242,7 @@ await test('检索列表：本地分析已覆盖该范围（信封缓存命中�
   }
   const imap = await mailMocks.startMockImap({ messages });
   const savedPath = process.env.MAILBOT_DATA_DIR;
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-cache-'));
+  const scratch = makeTempDir('mailbot-cache-');
   try {
     process.env.MAILBOT_DATA_DIR = scratch;
     resetConfigCache();
@@ -2319,14 +2290,11 @@ await test('检索列表：本地分析已覆盖该范围（信封缓存命中�
     process.env.MAILBOT_DATA_DIR = savedPath;
     resetConfigCache();
     loadConfig({ rootDir: root, force: true });
-    rmTempDir(scratch);
     await imap.close();
   }
 });
 
 await test('检索回补：本地未覆盖的时间段会按需拉取并分析，从而查到邮件', async () => {
-  const os = await import('node:os');
-  const path = await import('node:path');
   const { searchEmails } = await import('../server/ai/search.js');
     const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
 
@@ -2362,7 +2330,7 @@ await test('检索回补：本地未覆盖的时间段会按需拉取并分析�
   });
 
   const savedPath = process.env.MAILBOT_DATA_DIR;
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-backfill-'));
+  const scratch = makeTempDir('mailbot-backfill-');
   try {
     // 用一个干净的数据目录，确保「本地没有这些邮件」是真实前提
     process.env.MAILBOT_DATA_DIR = scratch;
@@ -2416,7 +2384,6 @@ await test('检索回补：本地未覆盖的时间段会按需拉取并分析�
     process.env.MAILBOT_DATA_DIR = savedPath;
     resetConfigCache();
     loadConfig({ rootDir: root, force: true });
-    rmTempDir(scratch);
     await historyImap.close();
   }
 });
@@ -2487,8 +2454,6 @@ await test('检索回补：服务器丢 ENVELOPE 响应时，改用头部查询�
 
 await test('检索回补：日期边界按配置时区判断（UTC 8/31 属于北京 9/1）', async () => {
   const { searchEmails } = await import('../server/ai/search.js');
-  const os = await import('node:os');
-  const path = await import('node:path');
   const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
 
   // 这封邮件的时间戳是 UTC 8/31 17:51 —— 北京时间已经是 9/1 01:51。
@@ -2511,7 +2476,7 @@ await test('检索回补：日期边界按配置时区判断（UTC 8/31 属于�
   });
 
   const savedPath = process.env.MAILBOT_DATA_DIR;
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-tz-'));
+  const scratch = makeTempDir('mailbot-tz-');
   try {
     process.env.MAILBOT_DATA_DIR = scratch;
     resetConfigCache();
@@ -2548,15 +2513,12 @@ await test('检索回补：日期边界按配置时区判断（UTC 8/31 属于�
     process.env.MAILBOT_DATA_DIR = savedPath;
     resetConfigCache();
     loadConfig({ rootDir: root, force: true });
-    rmTempDir(scratch);
     await tzImap.close();
   }
 });
 
 await test('检索回补：配置为 0 时关闭，并给出可执行提示', async () => {
   const { searchEmails } = await import('../server/ai/search.js');
-  const os = await import('node:os');
-  const path = await import('node:path');
     const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
 
   const imap2 = await mailMocks.startMockImap({
@@ -2570,7 +2532,7 @@ await test('检索回补：配置为 0 时关闭，并给出可执行提示', as
     ],
   });
   const savedPath = process.env.MAILBOT_DATA_DIR;
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-nobf-'));
+  const scratch = makeTempDir('mailbot-nobf-');
   try {
     process.env.MAILBOT_DATA_DIR = scratch;
     resetConfigCache();
@@ -2602,7 +2564,6 @@ await test('检索回补：配置为 0 时关闭，并给出可执行提示', as
     process.env.MAILBOT_DATA_DIR = savedPath;
     resetConfigCache();
     loadConfig({ rootDir: root, force: true });
-    rmTempDir(scratch);
     await imap2.close();
   }
 });
@@ -4152,5 +4113,5 @@ if (failures.length) {
   console.log('\n失败详情：');
   for (const f of failures) console.log(`\n[${f.name}]\n${f.message}`);
 }
-console.log(`\n测试数据目录：${tmpDir}`);
+console.log(`\n测试数据目录：${tmpDir}（已登记，退出时自动清理）`);
 process.exit(failures.length ? 1 : 0);

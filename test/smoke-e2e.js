@@ -6,13 +6,14 @@
  */
 
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { makeTempDir } from './lib/tmp.js';
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-smoke-'));
+const tmpDir = makeTempDir('mailbot-smoke-');
 process.env.MAILBOT_DATA_DIR = tmpDir;
 process.env.MAILBOT_LOG_LEVEL = 'warn';
 // 隔离本机 .env：否则真实凭据会覆盖测试配置
