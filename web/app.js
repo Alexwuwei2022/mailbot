@@ -52,8 +52,45 @@ const LEGACY_VIEW_ALIAS = {
 
 /** 把（可能是旧的）视图 id 解析成 `{view, tab}`；`tab` 为空表示无需指定页签。 */
 function resolveView(id) {
-  const alias = LEGACY_VIEW_ALIAS[id];
-  return alias ? { ...alias } : { view: id, tab: null };
+  /*
+   * 两种写法都认：
+   *   - `#/followup/timeline`：视图 + 页签都写在地址里。刷新、分享链接、按「后退」
+   *     都能落回**同一个页签**，而不是被打回默认页签。
+   *   - `#/followups`、`#/timeline`：合并前的旧地址（见 LEGACY_VIEW_ALIAS）。
+   *
+   * 子路径只对「跟进」页有意义，所以只有它会被拆开；别的视图若带子路径
+   * （`#/drafts/xxx`）仍按无效 id 处理、退回总览——不把随手的子路径当成参数
+   * 塞给那个视图（那会变成"能进页面但状态莫名其妙"）。
+   */
+  const raw = String(id || '');
+  const slash = raw.indexOf('/');
+  const head = slash === -1 ? raw : raw.slice(0, slash);
+  const sub = slash === -1 ? '' : raw.slice(slash + 1);
+  const alias = LEGACY_VIEW_ALIAS[head];
+  if (alias) return { ...alias };
+  if (head === 'followup') return { view: 'followup', tab: sub || null };
+  return { view: raw, tab: null };
+}
+
+/**
+ * 把视图（+ 可选的页签）写成地址。
+ *
+ * 「跟进」页的页签是唯一被编进地址的状态：它是**视图级**的切换，
+ * 用户会想直接分享/收藏"时间线"那一个地址；其余页签（草稿的已发送等）属于页内筛选，
+ * 不进地址（进地址会让后退键的语义变重）。
+ */
+function hashFor(viewId, tab) {
+  return tab ? `#/${viewId}/${tab}` : `#/${viewId}`;
+}
+
+/**
+ * 路由指纹：`视图#页签`。用来判断"地址变了"到底有没有带来**新信息**。
+ *
+ * 没有它就会多绕一圈：`navigate()` 自己写地址 → 浏览器随后抛 `hashchange` →
+ * 处理器发现"地址和当前视图不一致"→ 又 navigate 一次（多余的整视图重绘 + 多一轮接口）。
+ */
+function routeKeyOf({ view, tab }) {
+  return `${view}#${tab || ''}`;
 }
 
 /** 供测试与调试使用的应用实例。 */
@@ -103,7 +140,14 @@ const app = {
     const sameView = viewId === this.viewId;
     if (params && typeof params === 'object') this.navParams[viewId] = { ...(this.navParams[viewId] || {}), ...params };
     this.viewId = viewId;
-    location.hash = `#/${viewId}`;
+    // 页签一起写进地址（只有「跟进」页有这种子路径）；没指定就写裸地址，由视图决定落在哪个页签
+    const tab = viewId === 'followup' ? params?.tab || target.tab || null : null;
+    this.routeKey = routeKeyOf({ view: viewId, tab });
+    try {
+      location.hash = hashFor(viewId, tab);
+    } catch {
+      /* 最小 DOM 环境里 location 可能是只读对象，忽略即可 */
+    }
     this.renderView();
     this.paintNav();
     /*
@@ -126,6 +170,27 @@ const app = {
     const params = this.navParams[viewId] || null;
     this.navParams[viewId] = null;
     return params;
+  },
+
+  /**
+   * 视图**内部**换了页签时，把地址同步过来（`#/followup/timeline`）。
+   *
+   * 为什么不重绘：DOM 已经由视图自己更新好了（页签点击是纯页内切换）。这里只做两件事——
+   * 写地址、同步路由指纹（`routeKey`）。同步指纹是必须的：随后浏览器会抛一次
+   * `hashchange`，没有它就会被当成"用户换了地址"再整视图重绘一遍、多打一轮接口。
+   *
+   * 反过来说，**地址的变化**（后退/前进/手改地址）一律由 `hashchange` → `navigate` 处理，
+   * 视图不需要自己养一个 hashchange 监听器（那种监听器在视图反复重绘时很容易累积，
+   * 设置页目录的滚动监听就漏过一次）。
+   */
+  syncTabHash(viewId, tab) {
+    if (viewId !== this.viewId) return;
+    this.routeKey = routeKeyOf({ view: viewId, tab });
+    try {
+      location.hash = hashFor(viewId, tab);
+    } catch {
+      /* 最小 DOM 环境里 location 可能是只读对象，忽略即可 */
+    }
   },
 
   renderView() {
@@ -1087,8 +1152,17 @@ function bootShellAndViews(root) {
   subscribeProgress((event) => app.onProgressEvent(event));
 
   window.addEventListener('hashchange', () => {
-    const id = location.hash.replace(/^#\/?/, '') || 'overview';
-    if (id !== app.viewId) app.navigate(id);
+    const parsed = resolveView(location.hash.replace(/^#\/?/, '') || 'overview');
+    /*
+     * 只处理**真的带来新信息的地址变化**（路由指纹变了才动）。
+     *
+     * `navigate()` 与 `syncTabHash()` 自己写地址后，浏览器会抛一次 hashchange；
+     * 不比指纹的话，那次事件会被当成"用户换了地址"再整视图重绘一遍。
+     * 而地址真的变了（后退/前进/手改地址，含旧地址 `#/timeline`）时，
+     * 键不同 → 走 navigate —— 视图换成对应页签这件事就自动成立了。
+     */
+    if (routeKeyOf(parsed) === app.routeKey) return;
+    app.navigate(parsed.view, parsed.tab ? { tab: parsed.tab } : undefined);
   });
 
   /*
@@ -1097,11 +1171,16 @@ function bootShellAndViews(root) {
    */
   const initial = resolveView(location.hash.replace(/^#\/?/, '') || 'overview');
   app.viewId = VIEWS.some((v) => v.id === initial.view) ? initial.view : 'overview';
+  /*
+   * 首屏也要把路由指纹记上账：否则紧接着来的一次 hashchange（例如上面那次"改写回新入口"
+   * 触发的）会被当成新地址，白白重绘一遍。
+   */
+  app.routeKey = routeKeyOf({ view: app.viewId, tab: app.viewId === initial.view ? initial.tab : null });
   if (initial.tab) {
     app.navParams[app.viewId] = { ...(app.navParams[app.viewId] || {}), tab: initial.tab };
-    // 把地址栏改写回新入口，避免刷新一次又走一遍兼容分支
+    // 把地址栏改写回新入口（含页签，一次写完），避免刷新一次又走一遍兼容分支
     try {
-      location.hash = `#/${app.viewId}`;
+      location.hash = hashFor(app.viewId, initial.tab);
     } catch {
       /* 最小 DOM 环境里 location 可能是只读对象，忽略即可 */
     }

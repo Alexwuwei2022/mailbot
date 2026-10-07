@@ -17,6 +17,17 @@
  *
  * `#/followups` 与 `#/timeline` 仍然可用：app.js 会把它们解析成 `{ tab }` 参数
  * 交给这里（`takeNavParams`），所以书签与文档里的老链接不会失效。
+ *
+ * ## 页签写在地址里（`#/followup/timeline`）
+ *
+ * 页签是**视图级**的状态，用户会想直接刷新/收藏/分享"时间线"那一个地址。分工是：
+ *   - 地址 → 页签：由 app.js 的 `hashchange` → `navigate` 处理（含旧地址 `#/timeline`），
+ *     视图只从 `takeNavParams` 里取一次结果。视图**不自己养 hashchange 监听器**——
+ *     那种监听器在视图反复重绘时很容易累积（设置页目录的滚动监听就漏过一次）。
+ *   - 页签 → 地址：点页签时调 `app.syncTabHash()` 把地址同步过去（并让路由指纹跟着走，
+ *     免得随后的 hashchange 被当成"用户换了地址"再整视图重绘一遍）。
+ *   - **不重绘整视图**：页签切换是纯页内切换，DOM 由这里的 `paint()` 更新；
+ *     后退/前进会走一遍路由（视图整体重绘一次），这是刻意的：地址的变化由路由统一处理。
  */
 
 import { h, mount } from '../dom.js';
@@ -34,8 +45,9 @@ export function renderFollowUp(root, app) {
   const { state } = viewState(app, 'followup', () => ({ tab: TABS[0].id }));
 
   /*
-   * 页签是一次性跳转参数（`navigate('followup', { tab: 'timeline' })`）。
-   * 取走之后就只认 state：用户手动切的页签不该被下一次重绘顶回去。
+   * 页签是一次性跳转参数（`navigate('followup', { tab: 'timeline' })`，也是地址
+   * `#/followup/timeline` 落地的方式）。取走之后就只认 state：用户手动切的页签
+   * 不该被下一次重绘顶回去。
    */
   const nav = app.takeNavParams?.('followup');
   if (nav?.tab && TABS.some((t) => t.id === nav.tab)) state.tab = nav.tab;
@@ -66,6 +78,8 @@ export function renderFollowUp(root, app) {
               onclick: () => {
                 if (state.tab === t.id) return;
                 state.tab = t.id;
+                // 只同步地址，不重绘：DOM 由下面这行 paint() 更新（可选调用，便于测试替身）
+                app.syncTabHash?.('followup', t.id);
                 paint();
               },
             },

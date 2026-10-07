@@ -3945,6 +3945,62 @@ await step('旧链接与页签参数：navigate("timeline") 落到「跟进」�
   await new Promise((r) => setTimeout(r, 120));
 });
 
+await step('「跟进」页签编进地址：#/followup/<tab>、旧地址、后退都能落到对应页签', async () => {
+  const { app } = await import('../web/app.js');
+  const { api } = await import('../web/api.js');
+  const real = { followups: api.followups, projects: api.projects, timeline: api.timeline };
+  const tlCalls = [];
+  api.followups = () =>
+    Promise.resolve({ ok: true, items: [], all: [], summary: { open: 0, mine: 0, waiting: 0 }, config: { enabled: true, waitHours: 24 } });
+  api.projects = () => Promise.resolve({ ok: true, projects: [], unclassified: 0 });
+  api.timeline = () => {
+    tlCalls.push(1);
+    return Promise.resolve({ ok: true, project: '', calendarNote: '', counts: {}, entries: [] });
+  };
+  const realHash = location.hash;
+  const tabBtn = (id) => [...app.els.main.querySelectorAll('.followup-tabs .tab')].find((t) => (t.dataset.tab || '') === id);
+  const click = (el) => el.dispatchEvent(new window.Event('click', { bubbles: true }));
+  try {
+    // ① 跳进「跟进」页时带页签 → 地址里就有页签（书签/分享能直达「时间线」）
+    app.navigate('followup', { tab: 'timeline' });
+    await new Promise((r) => setTimeout(r, 200));
+    checkEqual(location.hash, '#/followup/timeline', '带页签进入时应把页签写进地址');
+    check(tabBtn('timeline')?.classList.contains('active'), '该页签应是选中态');
+
+    // ② 点页签 → 地址跟着改；这是纯页内切换，不该重建整个视图、也不该多取一次另一边的数据
+    const viewEl = app.els.main.querySelector('.view-followup');
+    const tlBefore = tlCalls.length;
+    click(tabBtn('followups'));
+    await new Promise((r) => setTimeout(r, 200));
+    checkEqual(location.hash, '#/followup/followups', '点页签应按 #/followup/<tab> 改写地址');
+    check(tabBtn('followups')?.classList.contains('active'), '选中态应跟着切换');
+    checkEqual(app.els.main.querySelector('.view-followup'), viewEl, '页签切换是页内切换，不该重建整个视图');
+    checkEqual(tlCalls.length, tlBefore, '切到跟催不该再去取时间线数据');
+
+    // ③ 后退到上一个页签（地址变了、视图没换）→ 由路由落到对应页签
+    location.hash = '#/followup/timeline';
+    window.dispatchEvent(new window.Event('hashchange'));
+    await new Promise((r) => setTimeout(r, 220));
+    checkEqual(app.viewId, 'followup', '后退回页签不该换视图');
+    check(tabBtn('timeline')?.classList.contains('active'), '后退后应回到「时间线」页签');
+    check(tlCalls.length > tlBefore, '退回时间线页签应重新取一次时间线数据');
+
+    // ④ 旧地址 #/followups 仍然可用（书签），并会被改写成新地址
+    location.hash = '#/followups';
+    window.dispatchEvent(new window.Event('hashchange'));
+    await new Promise((r) => setTimeout(r, 220));
+    check(tabBtn('followups')?.classList.contains('active'), '旧地址 #/followups 仍应落到「跟催」页签');
+    checkEqual(location.hash, '#/followup/followups', '旧地址应被改写成新地址（便于之后刷新/分享）');
+  } finally {
+    api.followups = real.followups;
+    api.projects = real.projects;
+    api.timeline = real.timeline;
+    location.hash = realHash;
+    app.navigate('overview');
+    await new Promise((r) => setTimeout(r, 160));
+  }
+});
+
 await step('设置页：具名锚点 data-section + options.anchor / 跳转参数两条路都会定位并高亮', async () => {
   const settingsView = await import('../web/views/settings.js');
   const mkBox = () => {
