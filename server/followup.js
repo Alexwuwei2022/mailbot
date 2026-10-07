@@ -437,7 +437,7 @@ function moreInformative(a, b, na, nb) {
  * @param {Array} group 同一来源的条目（会按规则挑一条，其余全部并进去）
  * @returns {object} 折叠后的条目
  */
-function foldGroup(group) {
+function foldGroup(group, matcher = null) {
   const norm = new Map();
   for (const e of group) norm.set(e, normalizeTitle(e.title));
 
@@ -450,7 +450,10 @@ function foldGroup(group) {
   const find = (i) => (parent[i] === i ? i : (parent[i] = find(parent[i])));
   for (let i = 0; i < group.length; i += 1) {
     for (let j = i + 1; j < group.length; j += 1) {
-      if (similarTitles(norm.get(group[i]), norm.get(group[j]))) {
+      const same = matcher
+        ? matcher(group[i], group[j], norm.get(group[i]), norm.get(group[j]))
+        : similarTitles(norm.get(group[i]), norm.get(group[j]));
+      if (same) {
         const a = find(i);
         const b = find(j);
         if (a !== b) parent[b] = a;
@@ -539,12 +542,63 @@ export function mergeUserState(into, from) {
  * @param {Array} items 跟催条目（候选或既有记录都可）
  * @returns {{items: Array, absorbed: Array, folded: number}} 折叠后的条目与"被并掉的条目"
  */
-export function foldSimilarCommitments(items = []) {
+/**
+ * 「同一件事」的判定（**跨来源**，比同来源折叠更宽）。
+ *
+ * 为什么需要放宽：同一封会议通知常常被同一条线程里的多封邮件各抽一次，
+ * 每封邮件是不同的草稿 → sourceKey 不同 → 只按来源折叠拦不住，
+ * 于是同一件事在列表里堆成好几条（用户实测：三条「按时参加9月29日…讨论会」）。
+ *
+ * 每一条放宽都有独立信号支撑，不靠"看着像"：
+ *   - 归一化标题完全相同 → 最强信号；
+ *   - 既有保守判据 similarTitles（占比+边界+相似度双阈值）成立；
+ *   - **截止时间完全相同**（且非空）且标题相似度 ≥ 0.5 —— 两个独立信号叠加，
+ *     专门覆盖"同一场会、不同措辞"（时间相同很难是巧合）。
+ * 类型不同（我承诺的 / 等对方回复）一律不合并。
+ */
+export function sameCommitmentAcrossSources(a, b, na, nb) {
+  if (!a || !b) return false;
+  if ((a.kind || 'mine') !== (b.kind || 'mine')) return false;
+  const x = na ?? normalizeTitle(a.title);
+  const y = nb ?? normalizeTitle(b.title);
+  if (!x || !y) return false;
+  if (x === y) return true;
+  if (similarTitles(x, y)) return true;
+  const da = a.dueAt ? Date.parse(a.dueAt) : NaN;
+  const db = b.dueAt ? Date.parse(b.dueAt) : NaN;
+  if (Number.isFinite(da) && Number.isFinite(db) && da === db) {
+    if (diceSimilarity(x, y) >= 0.5) return true;
+    /*
+     * 同一场会常常被写得长短不一：
+     *   「按时参加9月29日综维讨论会」
+     *   「按时参加9月29日10:00-17:00的综维超级数字员工及重点任务讨论会」
+     * 两者相似度只有 0.36（插入的限定语把分母撑大了），但**开头动作与对象一致**。
+     * 中文承诺的动词在最前面，所以"共同前缀 ≥ 4 字"是个可用的独立信号；
+     * 配上"截止时间完全相同"（同一场会很难是巧合），两条一起才判定为同一件事。
+     *
+     * 反例（必须不合并）：「按时参加9月29日…讨论会」与「会前准备…初步梳理」
+     * 前缀为 0，即使截止时间相同也各留一条。
+     */
+    if (commonPrefixLen(x, y) >= 4) return true;
+  }
+  return false;
+}
+
+/** 两个归一化标题的共同前缀长度（中文承诺的动作词在最前面，所以前缀很有信息量）。 */
+function commonPrefixLen(a, b) {
+  const max = Math.min(a.length, b.length);
+  let i = 0;
+  while (i < max && a[i] === b[i]) i += 1;
+  return i;
+}
+
+export function foldSimilarCommitments(items = [], { acrossSources = false } = {}) {
   const list = (Array.isArray(items) ? items : []).filter((f) => f && String(f.title || '').trim());
   const groups = new Map();
   const passthrough = [];
   for (const f of list) {
-    const key = foldGroupKey(f);
+    // 跨来源折叠：同一类型放进同一组，再靠 sameCommitmentAcrossSources 判定
+    const key = acrossSources ? `${f.kind || 'mine'}:any` : foldGroupKey(f);
     if (!key) {
       passthrough.push(f);
       continue;
@@ -560,7 +614,7 @@ export function foldSimilarCommitments(items = []) {
       out.push(group[0]);
       continue;
     }
-    const { kept, absorbed: gone } = foldGroup(group);
+    const { kept, absorbed: gone } = foldGroup(group, acrossSources ? sameCommitmentAcrossSources : null);
     out.push(...kept);
     absorbed.push(...gone);
   }
@@ -609,7 +663,35 @@ export function mergeFollowUps(existing, candidates, { now = new Date(), replied
     } else if (f) passthrough.push(f); // 没有来源键的记录不属于扫描范围，别动它
   }
   let autoClosed = 0;
+  let absorbedIntoTwin = 0;
   const closed = [];
+  /*
+   * 跨来源比对用的池子与"这条记录在 byKey 里的键"。
+   * pool 会随本轮新建的记录增长，所以同一批候选里互相重复的也会被并掉。
+   */
+  const pool = [...byKey.values()];
+  const keyOf = new Map();
+  for (const [k, v] of byKey.entries()) keyOf.set(v, k);
+  const normCache = new Map();
+  const normOf = (entry) => {
+    if (!normCache.has(entry)) normCache.set(entry, normalizeTitle(entry.title));
+    return normCache.get(entry);
+  };
+  const findTwin = (list, cand, candNorm) => {
+    for (const item of list) {
+      if (item === cand) continue;
+      if (sameCommitmentAcrossSources(item, cand, normOf(item), candNorm)) return item;
+    }
+    return null;
+  };
+  /** 只刷新"会变的事实"，绝不覆盖用户可能改过的标题、备注与状态。 */
+  const refreshFacts = (target, cand, at) => ({
+    waitingHours: cand.waitingHours ?? target.waitingHours,
+    dueAt: cand.dueAt ?? target.dueAt,
+    counterparty: cand.counterparty || target.counterparty,
+    replyTrackable: cand.replyTrackable ?? target.replyTrackable,
+    updatedAt: at.toISOString(),
+  });
 
   const seen = new Set();
   for (const c of candidates) {
@@ -617,12 +699,27 @@ export function mergeFollowUps(existing, candidates, { now = new Date(), replied
     seen.add(key);
     const prev = byKey.get(key);
     if (!prev) {
-      byKey.set(key, {
-        ...c,
-        status: 'open',
-        createdAt: now.toISOString(),
-        updatedAt: now.toISOString(),
-      });
+      /*
+       * **键对不上不等于新承诺**——这是"已完成又被重新列出来"的根因：
+       * sourceKey 是「草稿 id + 标题哈希」，模型换个说法，或同一条线程里的另一封邮件
+       * 再抽一次同一件事，键就变了；若直接新建一条 open，用户昨天标的「已完成」
+       * 今天就变成一条待办重新出现，而且每扫一次多一条。
+       *
+       * 所以先在整个表里找"同一件事"（sameCommitmentAcrossSources）：
+       * 找到就并入那条——保留它的 id、标题与**用户状态**，只刷新会变的事实。
+       */
+      const twin = findTwin(pool, c, normOf(c));
+      if (twin) {
+        const mergedTwin = { ...twin, ...refreshFacts(twin, c, now) };
+        byKey.set(keyOf.get(twin), mergedTwin);
+        keyOf.set(mergedTwin, keyOf.get(twin));
+        absorbedIntoTwin += 1;
+        continue;
+      }
+      const created = { ...c, status: 'open', createdAt: now.toISOString(), updatedAt: now.toISOString() };
+      byKey.set(key, created);
+      keyOf.set(created, key);
+      pool.push(created);
       continue;
     }
     if (prev.status === 'done' || prev.status === 'ignored') continue; // 终态不动
@@ -676,7 +773,11 @@ export function mergeFollowUps(existing, candidates, { now = new Date(), replied
    * 折叠带用户状态搬迁（见 foldGroup 注释），所以"已标记完成/稍后/忽略"不会被弄丢。
    * 计数按折叠**之后**的实际结果算，返回值才与用户看到的列表一致。
    */
-  const foldedResult = foldSimilarCommitments(Object.values(map));
+  /*
+   * 写回前**跨来源**折一次：历史遗留的重复（同一场会被同线程的多封邮件各抽一条）
+   * 会在下一次扫描时就地收敛，不需要用户手工清理。折叠带状态搬迁，终态不会丢。
+   */
+  const foldedResult = foldSimilarCommitments(Object.values(map), { acrossSources: true });
   map = {};
   for (const f of foldedResult.items) {
     const id = f.id || `${f.kind}_${String(f.sourceKey).replace(/[^a-zA-Z0-9:_-]/g, '_')}`;
@@ -689,7 +790,16 @@ export function mergeFollowUps(existing, candidates, { now = new Date(), replied
     if (known.has(`${f.kind}|${f.sourceKey}`)) updatedFinal += 1;
     else createdFinal += 1;
   }
-  return { created: createdFinal, updated: updatedFinal, folded: foldedResult.folded, autoClosed, closed, map };
+  return {
+    created: createdFinal,
+    updated: updatedFinal,
+    folded: foldedResult.folded,
+    /* 因「键变了但其实同一件事」而被并进既有记录的条数（诊断用） */
+    absorbed: absorbedIntoTwin,
+    autoClosed,
+    closed,
+    map,
+  };
 }
 
 /** 从分析记录里收集"已经被回复过"的 messageId（本地线程匹配的唯一依据）。 */

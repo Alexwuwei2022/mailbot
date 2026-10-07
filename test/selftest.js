@@ -3679,6 +3679,67 @@ await test('项目标签：近义标签本地合并（模型并行分批各造�
   assertEqual(mergeSimilarLabel('新项目名', []).name, '新项目名', '没有已有标签时保留原名');
 });
 
+/* -------------------------------------------------- 27. 跟催：终态不被重新列出来 */
+
+await test('跟催：换个说法的同一件事不会把「已完成」重新变成待办', async () => {
+  const { mergeFollowUps } = await import('../server/followup.js');
+  const now = new Date('2026-10-07T00:00:00Z');
+  const due = '2026-09-29T08:00:00.000Z';
+
+  /*
+   * 用户实测的 bug：昨天把「按时参加9月29日…讨论会」标成已完成，
+   * 今天刷新又出现一条同样的待办，而且每扫一次多一条。
+   * 原因是 sourceKey = 草稿id + 标题哈希：模型换个说法、或同一条线程的
+   * 另一封邮件再抽一次，键就变了，于是被当成全新承诺新建了一条 open。
+   */
+  const existing = {
+    a: {
+      id: 'a', kind: 'mine', sourceKey: 'draft:1#aaa', title: '按时参加9月29日综维讨论会',
+      status: 'done', doneAt: '2026-10-01T00:00:00.000Z', dueAt: due, draftId: 'd1',
+    },
+  };
+  const candidates = [
+    {
+      kind: 'mine', sourceKey: 'draft:2#bbb', draftId: 'd2', dueAt: due,
+      title: '按时参加9月29日10:00-17:00的综维超级数字员工及重点任务讨论会',
+    },
+  ];
+  const out = mergeFollowUps(existing, candidates, { now });
+  assertEqual(Object.keys(out.map).length, 1, '同一件事不该变出第二条记录');
+  assertEqual(Object.values(out.map)[0].status, 'done', '用户标过的「已完成」必须保持，不得被重新打开');
+  assertEqual(Object.values(out.map)[0].title, '按时参加9月29日综维讨论会', '不得覆盖用户看过的标题');
+  assert(out.absorbed >= 1, '应记录为并入了既有记录（实际 ' + out.absorbed + '）');
+
+  // 幂等：再扫一次结果不变（不能每扫一次多一条）
+  const again = mergeFollowUps(out.map, candidates, { now });
+  assertEqual(Object.keys(again.map).length, 1, '重复扫描不得增加条目');
+
+  // 反例：确实是另一件事（标题与截止时间都不同）必须照常新增
+  const other = mergeFollowUps(out.map, [
+    { kind: 'mine', sourceKey: 'draft:3#ccc', draftId: 'd3', dueAt: '2026-10-20T08:00:00.000Z', title: '提交季度预算复盘材料' },
+  ], { now });
+  assertEqual(Object.keys(other.map).length, 2, '另一件事必须被新增，不能被误并');
+});
+
+await test('跟催：历史遗留的重复会在下次扫描时就地收敛，且终态优先', async () => {
+  const { mergeFollowUps } = await import('../server/followup.js');
+  const now = new Date('2026-10-07T00:00:00Z');
+  const due = '2026-09-28T08:00:00.000Z';
+  /*
+   * 模拟用户表里已经堆起来的三条近义记录（来自三封不同邮件），其中一条是终态。
+   * 折叠时必须收敛成一条，并且**保留终态**——否则用户会以为"我明明标记过"。
+   */
+  const existing = {
+    x: { id: 'x', kind: 'mine', sourceKey: 'draft:1#a1', title: '按附件2规范编制停机场景端到端链路图及业编系统两图两表', status: 'open', dueAt: due, draftId: 'd1' },
+    y: { id: 'y', kind: 'mine', sourceKey: 'draft:2#a2', title: '按附件2规范编制停机场景端到端链路图及业编系统「两图两表」', status: 'done', doneAt: '2026-10-02T00:00:00.000Z', dueAt: due, draftId: 'd2' },
+    z: { id: 'z', kind: 'mine', sourceKey: 'draft:3#a3', title: '按附件2规范编制停机场景端到端链路图及业编系统两图两表', status: 'open', dueAt: due, draftId: 'd3' },
+  };
+  const out = mergeFollowUps(existing, [], { now });
+  assertEqual(Object.keys(out.map).length, 1, '三条近义记录应收敛成一条（实际 ' + Object.keys(out.map).length + '）');
+  assertEqual(Object.values(out.map)[0].status, 'done', '收敛后必须保留终态，不得把「已完成」降级');
+  assert(out.folded >= 2, '应报告折叠掉至少两条（实际 ' + out.folded + '）');
+});
+
 /* ------------------------------------------------------------ 收尾 */
 
 await imap.close();
