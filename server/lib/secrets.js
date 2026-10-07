@@ -320,14 +320,19 @@ const dpapiBackend = {
 /* ------------------------------------------------------------------ 后端：macOS 钥匙串 */
 
 /**
- * 测试专用：把钥匙串后端**钉到一个临时钥匙串**上（命令末尾显式带上它）。
+ * 测试专用：把钥匙串后端**钉到一个临时钥匙串**上（每条 `security` 命令都显式带上它）。
  *
  * 为什么需要这么个钩子：真机用例必须用临时钥匙串，绝不能碰用户的登录钥匙串。
- * 而"把临时钥匙串设成默认钥匙串 / 改搜索列表"动的是**全局机器状态**——
- * 进程要是被强杀，用户机器的默认钥匙串就被换走了。钉住之后每条命令只认这一个
- * 钥匙串文件，默认值与搜索列表一个字都不用动，登录钥匙串压根不在搜索范围内。
+ * 钉住之后命令只认这一个钥匙串文件，默认值一个字都不用动。
  *
- * **生产路径不受影响**：没钉住时（默认 null）命令里不带钥匙串参数，与以前一字不差。
+ * ⚠️ 但"钉住"对**读取**并不天然成立：`security find-*` 的裸路径位置参数是
+ * 「先在搜索列表里找，找不到才拿这个路径兜底」的语义，所以读取是否真落到临时钥匙串
+ * 取决于搜索列表。因此这里把查询拆成 `queryArgs()`（用 `-k <钥匙串>` 显式指定，不做兜底），
+ * 写入仍用 `args()`（`add-generic-password` 的位置参数是明确的写入目标）。
+ * 测试那边还会先探一次，探不通就往搜索列表里**追加**临时钥匙串并在 finally 严格还原
+ * （见 test/secrets-platform.js 的 macOS 用例）——两件事都要做，才谈得上"隔离"。
+ *
+ * **生产路径不受影响**：没钉住时（默认 null）读写的参数与以前一字不差。
  */
 let keychainPath = null;
 export function __setKeychainPathForTest(file) {
@@ -340,16 +345,41 @@ const keychainBackend = {
   encrypted: true,
   detail: '由系统钥匙串保管；换机器需要重新填授权码',
   available: () => process.platform === 'darwin' && which('security'),
-  /** 拼钥匙串参数：`security` 的钥匙串是位置参数，钉住时追加在末尾 */
+  /** 拼钥匙串参数：`security` 的位置参数形式（`set-key-partition-list` 等用） */
   args(list) {
     return keychainPath ? [...list, keychainPath] : list;
   },
+  /**
+   * 拼**查询**类命令的参数。
+   *
+   * 与 `args()` 的区别只在钉住时：查询走 `-k <钥匙串>` 这个显式选项，而不是把路径摆成
+   * 位置参数。原因是 `security find-*` 的裸路径位置参数语义是「先在搜索列表里找，找不到
+   * 再拿这个路径兜底」——读取是否真的落到这个钥匙串**取决于搜索列表**。用 `-k` 则把
+   * 「到这个钥匙串里找」写死在命令行上，写入/读取两侧完全对称，测试里"钉住即隔离"的
+   * 前提才真正成立（详见 test/secrets-platform.js 里 macOS 用例的注释）。
+   */
+  queryArgs(list) {
+    return keychainPath ? [...list, '-k', keychainPath] : list;
+  },
   read() {
-    const res = run('security', this.args(['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w']));
+    const res = run('security', this.queryArgs(['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w']));
     // 44 = errSecItemNotFound：没存过，不算错误
     if (!res.ok && (res.status === 44 || /could not be found/i.test(res.message))) return { ok: true, value: null };
-    if (!res.ok) return { ok: false, code: 'KEYCHAIN_READ_FAILED', message: res.message };
-    return { ok: true, value: res.stdout };
+    if (!res.ok) {
+      return {
+        ok: false,
+        code: 'KEYCHAIN_READ_FAILED',
+        message: res.message,
+        // 原样带回 `security` 的原始输出与退出码：失败信息要能自证，不能只留一句"读不到"
+        evidence: { status: res.status, stdout: res.stdout, stderr: res.stderr, keychain: keychainPath },
+      };
+    }
+    /*
+     * 成功也要留下退出码证据：macOS 上"退出码 0 但输出为别的条目/空串"这类情况
+     * （搜索列表兜底、条目被别的东西覆盖）只有原始输出能看出来。
+     * 注意**不记录写入路径里的 argv**（那里可能带明文密钥），只记录查询命令的原始输出。
+     */
+    return { ok: true, value: res.stdout, evidence: { status: res.status, stdout: res.stdout, stderr: res.stderr, keychain: keychainPath } };
   },
   write(dataDir, plaintext) {
     /*
@@ -358,15 +388,24 @@ const keychainBackend = {
      * 但这点在文档里如实写明，不假装没有。
      */
     const res = run('security', this.args(['add-generic-password', '-U', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w', plaintext]));
-    if (!res.ok) return { ok: false, code: 'KEYCHAIN_WRITE_FAILED', message: res.message };
-    return { ok: true };
+    /*
+     * 失败证据**只带退出码**，不带 stdout/stderr：这条命令的原始输出在异常情况下可能回显
+     * 命令行（里含明文）。写失败时退出码 + 随后的查询证据已经足够定位。
+     */
+    if (!res.ok) return { ok: false, code: 'KEYCHAIN_WRITE_FAILED', message: res.message, evidence: { status: res.status, keychain: keychainPath } };
+    return { ok: true, evidence: { status: res.status, keychain: keychainPath } };
   },
   clear() {
     const res = run('security', this.args(['delete-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot']));
     if (!res.ok && !/could not be found/i.test(res.message)) {
-      return { ok: false, code: 'KEYCHAIN_CLEAR_FAILED', message: res.message };
+      return {
+        ok: false,
+        code: 'KEYCHAIN_CLEAR_FAILED',
+        message: res.message,
+        evidence: { status: res.status, stdout: res.stdout, stderr: res.stderr, keychain: keychainPath },
+      };
     }
-    return { ok: true };
+    return { ok: true, evidence: { status: res.status, keychain: keychainPath } };
   },
 };
 
@@ -540,8 +579,8 @@ export function readVault(mode, { dataDir, force = false } = {}) {
 
   const res = backend.read(dataDir);
   const out = res.ok
-    ? { ok: true, backend: backendId, data: res.value || null }
-    : { ok: false, backend: backendId, error: res.message, code: res.code };
+    ? { ok: true, backend: backendId, data: res.value || null, evidence: res.evidence || null }
+    : { ok: false, backend: backendId, error: res.message, code: res.code, evidence: res.evidence || null };
   cache.set(backendId, out);
   return out;
 }
@@ -559,7 +598,9 @@ export function writeVault(mode, { dataDir }, data) {
   if (!backend) return { ok: false, backend: backendId, error: `未知的密钥保管后端：${backendId}` };
   const res = backend.write(dataDir, data);
   cache.delete(backendId);
-  return res.ok ? { ok: true, backend: backendId } : { ok: false, backend: backendId, error: res.message, code: res.code };
+  return res.ok
+    ? { ok: true, backend: backendId, evidence: res.evidence || null }
+    : { ok: false, backend: backendId, error: res.message, code: res.code, evidence: res.evidence || null };
 }
 
 export function clearVault(mode, { dataDir }) {
@@ -569,7 +610,9 @@ export function clearVault(mode, { dataDir }) {
   if (!backend) return { ok: false, backend: backendId, error: `未知的密钥保管后端：${backendId}` };
   const res = backend.clear(dataDir);
   cache.delete(backendId);
-  return res.ok ? { ok: true, backend: backendId } : { ok: false, backend: backendId, error: res.message, code: res.code };
+  return res.ok
+    ? { ok: true, backend: backendId, evidence: res.evidence || null }
+    : { ok: false, backend: backendId, error: res.message, code: res.code, evidence: res.evidence || null };
 }
 
 /* ------------------------------------------------------------------ 打包 / 解包 */

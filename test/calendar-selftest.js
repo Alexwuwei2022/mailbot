@@ -13,6 +13,8 @@ import { fileURLToPath } from 'node:url';
 
 import { listenRandom } from './lib/port.js';
 import { makeTempDir } from './lib/tmp.js';
+// 只为"证书材料指纹"这条诊断证据：自签证书每次重签指纹都会变，指纹能区分"复用/重签"
+import { fingerprintOf } from '../server/lib/x509.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const tmpDir = makeTempDir('mailbot-cal-');
@@ -47,8 +49,13 @@ async function test(name, fn) {
   } catch (err) {
     // `fetch` 只说 "fetch failed"，真正原因在 cause 里（详见 fresh-install.js 的同类注释）
     const cause = err?.cause ? ` ← ${err.cause.code || err.cause.name || ''} ${err.cause.message || err.cause}` : '';
-    failures.push({ name, message: (err?.stack || String(err)) + cause });
-    console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}`);
+    /*
+     * 带 `diagnostic` 的错误（HTTPS/TLS 那类网络用例）把现场证据序列化进去。
+     * 目的只有一个：失败信息在 CI 日志里要能自证——**判定一个字都没放宽**。
+     */
+    const diag = err?.diagnostic ? `\n      诊断=${JSON.stringify(err.diagnostic)}` : '';
+    failures.push({ name, message: (err?.stack || String(err)) + cause + diag });
+    console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}${diag}`);
   }
 }
 function assert(cond, msg) {
@@ -3692,6 +3699,154 @@ await test('隐私：仅本地模式硬拦非本机模型地址，/api/egress �
   }
 });
 
+/* -------------------------------------------------- HTTPS / TLS 诊断（只加证据，不改判定） */
+
+/**
+ * 这一组函数**不放松任何断言**，只负责在失败时把"到底是什么失败了"讲清楚。
+ *
+ * 背景：CI 上 `ubuntu/20` 走过一次「启用 HTTPS 后真的走 TLS」的红，而同矩阵的
+ * `ubuntu/22`、`ubuntu/20+TZ` 同一条用例是绿的——典型的端口/TLS 抖动。可在日志里
+ * 只能看到用例名，看不到**确切的 URL、底层 error 与 error.cause**，于是既没法确认
+ * 是抖动，也没法排除真问题。这里的唯一目标：**下次再红，失败信息自解释**。
+ */
+
+/** 一行化 + 截断：诊断信息要能塞进断言消息里，又不能把日志冲成一片 */
+function clipText(text, n = 400) {
+  const s = String(text ?? '').replace(/\s*\n\s*/g, ' ⏎ ');
+  return s.length > n ? `${s.slice(0, n)}…(共 ${s.length} 字符)` : s;
+}
+
+/** 收集 `data/tls` 下的证书材料指纹（列表本身也是证据：能看出是不是复用/重签了证书） */
+function certFileFacts(dataDir) {
+  const dir = `${dataDir}/tls`;
+  let names = [];
+  try {
+    names = fs.readdirSync(dir);
+  } catch {
+    names = [];
+  }
+  return names.map((name) => {
+    const p = `${dir}/${name}`;
+    let sha256 = null;
+    let error = null;
+    try {
+      sha256 = fingerprintOf(fs.readFileSync(p));
+    } catch (err) {
+      error = err?.message || String(err);
+    }
+    return { path: p, sha256, error };
+  });
+}
+
+/** 把"此时用例所在的机器/网络上下文"记下来：失败往往只发生在某些内核/Node 组合上 */
+function netDiagContext(extra = {}) {
+  return {
+    node: process.version,
+    platform: `${process.platform}/${process.arch}`,
+    libc: process.report?.getReport?.().header?.glibcVersionRuntime || null,
+    tz: process.env.TZ || null,
+    trustedEnv: {
+      NODE_EXTRA_CA_CERTS: process.env.NODE_EXTRA_CA_CERTS || null,
+      HTTPS_PROXY: process.env.HTTPS_PROXY || process.env.https_proxy || null,
+      HTTP_PROXY: process.env.HTTP_PROXY || process.env.http_proxy || null,
+      NO_PROXY: process.env.NO_PROXY || process.env.no_proxy || null,
+    },
+    ...extra,
+  };
+}
+
+/** 展开 error 链：`fetch`/`https` 常常只在 cause 里说真话 */
+function errorChain(err) {
+  if (!err) return null;
+  const out = [{ message: err.message, code: err.code || null, name: err.name || null }];
+  let cur = err.cause;
+  let depth = 0;
+  while (cur && depth < 5) {
+    out.push({ message: cur.message, code: cur.code || null, name: cur.name || null });
+    cur = cur.cause;
+    depth += 1;
+  }
+  return out;
+}
+
+/**
+ * 任何"网络调用没按预期完成"的地方都用它包一层错误。
+ *
+ * `extra` 里带**确切的 URL**，以及临时端口、证书文件与指纹、socket 的 local/remote、
+ * 代理与环境变量、Node 版本与平台——这些正是"抖动"与"真缺陷"唯一能分辨的地方。
+ */
+function tlsFail(target, err, extra = {}) {
+  const detail = {
+    phase: '网络调用失败',
+    target,
+    error: err ? String(err.message || err) : '(无 error 对象)',
+    errorChain: errorChain(err),
+    ...extra,
+    context: netDiagContext(extra.context || {}),
+  };
+  const e = new Error(`【HTTPS 诊断】${target} 未按预期完成：${detail.error}；详情=${JSON.stringify(detail)}`);
+  e.diagnostic = detail;
+  return e;
+}
+
+/** 断言失败时同样要把证据带上（断言本身一个字都没放宽） */
+function tlsAssertFail(target, what, extra = {}) {
+  const detail = { phase: '断言未通过', target, what, ...extra, context: netDiagContext(extra.context || {}) };
+  const e = new Error(`【HTTPS 诊断】${what}（target=${target}）；详情=${JSON.stringify(detail)}`);
+  e.diagnostic = detail;
+  return e;
+}
+
+/**
+ * 在**不等任何响应**的前提下，另起一条 TLS 连接直接读对端证书。
+ *
+ * 为什么不用 `https.request` 的 socket：那条连接的 `getPeerCertificate()` 会因 socket
+ * 状态返回空对象（原用例的注释里记过这个坑）。单独连一次最可靠。
+ *
+ * 失败时抛出的错误里带：确切 URL、底层 error 与 error.cause、from/to 地址、证书文件与指纹。
+ */
+async function tlsPeerCertificate(tlsMod, { host, port, url, certFiles }) {
+  /*
+   * `host` 必须是**具体的主机名/IP**：`tls.connect({ host: undefined })` 会在 Node 内部
+   * 解析地址时抛 `Cannot read properties of undefined (reading 'join')`——一个和 TLS 毫无
+   * 关系的报错，排查成本极高（本文件的诊断 helper 第一次跑就是这么炸的）。
+   * 所以这里显式兜底，并且把"兜底发生了"也写进证据。
+   */
+  const hostResolved = host || '127.0.0.1';
+  const hostSource = host ? 'caller' : 'fallback(127.0.0.1：调用方没给 host)';
+  return new Promise((resolve, reject) => {
+    let sock = null;
+    try {
+      sock = tlsMod.connect({ host: hostResolved, port, rejectUnauthorized: false }, () => {
+        let cert = {};
+        try {
+          cert = sock.getPeerCertificate() || {};
+        } catch (err) {
+          reject(tlsFail(`tls.connect ${hostResolved}:${port}`, err, { phase: '读对端证书失败', url, certFiles }));
+          return;
+        }
+        const facts = {
+          url,
+          requested: { host: hostResolved, hostSource, port },
+          local: sock.localAddress ? `${sock.localAddress}:${sock.localPort}` : null,
+          remote: sock.remoteAddress ? `${sock.remoteAddress}:${sock.remotePort}` : null,
+          tlsVersion: sock.getProtocol ? sock.getProtocol() : null,
+          cipher: sock.getCipher ? sock.getCipher()?.name || null : null,
+          authorized: sock.authorized,
+          authorizationError: sock.authorizationError || null,
+          certFiles,
+        };
+        sock.end();
+        resolve({ cert, facts });
+      });
+    } catch (err) {
+      reject(tlsFail(`tls.connect ${hostResolved}:${port}`, err, { url, certFiles }));
+      return;
+    }
+    sock.on('error', (err) => reject(tlsFail(`tls.connect ${hostResolved}:${port} 的 TLS 握手`, err, { url, certFiles })));
+  });
+}
+
 await test('安全：启用 HTTPS 后真的走 TLS，Cookie 变 Secure，且报告指纹', async () => {
   const fs = await import('node:fs');
   const https = await import('node:https');
@@ -3704,11 +3859,30 @@ await test('安全：启用 HTTPS 后真的走 TLS，Cookie 变 Secure，且报�
   const cfgFile = getPaths().configFile;
   const before = fs.readFileSync(cfgFile, 'utf8');
   const dataDir = getPaths().dataDir;
+  /*
+   * 诊断用的"现场上下文"。全部**只读**，不改变任何断言与行为。
+   * 尤其是 `certFiles`：里面有证书与私钥的路径、SHA-256 指纹和读取错误——
+   * "端口/TLS 抖动"与"证书本身有问题（半写、复用、重签）"靠它一眼就能分开。
+   */
+  const certFiles = () => certFileFacts(dataDir);
+  let listening = null;
   try {
     saveConfig({ web: { authToken: 'test-token-for-https-check-0123456789', https: { enabled: true, selfSigned: true } } });
-    const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+    const started = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+    const { server, url } = started;
+    // 请求/未捕获错误里都能拿到"确切的 URL"（这是日志里最缺的一条）
+    const diagBase = () =>
+      netDiagContext({
+        url,
+        port: started.port,
+        // 用字面量而不是 `started.host`：这条用例就是连回环地址，缺省值必须写死
+        host: '127.0.0.1',
+        pid: process.pid,
+        certFiles: certFiles(),
+      });
     try {
       assertIncludes(url, 'https://', '启动地址应按 HTTPS 显示');
+      listening = started;
       assert(fs.existsSync(`${dataDir}/tls/self-signed.crt`), '应生成自签证书文件');
       assert(fs.existsSync(`${dataDir}/tls/self-signed.key`), '应生成私钥文件');
       // 私钥权限要收紧（Windows 上这个位不生效，但代码表达了意图；Linux 上 CI 会真正校验）
@@ -3721,75 +3895,152 @@ await test('安全：启用 HTTPS 后真的走 TLS，Cookie 变 Secure，且报�
       const { port } = new URL(url);
       const agent = new https.Agent({ rejectUnauthorized: false });
       const token = getConfig().web.authToken;
-      const res = await new Promise((resolve, reject) => {
-        const req = https.request(`${url}/api/meta`, { agent, headers: { 'x-mailbot-token': token } }, (r) => {
-          const chunks = [];
-          r.on('data', (c) => chunks.push(c));
-          r.on('end', () => resolve({ status: r.statusCode, headers: r.headers, text: Buffer.concat(chunks).toString('utf8') }));
+      /** 每个请求都包一层：**只把失败讲清楚**，不改超时、不加重试、不放宽断言 */
+      const requestOnce = (target, options, body) =>
+        new Promise((resolve, reject) => {
+          let req = null;
+          try {
+            req = https.request(target, options, (r) => {
+              const chunks = [];
+              r.on('data', (c) => chunks.push(c));
+              r.on('end', () =>
+                resolve({
+                  status: r.statusCode,
+                  headers: r.headers,
+                  // Cookie 必须原样留下：曾经这里只留了 h['set-cookie']，结果"登录没拿到 Cookie"
+                  // 直接报成一句 `undefined.join` —— 排查要从"用例是不是被限速了"重新猜一遍
+                  setCookie: r.headers['set-cookie'] || null,
+                  text: Buffer.concat(chunks).toString('utf8'),
+                }),
+              );
+            });
+          } catch (err) {
+            reject(tlsFail(`https.request ${target}`, err, { phase: '构造请求时抛错', ...diagBase() }));
+            return;
+          }
+          req.on('error', (err) => reject(tlsFail(`https.request ${target}`, err, { phase: '请求/响应阶段出错', ...diagBase() })));
+          if (body !== undefined) req.write(body);
+          req.end();
         });
-        req.on('error', reject);
-        req.end();
-      });
-      assertEqual(res.status, 200, 'HTTPS 请求应成功');
+      const res = await requestOnce(`${url}/api/meta`, { agent, headers: { 'x-mailbot-token': token } });
+      assertEqual(res.status, 200, `HTTPS 请求应成功（target=${url}/api/meta）；详情=${JSON.stringify({ status: res.status, body: clipText(res.text, 300), ...diagBase() })}`);
       // HSTS 只在真的走 HTTPS 时才发（HTTP 下发它会把用户困在打不开的地址上）
-      assert(res.headers['strict-transport-security'], 'HTTPS 下应发送 HSTS');
+      assert(
+        res.headers['strict-transport-security'],
+        `HTTPS 下应发送 HSTS（target=${url}/api/meta）；详情=${JSON.stringify({ headers: res.headers, ...diagBase() })}`,
+      );
 
       /*
        * 证书里必须有 SAN——没有 SAN 的证书现代浏览器直接判为不匹配。
        * 用 `tls.connect` 直接读对端证书：在 HTTPS 响应的 socket 上取
        * `getPeerCertificate()` 会因 socket 状态而返回空对象（这一点我踩过）。
+       * 连接本身失败时，`tlsPeerCertificate` 会把确切 URL、error.cause、from/to 与证书指纹全带上。
        */
       const tlsMod = await import('node:tls');
-      const peer = await new Promise((resolve, reject) => {
-        const sock = tlsMod.connect({ host: '127.0.0.1', port: Number(port), rejectUnauthorized: false }, () => {
-          const cert = sock.getPeerCertificate();
-          sock.end();
-          resolve(cert);
-        });
-        sock.on('error', reject);
-      });
-      assertIncludes(peer.subjectaltname || '', '127.0.0.1', '自签证书的 SAN 必须覆盖回环地址');
-      assertIncludes(peer.subjectaltname || '', 'DNS:localhost', '自签证书的 SAN 应含 localhost');
+      const peerOut = await tlsPeerCertificate(tlsMod, { host: '127.0.0.1', port: Number(port), url, certFiles: certFiles() });
+      const peer = peerOut.cert;
+      assertIncludes(
+        peer.subjectaltname || '',
+        '127.0.0.1',
+        `自签证书的 SAN 必须覆盖回环地址；详情=${JSON.stringify({ subjectaltname: peer.subjectaltname || '', ...peerOut.facts, ...diagBase() })}`,
+      );
+      assertIncludes(
+        peer.subjectaltname || '',
+        'DNS:localhost',
+        `自签证书的 SAN 应含 localhost；详情=${JSON.stringify({ subjectaltname: peer.subjectaltname || '', ...peerOut.facts, ...diagBase() })}`,
+      );
 
       // HTTPS 下会话 Cookie 必须带 Secure（否则明文回退时会被一起发出去）
-      const login = await new Promise((resolve, reject) => {
-        const req = https.request(
-          `${url}/api/session`,
-          { agent, method: 'POST', headers: { 'content-type': 'application/json' } },
-          (r) => {
-            r.resume();
-            resolve({ status: r.statusCode, setCookie: r.headers['set-cookie'] || '' });
-          },
-        );
-        req.on('error', reject);
-        req.write(JSON.stringify({ token: getConfig().web.authToken }));
-        req.end();
-      });
-      assertEqual(login.status, 200, 'HTTPS 下登录应成功');
-      assertIncludes(login.setCookie.join(';'), 'Secure', 'HTTPS 下会话 Cookie 必须带 Secure');
+      /*
+       * 登录请求发出去之前，先把"我们打算用哪个令牌"记下来。
+       *
+       * 理由是这一次实测踩到的：某个偶发失败里 `login.status` 是 200 但**完全没有
+       * set-cookie**（服务端在 `web.authToken` 为空时会直接回"无需登录"，不带 Cookie）。
+       * 于是 `.join()` 报了一句和 TLS 毫无关系的 `Cannot read properties of undefined`。
+       * 把令牌长度与请求体长度一并留证，下次再看就能直接分辨"令牌为空 / 令牌不一致 / 被限速"。
+       */
+      const loginToken = String(getConfig().web.authToken || '');
+      const loginBody = JSON.stringify({ token: loginToken });
+      const login = await requestOnce(
+        `${url}/api/session`,
+        { agent, method: 'POST', headers: { 'content-type': 'application/json' } },
+        loginBody,
+      );
+      assertEqual(
+        login.status,
+        200,
+        `HTTPS 下登录应成功（target=${url}/api/session）；详情=${JSON.stringify({
+          status: login.status,
+          setCookie: login.setCookie,
+          retryAfter: login.headers?.['retry-after'] || null,
+          tokenLen: loginToken.length,
+          requestBodyLen: loginBody.length,
+          body: clipText(login.text, 300),
+          ...diagBase(),
+        })}`,
+      );
+      assert(
+        Array.isArray(login.setCookie) && login.setCookie.length > 0,
+        `HTTPS 下登录必须带回会话 Cookie（这不是"Cookie 少带 Secure"，是压根没拿到）；详情=${JSON.stringify({
+          status: login.status,
+          setCookie: login.setCookie,
+          headers: login.headers,
+          tokenLen: loginToken.length,
+          requestBodyLen: loginBody.length,
+          body: clipText(login.text, 300),
+          ...diagBase(),
+        })}`,
+      );
+      assertIncludes(
+        (login.setCookie || []).join(';'),
+        'Secure',
+        `HTTPS 下会话 Cookie 必须带 Secure；详情=${JSON.stringify({ status: login.status, setCookie: login.setCookie, ...diagBase() })}`,
+      );
 
       // /api/security 要能报告出证书来源与指纹
       // （注意：这里不能直接用 fetch——自签证书会让它抛 DEPTH_ZERO_SELF_SIGNED_CERT，
       //   这正是我们要的行为，所以测试里显式用一个关掉校验的 agent）
-      const httpsGetJson = (path, token2) =>
-        new Promise((resolve, reject) => {
-          const req = https.request(`${url}${path}`, { agent, headers: { 'x-mailbot-token': token2 } }, (r) => {
-            const chunks = [];
-            r.on('data', (c) => chunks.push(c));
-            r.on('end', () => resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))));
-          });
-          req.on('error', reject);
-          req.end();
-        });
-      const sec = await httpsGetJson('/api/security', token);
-      assertEqual(sec.https, true, '应报告已启用 HTTPS');
-      assertEqual(sec.tls.selfSigned, true, '应标明这是自签证书');
-      assert(/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(sec.tls.fingerprint256 || ''), `指纹格式应正确（实际 ${sec.tls?.fingerprint256}）`);
+      const httpsGetJson = async (path, token2, label) => {
+        const r = await requestOnce(`${url}${path}`, { agent, headers: { 'x-mailbot-token': token2 } });
+        try {
+          return JSON.parse(r.text);
+        } catch (err) {
+          throw tlsFail(`${url}${path}`, err, { phase: `${label}：响应不是 JSON`, httpStatus: r.status, body: clipText(r.text, 400), ...diagBase() });
+        }
+      };
+      const sec = await httpsGetJson('/api/security', token, '读安全报告');
+      assertEqual(sec.https, true, `应报告已启用 HTTPS；详情=${JSON.stringify({ sec: clipText(JSON.stringify(sec), 500), ...diagBase() })}`);
+      assertEqual(sec.tls?.selfSigned, true, `应标明这是自签证书；详情=${JSON.stringify({ tls: sec.tls, ...diagBase() })}`);
+      assert(
+        /^([0-9A-F]{2}:){31}[0-9A-F]{2}$/.test(sec.tls?.fingerprint256 || ''),
+        `指纹格式应正确（实际 ${sec.tls?.fingerprint256}）；详情=${JSON.stringify({ tls: sec.tls, certFiles: certFiles(), ...diagBase() })}`,
+      );
       const httpsCheck = (sec.checks || []).find((c) => /HTTPS/.test(c.title));
-      assert(httpsCheck && httpsCheck.level === 'warn', '自签证书应被标为"注意"而不是"正常"（浏览器会警告）');
+      assert(
+        httpsCheck && httpsCheck.level === 'warn',
+        `自签证书应被标为"注意"而不是"正常"（浏览器会警告）；详情=${JSON.stringify({ checks: sec.checks || [], ...diagBase() })}`,
+      );
     } finally {
       await new Promise((r) => server.close(r));
     }
+  } catch (err) {
+    /*
+     * 外层兜底：上面每个 await 点都已经带上了诊断，但"服务根本没起来"这类失败发生在
+     * 那些点之前（例如 listen 失败、证书生成失败）。这里补上同样的现场信息，
+     * 并且**原样保留 error 与 error.cause**（`fetch`/`net` 常常只在 cause 里说真话）。
+     */
+    err.diagnostic = {
+      phase: '用例整体失败（起点/收尾阶段）',
+      url: listening?.url || null,
+      listening: listening ? { port: listening.port, host: listening.host } : null,
+      error: String(err?.message || err),
+      errorChain: errorChain(err),
+      // 前几帧调用栈：没有它，"xxx 不是函数 / xxx 是 undefined"这类报错无从定位
+      stack: String(err?.stack || '').split('\n').slice(0, 6),
+      certFiles: certFiles(),
+      context: netDiagContext({ pid: process.pid }),
+    };
+    throw err;
   } finally {
     fs.writeFileSync(cfgFile, before, 'utf8');
     loadConfig({ rootDir: root, force: true });
