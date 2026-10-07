@@ -343,9 +343,17 @@ function buildTruncationNote({ stats, backfill }) {
      *     不代表已列的少了。
      * 原措辞「上方列表可能不全」把后者说成了前者，用户看到"63 封都列出来了"
      * 却被告知列表可能不全，只会怀疑数据。
+     *
+     * 数字口径：上限（scanLimit）/ 已扫描（scanned）/ 未检查（unscanned）/ 从 IMAP 取到（scanTotal）。
+     * 截断时恒有 `scanned + unscanned === scanTotal`——四个数在文案里一起给出，用户能直接对账
+     * （曾经的缺陷就是只写「已扫描约 250 封」，与预算 800 对不上却看不出问题在哪）。
      */
+    const scanned = backfill.scanned ?? 0;
+    const unscanned = backfill.unscanned ?? 0;
+    const limit = backfill.scanLimit ? `上限 ${backfill.scanLimit} 封，` : '';
+    const total = backfill.scanTotal ? `从 IMAP 取到 ${backfill.scanTotal} 封 UID，` : '';
     lines.push(
-      `本次信封扫描达到上限（已扫描约 ${backfill.scanned ?? 0} 封，另有约 ${backfill.unscanned ?? 0} 封未检查）。` +
+      `本次信封扫描达到上限（${limit}${total}已扫描约 ${scanned} 封，另有约 ${unscanned} 封未检查）。` +
         `**上方列表是完整的**（来自本地已分析记录）；未检查的那部分只可能带来**额外的**命中，` +
         `不影响已列出的结果。如需确认，请缩小时间范围（例如按月分次查询）后重试。`,
     );
@@ -774,6 +782,8 @@ export async function searchEmails({ query, instanceId, now = new Date(), limit,
             envelopeReused: !!backfill.envelopeReused,
             scanned: backfill.scanned || 0,
             unscanned: backfill.unscanned || 0,
+            /** 本次从 IMAP 取到的 UID 总数；截断时 scanned + unscanned === scanTotal */
+            scanTotal: backfill.scanTotal || 0,
             scanLimit: backfill.scanLimit || 0,
             failed: !!backfill.failed,
             errors: backfill.errors || [],

@@ -62,6 +62,17 @@ function assertIncludes(hay, needle, msg) {
 }
 
 /**
+ * 从「本次信封扫描达到上限……」的界面文案里抠出「已扫描 / 未检查」两个数。
+ *
+ * 这样断言的就是**用户真正看到的数字**，而不是只看返回值：本次缺陷正是文案里的数
+ * （250 / 1476）与预算（800）对不上，只查返回值会漏掉文案与数据不一致这类问题。
+ */
+function parseScanNumbers(note) {
+  const m = /已扫描约 (\d+) 封，另有约 (\d+) 封未检查/.exec(String(note || ''));
+  return m ? { scanned: Number(m[1]), unscanned: Number(m[2]) } : null;
+}
+
+/**
  * 删除临时目录。Windows 上刚写过的文件偶尔还被句柄占着（EPERM），
  * 直接 rmSync 会让「清理失败」变成一个和被测逻辑无关的假失败，因此这里容忍并重试。
  */
@@ -2061,6 +2072,21 @@ await test('检索列表：信封扫描达到上限时明确暴露「还有更�
     assertIncludes(out.truncationNote, '信封扫描达到上限', '结论文案应明确说明扫描被截断');
     assertIncludes(out.truncationNote, '上方列表是完整的', '应说明列表上方列表是完整的');
     assertIncludes(out.truncationNote, '缩小时间范围', '应给出可执行的建议');
+    // 上限口径：scanned <= envelopeScanMax=50，且「已扫描 + 未检查 = 从 IMAP 取到的 UID 总数」
+    assertEqual(out.stats.backfill.scanLimit, 50, '信封上限应等于配置的 envelopeScanMax=50');
+    assertEqual(out.stats.backfill.scanned, 50, `显式把上限设成 50 时应恰好扫 50 封（实际 ${out.stats.backfill.scanned}）`);
+    assertEqual(out.stats.backfill.scanTotal, 120, '从 IMAP 应取到 120 封 UID（邮箱里就这么多）');
+    assertEqual(
+      out.stats.backfill.scanned + out.stats.backfill.unscanned,
+      out.stats.backfill.scanTotal,
+      '已扫描 + 未检查 必须等于从 IMAP 取到的 UID 总数（三数自洽）',
+    );
+    const capShown = parseScanNumbers(out.truncationNote);
+    assert(capShown, `截断文案应同时给出「已扫描」与「未检查」两个数（实际：${out.truncationNote}）`);
+    assertEqual(capShown.scanned, out.stats.backfill.scanned, '文案里的已扫描数应与返回值一致');
+    assertEqual(capShown.unscanned, out.stats.backfill.unscanned, '文案里的未检查数应与返回值一致');
+    assertIncludes(out.truncationNote, '上限 50 封', '文案应写明生效的上限');
+    assertIncludes(out.truncationNote, '从 IMAP 取到 120 封 UID', '文案应写明取到的 UID 总数');
     // 模型额度没有被放大：仍然受 backfillMax=5 约束
     assert(out.stats.backfill.analyzed <= 5, `模型分析量应仍受回补额度约束（实际 ${out.stats.backfill.analyzed}）`);
     // 列表不能缺：没有花额度分析的那部分邮件也要列出来，并标明「仅信封」
@@ -2079,6 +2105,135 @@ await test('检索列表：信封扫描达到上限时明确暴露「还有更�
     loadConfig({ rootDir: root, force: true });
     rmTempDir(scratch);
     await capImap.close();
+  }
+});
+
+/**
+ * 信封扫描预算：默认配置（`backfillMax=40`、`envelopeScanMax=3000`）下预算应为
+ * `min(3000, max(40*8, 600)) = 600` 封。
+ *
+ * 回归背景（用户实测）：候选 1726 封时界面却报「已扫描约 250 封，另有约 1476 封未检查」——
+ * 250 正好是单批 `ENVELOPE_BATCH`，而不是预算 800：第一批拉完就误判「到上限」，扫描提前终止，
+ * 后面 1476 封永远不会被检查。这里用 700 封候选把默认情形钉死：必须真的扫满 600 封，
+ * 且「上限 / 已扫描 / 未检查 / 取到的 UID 总数」四个数在返回值与界面文案里都对得上。
+ */
+await test('检索列表：默认信封预算下候选超过 600 时真的扫满 600 封（不再停在单批 250）', async () => {
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { searchEmails } = await import('../server/ai/search.js');
+  const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
+
+  /** 候选数（全部是同一位发件人、全部落在检索时间范围内，保证「候选」=「取到的 UID」） */
+  const CANDIDATES = 700;
+  const BACKFILL_MAX = 40;
+  const ENVELOPE_CAP = 3000;
+  /* 与 backfill.js 的口径一致：max(budget*8, 600) 再被 envelopeScanMax 封顶 */
+  const expectedScan = Math.min(ENVELOPE_CAP, Math.max(BACKFILL_MAX * 8, 600));
+
+  const messages = [];
+  for (let i = 0; i < CANDIDATES; i += 1) {
+    // 7/02 ~ 9/19（都在「7 月以来」的范围内），循环取模避免落到范围之外
+    const date = new Date(Date.UTC(2026, 6, 2 + (i % 80), 2));
+    messages.push({
+      uid: 5100 + i,
+      raw: mailMocks.makeRawMail({
+        subject: `信封预算验证 ${i}`,
+        from: { name: '苏美佳', address: 'sumj1@chinatelecom.cn' },
+        body: `第 ${i} 封`,
+        date,
+        messageId: `<budget-${i}@chinatelecom.cn>`,
+      }),
+      flags: [],
+      internalDate: date.toUTCString(),
+    });
+  }
+  const imap = await mailMocks.startMockImap({ messages });
+  const savedPath = process.env.MAILBOT_DATA_DIR;
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-budget-'));
+  try {
+    process.env.MAILBOT_DATA_DIR = scratch;
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+    const live = getConfig();
+    live.instances = [
+      {
+        id: 'budget',
+        label: '信封预算邮箱',
+        imap: { host: '127.0.0.1', port: imap.port, secure: false, authUser: 'bot@example.com', authPass: 'secret' },
+        smtp: { host: '127.0.0.1', port: 1, secure: false, authUser: 'bot@example.com', authPass: 'secret' },
+        identity: { name: '王磊', email: 'bot@example.com' },
+      },
+    ];
+    live.defaultInstanceId = 'budget';
+    live.calendar.timeZone = TZ;
+    live.llm = { ...live.llm, baseUrl: llm.baseUrl, apiKey: 'test', model: 'mock', maxRetries: 1 };
+    // 默认值：回补额度 40，信封上限 3000
+    live.search = { backfillMax: BACKFILL_MAX, envelopeScanMax: ENVELOPE_CAP };
+    store.loadState({ force: true });
+    store.persistState({ prune: false });
+    saveConfig(maskConfig(getConfig()));
+
+    const out = await searchEmails({
+      query: '请分析7月份以来，sumj1@chinatelecom.cn 发给我的邮件',
+      instanceId: 'budget',
+      now: NOW,
+    });
+
+    assertEqual(expectedScan, 600, '默认口径应给出 600 封信封预算');
+    assertEqual(out.stats.backfill?.attempted, true, '应触发按需回补');
+    assertEqual(out.stats.backfill.scanLimit, expectedScan, `生效上限应为 ${expectedScan} 封`);
+    assertEqual(
+      out.stats.backfill.scanned,
+      expectedScan,
+      `候选 ${CANDIDATES} 封时应真的扫满 ${expectedScan} 封（实际 ${out.stats.backfill.scanned}）`,
+    );
+    assert(out.stats.backfill.scanned > 250, `不得停在单批 ENVELOPE_BATCH=250 上（实际 ${out.stats.backfill.scanned}）`);
+    assertEqual(out.stats.backfill.scanTotal, CANDIDATES, `应从 IMAP 取到 ${CANDIDATES} 封 UID`);
+    assertEqual(
+      out.stats.backfill.unscanned,
+      CANDIDATES - expectedScan,
+      `未检查数应为「总数 - 已扫描」（实际 ${out.stats.backfill.unscanned}）`,
+    );
+    assertEqual(
+      out.stats.backfill.scanned + out.stats.backfill.unscanned,
+      out.stats.backfill.scanTotal,
+      '已扫描 + 未检查 必须等于从 IMAP 取到的 UID 总数',
+    );
+    assertEqual(out.stats.backfill.scanTruncated, true, '还剩 100 封没扫到，必须标记截断');
+
+    // 界面文案里的数字必须与返回值一致（用户看到的就是这段话）
+    const shown = parseScanNumbers(out.truncationNote);
+    assert(shown, `截断文案应给出「已扫描」与「未检查」两个数（实际：${out.truncationNote}）`);
+    assertEqual(shown.scanned, expectedScan, '文案里的已扫描数应与返回值一致');
+    assertEqual(shown.unscanned, CANDIDATES - expectedScan, '文案里的未检查数应与返回值一致');
+    assertIncludes(out.truncationNote, `上限 ${expectedScan} 封`, '文案应写明生效上限');
+    assertIncludes(out.truncationNote, `从 IMAP 取到 ${CANDIDATES} 封 UID`, '文案应写明取到的 UID 总数');
+    assertIncludes(out.truncationNote, '信封扫描达到上限', '文案应说明扫描被截断');
+
+    /*
+     * 回归：信封扫描放大**不等于**模型调用放大。
+     * 多扫的 560 封只取了信头（不读正文、不调模型），真正花额度的仍受 backfillMax 约束。
+     */
+    assert(
+      out.stats.backfill.analyzed <= BACKFILL_MAX,
+      `模型分析量必须仍受 backfillMax=${BACKFILL_MAX} 约束（实际 ${out.stats.backfill.analyzed}）`,
+    );
+    assert(
+      out.stats.backfill.fetched <= BACKFILL_MAX,
+      `拉取正文的封数也应受额度约束（实际 ${out.stats.backfill.fetched}）`,
+    );
+    assert(
+      out.stats.backfill.scanned > out.stats.backfill.analyzed,
+      `多扫的是信头而不是模型调用（scanned=${out.stats.backfill.scanned}，analyzed=${out.stats.backfill.analyzed}）`,
+    );
+    // 没花额度的命中仍要列出来（列表完整性不靠放大模型调用换取）
+    assert(out.stats.envelopeOnly > 0, `应列出仅信封命中的邮件（实际 ${out.stats.envelopeOnly}）`);
+  } finally {
+    process.env.MAILBOT_DATA_DIR = savedPath;
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+    rmTempDir(scratch);
+    await imap.close();
   }
 });
 

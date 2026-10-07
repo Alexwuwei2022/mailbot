@@ -171,7 +171,8 @@ export function renderSettings(root, app) {
             numberInput(cfg.search?.envelopeScanMax ?? 3000, (v) => {
               cfg.search = { ...(cfg.search || {}), envelopeScanMax: v };
             }, { min: 50, max: 3000 }),
-            '只读信头（不花模型额度）的扫描上限；命中列表靠它保证完整，达到上限会明确提示「还有邮件未检查到」',
+            '只读信头（不花模型额度）的扫描上限；生效预算 = min(本值, max(回补上限 × 8, 600))——默认 600 封。' +
+              '命中列表靠它保证完整，达到上限会明确提示「还有邮件未检查到」，并给出「已扫描 / 未检查 / 取到的 UID 总数」三个数',
           ),
           field('单次最大处理邮件数', numberInput(cfg.scan.maxMessages, (v) => (cfg.scan.maxMessages = v), { min: 1, max: 2000 })),
           field('扫描文件夹（逗号分隔）', textInput((cfg.scan.folders || []).join(','), (v) => (cfg.scan.folders = v.split(',').map((s) => s.trim()).filter(Boolean)))),

@@ -215,25 +215,36 @@ async function resolveCandidates({ instance, filters, items, client, maxEnvelope
   let scanned = 0;
   let exhausted = false;
   let skipped = 0;
+  /** 请求了信头但服务器没回的 UID 数（少回同样是「没检查到」，必须记账） */
+  let unreturned = 0;
   const errors = [];
   // 待扫描的 UID 总数，用于如实报出「还有多少没扫到」
   const totalUids = [...byFolder.values()].reduce((sum, list) => sum + list.length, 0);
 
   for (const [folder, uidsRaw] of byFolder) {
     const uids = [...uidsRaw];
-    for (let i = 0; i < uids.length; i += ENVELOPE_BATCH) {
-      if (exhausted) {
-        skipped += uids.length - i;
-        break;
-      }
-      // 已经到上限时不再整批拉：只拉到上限为止，剩下的如实计入「未检查」
+    /*
+     * 逐批拉信头。这里有两个必须守住的账（用户实测踩过坑）：
+     *
+     *   1. **只有真的用完 maxEnvelopes 才算截断**。
+     *      旧写法是「本批之后还剩 UID 就判 exhausted」，于是在预算 800、单批 250 时，
+     *      第一批发完就发现「还剩 1476 封」→ 直接判成到上限，实际只扫了 250 封
+     *      （正好等于 ENVELOPE_BATCH），界面上出现「已扫描约 250 封，另有约 1476 封未检查」，
+     *      与预算 800 完全对不上，剩下的邮件永远不会被检查。
+     *      （真实配置：backfillMax=100 → 预算 min(3000, max(100*8, 600)) = 800。）
+     *   2. **游标按「本批实际请求的封数」前进**，不能按固定批量前进：
+     *      否则最后一批被剩余额度截短时，中间那段 UID 既没被请求、也没被记成「未检查」。
+     */
+    let i = 0;
+    while (i < uids.length) {
+      // 额度用尽时不再发多余的 IMAP 请求：剩下的 UID 如实计入「未检查」
       const room = maxEnvelopes - scanned;
-      const batch = uids.slice(i, i + Math.min(ENVELOPE_BATCH, Math.max(0, room)));
-      if (!batch.length) {
+      if (room <= 0) {
         exhausted = true;
         skipped += uids.length - i;
         break;
       }
+      const batch = uids.slice(i, i + Math.min(ENVELOPE_BATCH, room));
       let summaries = [];
       try {
         summaries = await fetchHeaders(instance, { folder, uids: batch, client });
@@ -243,32 +254,52 @@ async function resolveCandidates({ instance, filters, items, client, maxEnvelope
         break;
       }
       scanned += summaries.length;
+      if (summaries.length < batch.length) {
+        // 服务器少回了信头：这部分 UID 既没进 scanned 也没进 skipped，但确实没被检查到。
+        // 单记账，让下面的 truncatedScan 把它也算成「没扫全」，绝不静默少给。
+        unreturned += batch.length - summaries.length;
+        log.warn(`回补：${folder} 请求 ${batch.length} 封信头，服务器只回了 ${summaries.length} 封`);
+      }
       for (const s of summaries) {
         if (!inDateRange(s, filters, timeZone)) continue;
         if (!matchesSender(s, filters.from)) continue;
         matched.push({ ...s, folder });
       }
-      const rest = uids.length - (i + batch.length);
-      if (rest > 0) {
-        // 本批只拉到上限：其余 UID 明确算作未检查（绝不静默）
-        skipped += rest;
-        exhausted = true;
-      } else {
-        onProgress?.({ phase: 'filtering', message: `已扫描 ${scanned} 封头部，命中 ${matched.length} 封` });
-      }
+      i += batch.length;
+      onProgress?.({ phase: 'filtering', message: `已扫描 ${scanned} 封头部，命中 ${matched.length} 封` });
     }
   }
 
   /*
    * 还有多少 UID **没被扫到**。
+   *
+   * 口径（三数必须自洽，用户实测就是数字对不上才发现的）：
+   *   - scanned：真实扫到的信头数（受 maxEnvelopes 约束，绝不会超）；
+   *   - unscanned：`totalUids - scanned`，即没被检查到的 UID 数；
+   *   - 于是**截断时恒有 `scanned + unscanned === totalUids`**。
    * 只有确实还剩 UID 没扫时才算截断——否则会把「一次批量刚好到上限」误报成列表不全。
    */
   const unscanned = Math.max(0, totalUids - scanned, skipped);
-  const truncatedScan = (exhausted || skipped > 0) && unscanned > 0;
+  // 是否因**预算用尽**而停（另一种截断原因是服务器少回信头，由 unreturned 单独记账）
+  const capped = exhausted || skipped > 0;
+  // 拉取失败中断（folder 级 errors）不算「扫描截断」：那属于故障，由 errors /「拉取失败」文案单独说明
+  const truncatedScan = unscanned > 0 && (capped || unreturned > 0);
 
   // 按时间升序返回，便于后续按序分析
   matched.sort((a, b) => new Date(a.date || 0) - new Date(b.date || 0));
-  return { candidates: matched, scanned, unscanned: truncatedScan ? unscanned : 0, scanLimit: maxEnvelopes, exhausted: truncatedScan, errors };
+  return {
+    candidates: matched,
+    scanned,
+    unscanned: truncatedScan ? unscanned : 0,
+    // 从 IMAP 取到的 UID 总数：界面用「上限 / 已扫描 / 未检查 / 取到 N 封 UID」四个数互相印证
+    scanTotal: totalUids,
+    scanLimit: maxEnvelopes,
+    /** 截断原因：预算用尽（capped）/ 服务器少回信头（unreturned>0） */
+    capped,
+    unreturned,
+    exhausted: truncatedScan,
+    errors,
+  };
 }
 
 /**
@@ -410,8 +441,16 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
   }
 
   const budget = config.search?.backfillMax ?? MAX_BACKFILL;
-  // 信封上限：只要扫描能力开着就至少给 600（信封很小），再按回补额度放大，上限 MAX_ENVELOPE_SCAN。
-  // 信封面不花模型额度，因此这里放大是安全的；真正花钱的额度由 budget 卡住。
+  /*
+   * 信封扫描预算（`maxEnvelopes`）——**只读信头、不读正文、不调模型**，所以可以与模型额度解耦：
+   *
+   *   1. 先按回补额度缩放：`budget * 8`（回补越多，越有理由多扫几封信封）；
+   *   2. 再抬到地板 600：默认配置（budget=40 → 320）也至少能扫 600 封信头；
+   *   3. 最后由 `search.envelopeScanMax` 封顶（默认 3000，最小 50）。
+   *
+   * 口径写死在这里，是因为「上限」与「已扫描 / 未检查」两个数必须能被界面对账：
+   * 截断时 `scanned + unscanned === 从 IMAP 取到的 UID 总数`，且 `scanned <= maxEnvelopes`。
+   */
   const envelopeCap = clampNumber(config.search?.envelopeScanMax, 50, MAX_ENVELOPE_SCAN, MAX_ENVELOPE_SCAN);
   const maxEnvelopes = Math.min(envelopeCap, Math.max(budget * 8, 600));
   const llm = new LlmClient(config.llm);
@@ -434,6 +473,7 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
       matched: (cached.candidates || []).length,
       scanned: cached.scanned || 0,
       unscanned: cached.unscanned || 0,
+      scanTotal: cached.scanTotal ?? cached.scanned + (cached.unscanned || 0),
       scanLimit: cached.scanLimit || maxEnvelopes,
       scanTruncated: !!cached.exhausted,
       envelopeReused: true,
@@ -459,7 +499,7 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
     /* ---- 1. 信封级筛选：不读正文、不调模型，能把范围内对得上的邮件全部列出来 ---- */
     let scan = null;
     if (!items.length) {
-      scan = { candidates: [], scanned: 0, unscanned: 0, exhausted: false, errors: [], reused: false };
+      scan = { candidates: [], scanned: 0, unscanned: 0, scanTotal: 0, exhausted: false, errors: [], reused: false };
     } else {
       onProgress?.({ phase: 'filtering', message: `在 ${items.length} 封邮件中筛选信封…` });
       const res = await resolveCandidates({ instance, filters, items, client: imap, maxEnvelopes, timeZone, onProgress });
@@ -480,12 +520,17 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
 
     const allErrors = [...errors, ...(scan.errors || [])];
     const scanTruncated = !!scan.exhausted;
+    /* 三个数一次算清：上限 / 范围内 UID 总数 / 未检查数（截断时 scanned + unscanned === scanTotal） */
+    const scanLimit = scan.scanLimit || maxEnvelopes;
+    const scanTotal = scan.scanTotal ?? (scan.scanned || 0) + (scan.unscanned || 0);
     const envelopeBase = {
       attempted: true,
       matched: candidates.length,
       scanned: scan.scanned || 0,
       unscanned: scan.unscanned || 0,
-      scanLimit: scan.scanLimit || maxEnvelopes,
+      /* 范围内的 UID 总数：与 scanned/unscanned 一起让界面上的数字能对账 */
+      scanTotal,
+      scanLimit,
       scanTruncated,
       envelopeReused: !!scan.reused,
       perFolder,
@@ -510,23 +555,25 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
       candidatesToAnalyze.length > analyzeLimit ? candidatesToAnalyze.slice(-analyzeLimit) : candidatesToAnalyze;
     const failedNote = allErrors.length ? `部分文件夹拉取失败：${allErrors.map((e) => `${e.folder}: ${e.message}`).join('；')}` : '';
 
+    /*
+     * 信封扫描被截断时只走这一处文案，保证四个数与界面上别处出现的数字口径一致：
+     *   上限（scanLimit）/ 已扫描（scanned）/ 未检查（unscanned）/ 从 IMAP 取到（scanTotal），
+     * 且截断时恒有 `scanned + unscanned === scanTotal`、`scanned <= scanLimit`。
+     */
+    const scanCappedNote = `信封扫描达到上限 ${scanLimit} 封：本次从 IMAP 取到 ${scanTotal} 封 UID，已扫描 ${scan.scanned} 封，另有 ${scan.unscanned} 封未检查到（信头扫描不花模型额度，未检查的部分只可能带来额外的命中）。请缩小时间范围后重试。`;
+    // 「服务器少回信头」与「预算到上限」不是一回事，文案分开写：别把服务器故障说成上限
+    const scanUnreturnedNote = `邮箱未返回全部信头：本次从 IMAP 取到 ${scanTotal} 封 UID，已扫描 ${scan.scanned} 封，另有 ${scan.unscanned} 封未检查到。请重试，或缩小时间范围分次查询。`;
+    const truncationNote = scanTruncated ? (scan.capped ? scanCappedNote : scanUnreturnedNote) : '';
+
     if (!toAnalyze.length && !candidates.length) {
       // 范围内没有命中：如实说明，不装作检索过
-      const note =
-        failedNote ||
-        (scanTruncated
-          ? `信封扫描达到上限（约 ${scan.scanned} 封），该范围内还有邮件未检查到，列表可能不全。请缩小时间范围后重试。`
-          : `按需检查后发现该范围内没有符合时间与发件人条件的邮件。`);
+      const note = failedNote || truncationNote || `按需检查后发现该范围内没有符合时间与发件人条件的邮件。`;
       return { ...envelopeBase, fetched: 0, analyzed: 0, failed: 0, truncated: false, note };
     }
 
     if (!toAnalyze.length) {
       // 信封命中全部已在本地分析过：不需要新的模型调用，列表本来就完整
-      const note =
-        failedNote ||
-        (scanTruncated
-          ? `信封扫描达到上限（约 ${scan.scanned} 封），该范围内还有邮件未检查到，列表可能不全。请缩小时间范围后重试。`
-          : '');
+      const note = failedNote || truncationNote;
       return {
         ...envelopeBase,
         fetched: 0,
@@ -549,11 +596,7 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
           '未分析的邮件仍会出现在命中列表里（标记为「未分析」），只是没有摘要。可把「检索按需回补上限」调大后重试。',
       );
     }
-    if (scanTruncated) {
-      notes.push(
-        `信封扫描达到上限（约 ${scan.scanned} 封），该范围内还有邮件未检查到，列表可能不全。请缩小时间范围后重试。`,
-      );
-    }
+    if (truncationNote) notes.push(truncationNote);
     if (failedNote) notes.push(failedNote);
 
     return {
