@@ -21,6 +21,7 @@ import { classifyMails } from './analyze.js';
 import { clipForLlm, makeSnippet, parseMessage, stripQuoted } from '../mail/parse.js';
 import { classifyRecipient } from '../mail/recipient.js';
 import { connect, fetchHeaders, fetchRawSourceWithin, safeLogout, searchUids } from '../mail/imap.js';
+import { acquireAccount } from '../mail/account-lock.js';
 import { dayKey, zonedTimeToUtc } from '../calendar/time.js';
 import * as store from '../store/state.js';
 
@@ -486,7 +487,23 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
 
   // 整段回补只开一条 IMAP 连接（企业邮箱通常限制并发连接数）
   let imap;
+  let releaseAccount = null;
   try {
+    /*
+     * 与别的入口排队共用同一个账号的额度：回补可能跑几分钟（扫信封 + 分析上百封），
+     * 期间绝不能再让第二个入口（尤其是定时分析）在旁边开第二条连接。
+     * 排队时通过 onProgress 推一条 SSE 进度，界面上能看出「在等邮箱」而不是卡死。
+     */
+    releaseAccount = await acquireAccount(instance, {
+      label: `检索按需回补（${instance.label}）`,
+      onWait: ({ holder, queued, waitMs }) =>
+        onProgress?.({
+          phase: 'queued',
+          message: `邮箱正忙（${holder}），回补已排队（前面 ${queued - 1} 个，最多等 ${Math.round(waitMs / 1000)} 秒）…`,
+          queued: queued - 1,
+          holder,
+        }),
+    });
     imap = await connect(instance);
     const collect = reusable
       ? reusable.collect
@@ -610,6 +627,7 @@ export async function ensureCoverage({ instanceId, filters, onProgress, skipScan
     };
   } finally {
     if (imap) await safeLogout(imap);
+    releaseAccount?.();
   }
 }
 

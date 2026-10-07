@@ -1480,7 +1480,17 @@ await test('发送：Date 头按配置时区写 +0800，且与 IMAP internal dat
 
   // 4) internal date 与 sentAt 一致：用固定的 date 传进 appendToMailbox
   const beforeAppend = imap.store.appended.length;
-  await appendToMailbox(await connect(getInstance('test')), 'Drafts', Buffer.from(raw), ['\\Draft'], instant);
+  /*
+   * 这条用例直接用底层 API（绕过入口的账号排队），因此必须自己把连接关掉：
+   * 否则这条连接会一直挂在 mock 服务器上，后面凡是数「同时活跃连接数」的用例
+   * 都会莫名其妙多出 1 条（并发断言从此不可信）。
+   */
+  const appendClient = await connect(getInstance('test'));
+  try {
+    await appendToMailbox(appendClient, 'Drafts', Buffer.from(raw), ['\\Draft'], instant);
+  } finally {
+    await safeLogout(appendClient);
+  }
   const appended = imap.store.appended[imap.store.appended.length - 1];
   assertEqual(imap.store.appended.length, beforeAppend + 1, '应写入一封');
   assert(appended.raw.includes('+0800'), '写入草稿箱的原文也应带 +0800');
@@ -4105,6 +4115,263 @@ await test('跟催：历史遗留的重复会在下次扫描时就地收敛，�
   assertEqual(Object.keys(out.map).length, 1, '三条近义记录应收敛成一条（实际 ' + Object.keys(out.map).length + '）');
   assertEqual(Object.values(out.map)[0].status, 'done', '收敛后必须保留终态，不得把「已完成」降级');
   assert(out.folded >= 2, '应报告折叠掉至少两条（实际 ' + out.folded + '）');
+});
+
+/* ================================================================ 28. 同账号 IMAP 串行化 */
+
+/*
+ * 这一组用例回答的是「多个入口会不会同时连同一个邮箱账号」。
+ *
+ * 证据取自 **mock 服务器自己数出来的同时活跃连接数**（`test/mocks.js` 的并发探针），
+ * 而不是读代码推断。加门**之前**用同一套探针实测到的峰值：
+ *   一次分析进行中再去取邮件正文 / 做一次分析预检 / 跑一次邮箱自检 / 做一次检索按需回补
+ *   → 同一个账号上的并发连接峰值分别是 2 / 2 / 2 / 2（重叠时间窗真实存在）；
+ *   只有"再点一次分析"这一种被既有的 RUN_IN_PROGRESS 挡住了（峰值 1）。
+ * 加门**之后**这一组断言把峰值钉回 1、重叠时长钉回 0，并且要求不同账号仍能并发
+ * ——将来有人新开一个连 IMAP 的入口，这里会先失败。
+ */
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 等条件成立；超时直接抛错——用例宁可失败，也不能因为死锁把整套测试挂死。 */
+async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 5, message = '等待条件超时' } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return true;
+    if (Date.now() > deadline) throw new Error(`${message}（等了 ${timeoutMs}ms）`);
+    await sleep(intervalMs);
+  }
+}
+
+/** 等 mock 服务器上的连接全部关掉，避免上一个用例的残留把峰值算进来。 */
+async function waitImapIdle(server, timeoutMs = 5000) {
+  return waitFor(() => server.stats.active === 0, { timeoutMs, message: 'mock IMAP 连接没有回到空闲' });
+}
+
+/** 从探针事件流里算「同时活跃 ≥ 2 条连接」的累计时长：串行化正确时应为 0。 */
+function overlapMs(server) {
+  const events = [...server.stats.events].sort((a, b) => a.at - b.at);
+  let total = 0;
+  for (let i = 0; i < events.length - 1; i += 1) {
+    if (events[i].active >= 2) total += events[i + 1].at - events[i].at;
+  }
+  return total;
+}
+
+const { acquireAccount, accountQueueState, __setAccountLimitsForTest } = await import('../server/mail/account-lock.js');
+
+await test('同账号串行化：一次分析进行中再取邮件正文，同账号并发连接峰值 ≤ 1', async () => {
+  const { runScan } = await import('../server/ai/engine.js');
+  const { loadRawFor } = await import('../server/ai/insight.js');
+  const instance = getInstance('test');
+
+  await waitImapIdle(imap);
+  imap.resetConcurrency();
+  const totalBefore = imap.stats.total;
+
+  /*
+   * 两个入口**同一时刻**发起：runScan 会先一步把账号许可拿走（它同步地跑到
+   * 第一个 await 处就已经占住了），因此正文回源必定排队。
+   * 这样断言不依赖"谁先谁后"的运气，排队没发生就会在下面超时报错，而不是悄悄通过。
+   */
+  const runPromise = runScan({ instanceId: 'test', windowHours: 24, trigger: 'manual' });
+  // 这封邮件本地没有归档（uid 不存在），必然回源 → 会自己连一次邮箱
+  const loadPromise = loadRawFor({ folder: 'INBOX', uid: 999, instanceId: 'test' });
+  await waitFor(() => accountQueueState(instance).queued >= 1, {
+    message: '正文回源没有排到正在跑的分析后面（说明两个入口在同时连邮箱）',
+  });
+  const totalWhileQueued = imap.stats.total;
+  const [result, loaded] = await Promise.all([runPromise, loadPromise]);
+
+  assertEqual(imap.maxConcurrent, 1, `同账号并发连接峰值应为 1，实际 ${imap.maxConcurrent}`);
+  assertEqual(overlapMs(imap), 0, '同账号不应出现两条连接同时活跃的时间窗');
+  assert(imap.stats.total > totalWhileQueued, '正文回源必须真的连过一次邮箱（否则是"没排队"而不是"排好了队"）');
+  assert(imap.stats.total - totalBefore >= 2, '分析 + 正文回源应各自连过一次邮箱');
+  assertEqual(loaded.source, 'none', '不存在的 UID 应如实返回取不到');
+  assert(result.fetched > 0, `分析应正常完成，实际 fetched=${result.fetched}`);
+  assertEqual(accountQueueState(instance).busy, false, '跑完之后账号不能被占住（否则下一个入口会一直排队）');
+});
+
+await test('同账号串行化：三个入口同时发起，也只有一条连接（预检 / 正文回源 / 邮箱自检）', async () => {
+  const { previewScan } = await import('../server/ai/engine.js');
+  const { loadRawFor } = await import('../server/ai/insight.js');
+  const { runDiagnostics } = await import('../server/diagnostics.js');
+  const instance = getInstance('test');
+
+  await waitImapIdle(imap);
+  imap.resetConcurrency();
+  const totalBefore = imap.stats.total;
+
+  // 先占住账号：等价于「另一个入口正在用邮箱」，三个入口都必须排队
+  const release = await acquireAccount(instance, { label: '占位：另一个入口' });
+  const started = [previewScan({ instanceId: 'test', windowHours: 24 }), loadRawFor({ folder: 'INBOX', uid: 999, instanceId: 'test' }), runDiagnostics({ instanceId: 'test', deep: false })];
+
+  // 排队是可见的：三个都在队列里等，而且知道是谁在占用
+  await waitFor(() => accountQueueState(instance).queued >= 3, { message: '三个入口没有都进入排队' });
+  const snapshot = accountQueueState(instance);
+  assertEqual(snapshot.busy, true, '占用期间账号应为忙');
+  assertIncludes(snapshot.holder, '占位：另一个入口', '排队状态里应能看出当前占用者');
+
+  release();
+  const results = await Promise.all(started);
+
+  assertEqual(imap.maxConcurrent, 1, `三个入口并发发起时同账号峰值应为 1，实际 ${imap.maxConcurrent}`);
+  assertEqual(overlapMs(imap), 0, '不应出现两条连接同时活跃的时间窗');
+  assert(imap.stats.total - totalBefore >= 3, '三个入口都应各自连过一次邮箱');
+  assert(results[0].matched >= 0 && results[1].source === 'none' && Array.isArray(results[2].checks), '三个入口的结果都要正常返回');
+  assertEqual(accountQueueState(instance).busy, false, '跑完之后账号不能被占住');
+});
+
+await test('不同账号互不阻塞：两个实例各自仍是单连接，且都在跑', async () => {
+  const { runScan } = await import('../server/ai/engine.js');
+  const config = getConfig();
+  const second = await mocks.startMockImap({
+    messages: MESSAGES,
+    user: 'other@example.com',
+    pass: 'secret',
+  });
+  config.instances.push(
+    baseInstance({
+      id: 'test2',
+      label: '第二个邮箱',
+      imap: { host: '127.0.0.1', port: second.port, secure: false, authUser: 'other@example.com', authPass: 'secret' },
+    }),
+  );
+  try {
+    // ① 直接验证「拿着 A 账号的许可，B 账号照样能立刻拿到」
+    const releaseA = await acquireAccount(getInstance('test'), { label: 'A 账号操作' });
+    let gotB = false;
+    const pendingB = acquireAccount(getInstance('test2'), { label: 'B 账号操作' }).then((rel) => {
+      gotB = true;
+      return rel;
+    });
+    await waitFor(() => gotB, { timeoutMs: 2000, message: 'B 账号被 A 账号挡住了（不同账号不该互相阻塞）' });
+    releaseA();
+    (await pendingB)();
+
+    // ② 端到端：两个实例同时分析，各自都成功，各自账号上都不超过一条连接
+    await waitImapIdle(imap);
+    await waitImapIdle(second);
+    imap.resetConcurrency();
+    second.resetConcurrency();
+    const [a, b] = await Promise.all([
+      runScan({ instanceId: 'test', windowHours: 24, trigger: 'manual' }),
+      runScan({ instanceId: 'test2', windowHours: 24, trigger: 'manual' }),
+    ]);
+    assertEqual(imap.maxConcurrent, 1, `A 账号峰值应为 1，实际 ${imap.maxConcurrent}`);
+    assertEqual(second.maxConcurrent, 1, `B 账号峰值应为 1，实际 ${second.maxConcurrent}`);
+    assert(a.fetched > 0 && b.fetched > 0, '两个实例都应真的拉到邮件');
+  } finally {
+    config.instances = config.instances.filter((i) => i.id !== 'test2');
+    await second.close();
+  }
+});
+
+await test('排队有界：等不到就给明确的 ACCOUNT_BUSY，不会永久挂起', async () => {
+  const { previewScan } = await import('../server/ai/engine.js');
+  const instance = getInstance('test');
+
+  await waitImapIdle(imap);
+  __setAccountLimitsForTest({ waitMs: 150, maxQueue: 8 });
+  const release = await acquireAccount(instance, { label: '占位：长时间操作' });
+  try {
+    const startedAt = Date.now();
+    const err = await previewScan({ instanceId: 'test', windowHours: 24 }).then(
+      () => null,
+      (e) => e,
+    );
+    const elapsed = Date.now() - startedAt;
+    assert(err, '被别的操作占着且等到超时，预检必须报错而不是静默继续');
+    assertEqual(err.code, 'ACCOUNT_BUSY', `应给明确错误码，实际 ${err.code}`);
+    assertEqual(err.status, 409, 'ACCOUNT_BUSY 应是 409（可重试），不是笼统的 500');
+    assertIncludes(err.message, '邮箱正忙', '错误文案要说清是"邮箱正忙、另一个操作还没结束"');
+    assertIncludes(err.message, '还没结束', '错误文案要说明占用者还没结束，而不是笼统失败');
+    assertIncludes(err.message, '占位：长时间操作', '错误文案里要能看出当前占用者是谁');
+    assert(err.detail && err.detail.holder === '占位：长时间操作', '错误里要能看出当前占用者是谁');
+    assert(elapsed < 3000, `必须是有界等待，实际等了 ${elapsed}ms`);
+  } finally {
+    release();
+    __setAccountLimitsForTest(null);
+  }
+});
+
+await test('排队有上限：队列满了直接拒绝，且拒绝也带明确错误码', async () => {
+  const instance = getInstance('test');
+  await waitImapIdle(imap);
+  __setAccountLimitsForTest({ waitMs: 5000, maxQueue: 1 });
+  const release = await acquireAccount(instance, { label: '占位：长操作' });
+  let queuedRelease = null;
+  try {
+    const queued = acquireAccount(instance, { label: '排队中的操作' }).then((rel) => {
+      queuedRelease = rel;
+      return rel;
+    });
+    await waitFor(() => accountQueueState(instance).queued === 1, { message: '第二个操作没有进入排队' });
+
+    const err = await acquireAccount(instance, { label: '第三个操作' }).then(
+      () => null,
+      (e) => e,
+    );
+    assert(err, '队列已满时第三个操作应被直接拒绝');
+    assertEqual(err.code, 'ACCOUNT_BUSY', `应给明确错误码，实际 ${err.code}`);
+    assertEqual(err.detail.queued, 1, '错误里应说明队列深度（界面可以提示"前面还有几个"）');
+
+    release();
+    await queued;
+    queuedRelease();
+  } finally {
+    __setAccountLimitsForTest(null);
+    release();
+    if (queuedRelease) queuedRelease();
+  }
+});
+
+await test('排队可见：运行相位与 SSE 事件都能看出"在排队"，而不是卡死', async () => {
+  const { runScan, progressBus } = await import('../server/ai/engine.js');
+  const instance = getInstance('test');
+  await waitImapIdle(imap);
+
+  const events = [];
+  const onEvent = (e) => events.push(e);
+  progressBus.on('event', onEvent);
+  const release = await acquireAccount(instance, { label: '占位：另一个入口' });
+  const run = runScan({ instanceId: 'test', windowHours: 24, trigger: 'manual' });
+  try {
+    await waitFor(() => events.some((e) => e.type === 'account:queued'), { message: '没有推「在排队」的进度事件' });
+    const queued = events.find((e) => e.type === 'account:queued');
+    assertIncludes(String(queued.holder), '占位：另一个入口', '排队事件里要说清是谁在占用邮箱');
+    const start = events.find((e) => e.type === 'run:start');
+    assert(start?.run?.id, '应有 run:start 事件（用来定位这次运行）');
+    assertEqual(store.getRun(start.run.id).phase, 'queued', '等待期间运行相位应为 queued（界面显示「等待邮箱空闲…」）');
+  } finally {
+    release();
+    progressBus.off('event', onEvent);
+  }
+  const result = await run;
+  assert(result.fetched > 0, '排完队之后分析要照常跑完');
+  assertEqual(store.getRun(result.runId).status, 'success', '排过队的这次运行也必须记为成功');
+});
+
+await test('加门之后既有功能仍然全部通过：分析 / 检索回补 / 跟催扫描', async () => {
+  const { runScan } = await import('../server/ai/engine.js');
+  const { ensureCoverage } = await import('../server/ai/backfill.js');
+  const { runFollowUpScan } = await import('../server/followup.js');
+
+  await waitImapIdle(imap);
+  const run = await runScan({ instanceId: 'test', windowHours: 24, trigger: 'manual' });
+  assert(run.fetched > 0, '分析仍要能拉到邮件');
+
+  // 检索按需回补：范围刻意早于本地覆盖，逼它真的去连一次邮箱
+  const backfill = await ensureCoverage({
+    instanceId: 'test',
+    filters: { dateFrom: '2020-01-01', dateTo: '2030-01-01', from: [], subject: [], content: [] },
+  });
+  assertEqual(backfill.attempted, true, '回补应真的执行（而不是因为门被跳过）');
+  assert(!backfill.errors.length, `回补不应报错：${JSON.stringify(backfill.errors)}`);
+
+  // 跟催扫描本身不连 IMAP（只读本地已发送/分析记录），加门不该影响它
+  const follow = await runFollowUpScan({ client: null, store });
+  assertEqual(follow.enabled, true, '跟催扫描仍应可用');
 });
 
 /* ------------------------------------------------------------ 收尾 */

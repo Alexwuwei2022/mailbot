@@ -20,6 +20,7 @@ import {
   safeLogout,
 } from '../mail/imap.js';
 import { buildMime, ensureReplyPrefix, identitySender, mailTimeZone, makeMessageId } from '../mail/compose.js';
+import { acquireAccount } from '../mail/account-lock.js';
 import { hasQuote } from '../mail/quote.js';
 import { safeFilename } from '../mail/parse.js';
 import { appendAudit } from '../store/audit.js';
@@ -370,7 +371,10 @@ export async function syncDraftToMailbox(id) {
   const instance = getInstance(draft.instanceId);
 
   let imap;
+  let releaseAccount = null;
   try {
+    // 写草稿箱也是这个账号上的 IMAP 操作，同样排队（不要在一次分析旁边多开一条连接）
+    releaseAccount = await acquireAccount(instance, { label: `同步草稿到草稿箱（${instance.label}）` });
     imap = await connect(instance);
     const draftsBox = await findDraftsMailbox(imap, config.draft.draftsMailbox);
     if (!draftsBox) throw new AppError('服务器上未找到草稿箱文件夹（\\Drafts）', { code: 'DRAFTS_MAILBOX_MISSING', status: 404 });
@@ -401,6 +405,7 @@ export async function syncDraftToMailbox(id) {
     return { draft: updated, mailbox: updated.mailbox, replaced };
   } finally {
     if (imap) await safeLogout(imap);
+    releaseAccount?.();
   }
 }
 
@@ -468,7 +473,16 @@ export async function sendDraft(id, options = {}) {
     const wantSent = appendToSent ?? config.draft.appendToSent ?? false;
     if ((deleteMailboxDraft && draft.mailbox?.uid) || wantSent) {
       let imap;
+      let releaseAccount = null;
       try {
+        /*
+         * 邮件已经发出去了，这里只是收尾（清服务器草稿副本 / 归档到已发送），
+         * 因此**不能因为邮箱正忙就把整次发送判失败**：排队等一小会儿，等不到就照旧只记一条 note。
+         */
+        releaseAccount = await acquireAccount(instance, {
+          label: `发送后收尾（${instance.label}）`,
+          waitMs: 10_000,
+        });
         imap = await connect(instance);
         if (deleteMailboxDraft && draft.mailbox?.uid) {
           try {
@@ -496,6 +510,7 @@ export async function sendDraft(id, options = {}) {
         notes.push(`发送后处理失败：${err?.message || err}`);
       } finally {
         if (imap) await safeLogout(imap);
+        releaseAccount?.();
       }
     }
 

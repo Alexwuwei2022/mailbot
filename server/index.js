@@ -24,6 +24,7 @@ import {
   secretsReport,
 } from './config/index.js';
 import { LLM_PRESETS, PRESETS } from './config/defaults.js';
+import { accountQueueState } from './mail/account-lock.js';
 import { AppError, APP_VERSION, formatBytes, hoursAgo, log, safeJson, toErrorPayload } from './lib/util.js';
 import { configHealth, runDiagnostics } from './diagnostics.js';
 import {
@@ -2022,6 +2023,11 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       ok: true,
       running: isRunning(config.defaultInstanceId),
       current: currentRun(config.defaultInstanceId),
+      /*
+       * 邮箱账号的排队情况：界面用它说清「现在是谁占着邮箱、我在排第几个」，
+       * 而不是让用户对着一个不动的进度条猜是不是卡死了。
+       */
+      mailQueue: mailQueueState(),
       counts: countsPayload(),
       lastRun: store.lastRun({}) || null,
     });
@@ -2043,7 +2049,23 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
   return null;
 }
 
-function countsPayload() {  const config = getConfig();
+/**
+ * 默认实例的邮箱账号排队情况（供 `/api/status` 用）。
+ *
+ * 只报「谁占着、排了几个、等了多久」，不带任何账号/凭据信息；
+ * 多实例时每个账号各有各的队列，这里只看默认实例这一个。
+ */
+function mailQueueState() {
+  try {
+    const config = getConfig();
+    return accountQueueState(getInstance(config.defaultInstanceId));
+  } catch {
+    return null;
+  }
+}
+
+function countsPayload() {
+  const config = getConfig();
   const state = store.getState();
   const id = instanceIdFrom(null) || config.defaultInstanceId;
   const pendingDrafts = state.drafts.filter((d) => d.status === 'pending' || d.status === 'failed');

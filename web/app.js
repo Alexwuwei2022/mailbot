@@ -61,6 +61,8 @@ export { app };
 
 const PHASE_TEXT = {
   starting: '准备中…',
+  // 同账号串行化：另一个邮箱操作还没结束时，本次分析在排队（不是卡死）
+  queued: '等待邮箱空闲…',
   connecting: '连接邮箱…',
   fetching: '拉取邮件…',
   reading: '读取正文…',

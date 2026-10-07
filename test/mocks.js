@@ -169,8 +169,39 @@ export async function startMockImap({
   const store = { messages: [...messages], appended: [], deleted: [], log: [] };
   const sockets = new Set();
 
+  /*
+   * 并发连接探针：用来**实测**「同一账号上到底同时有几条 IMAP 连接」。
+   *
+   * 为什么要记在 mock 里，而不是靠读代码推断：多个入口（分析 / 检索回补 / 正文回源 /
+   * 草稿同步 / 诊断）各自开连接，光看调用图很容易漏；只有服务器这一侧数出来的
+   * 「同时活跃连接数峰值」才是证据。峰值 ≤ 1 就等价于「同账号被串行化了」。
+   */
+  const stats = { active: 0, total: 0, maxConcurrent: 0, events: [] };
+  const mark = (type) => {
+    stats.events.push({ at: Date.now(), type, active: stats.active });
+  };
+
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    stats.active += 1;
+    stats.total += 1;
+    if (stats.active > stats.maxConcurrent) stats.maxConcurrent = stats.active;
+    mark('open');
+    /*
+     * 会话结束的判定要**确定**，不能只等 TCP 的 'close'：
+     * 客户端 `logout()` 收到 OK 就认为连接没了并马上去建下一条，而服务端的 'close'
+     * 往往晚几毫秒才到——那会让「先关后开」被误记成「两条同时活跃」，
+     * 峰值统计就会偶发变成 2（本套用例曾因此变成随机失败）。
+     * 因此在处理 LOGOUT 时就先记一次结束，'end'/'close' 只作为异常断开的兜底。
+     */
+    let sessionClosed = false;
+    const markClosed = () => {
+      if (sessionClosed) return;
+      sessionClosed = true;
+      sockets.delete(socket);
+      stats.active -= 1;
+      mark('close');
+    };
     const reader = new LineReader(socket);
     let selected = null;
 
@@ -377,6 +408,8 @@ export async function startMockImap({
         if (upper.startsWith('LOGOUT')) {
           write('* BYE logging out');
           write(`${tag} OK LOGOUT completed`);
+          // 客户端收到这个 OK 就认为连接结束了，这里同步把它算作"不再活跃"
+          markClosed();
           socket.end();
           break;
         }
@@ -392,7 +425,8 @@ export async function startMockImap({
       socket.destroy();
     });
 
-    socket.on('close', () => sockets.delete(socket));
+    socket.on('end', markClosed);
+    socket.on('close', markClosed);
   });
 
   await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
@@ -402,6 +436,17 @@ export async function startMockImap({
     port: actualPort,
     host: '127.0.0.1',
     store,
+    /** 并发探针：{ active, total, maxConcurrent, events }（events 含每条连接的开/关与当时活跃数） */
+    stats,
+    /** 同时活跃的连接数峰值（测试里最常用的那个数） */
+    get maxConcurrent() {
+      return stats.maxConcurrent;
+    },
+    /** 把峰值清零，便于「先跑基线、再测并发」两段分开断言 */
+    resetConcurrency() {
+      stats.maxConcurrent = stats.active;
+      stats.events.length = 0;
+    },
     close: () =>
       new Promise((resolve) => {
         for (const s of sockets) s.destroy();

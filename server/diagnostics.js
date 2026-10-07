@@ -5,6 +5,7 @@
 import { getConfig, getInstance, getPaths, validateInstance, validateLlm } from './config/index.js';
 import { LlmClient, pingLlm } from './llm/client.js';
 import { connect, findDraftsMailbox, listMailboxes, safeLogout } from './mail/imap.js';
+import { acquireAccount } from './mail/account-lock.js';
 import { verifyTransport } from './mail/smtp.js';
 import { APP_VERSION, hoursAgo } from './lib/util.js';
 import { describeNetworkError, httpRequest, resolveProxyFor } from './lib/http.js';
@@ -168,8 +169,11 @@ export async function runDiagnostics({ instanceId, deep = false } = {}) {
 
   /* 2. IMAP */
   let imap = null;
+  let releaseAccount = null;
   let draftsMailbox = null;
   try {
+    // 诊断也会连邮箱，同样排在账号队列里（否则"跑个自检"就能在一次分析旁边多开一条连接）
+    releaseAccount = await acquireAccount(instance, { label: `邮箱自检（${instance.label}）` });
     imap = await connect(instance);
     const boxes = await listMailboxes(imap);
     draftsMailbox = await findDraftsMailbox(imap, config.draft.draftsMailbox);
@@ -213,6 +217,7 @@ export async function runDiagnostics({ instanceId, deep = false } = {}) {
     push('imap', 'IMAP 连接与认证', 'error', err.message, err.detail);
   } finally {
     if (imap) await safeLogout(imap);
+    releaseAccount?.();
   }
 
   /* 3. SMTP：先按配置的认证方式验，失败时逐个换方式试，直接给出可用的那一种 */

@@ -48,6 +48,7 @@ import {
   searchUids,
 } from '../mail/imap.js';
 import { buildMime, ensureReplyPrefix, identitySender, makeMessageId } from '../mail/compose.js';
+import { acquireAccount, RUN_WAIT_MS } from '../mail/account-lock.js';
 import { clipForLlm, makeSnippet, parseMessage, stripQuoted } from '../mail/parse.js';
 import { classifyRecipient, isCcAttention, isDirectAction, isWorthNoting } from '../mail/recipient.js';
 import * as store from '../store/state.js';
@@ -117,9 +118,16 @@ export async function previewScan({ instanceId, windowHours } = {}) {
   const limit = maxMessagesFor(hours, config.scan.maxMessages);
 
   let imap;
+  let releaseAccount = null;
   const folders = [];
   let matchedTotal = 0;
   try {
+    // 预检也要连邮箱，同样得跟别的入口排队：否则「点一下预检」就可能在一次分析旁边多开一条连接
+    releaseAccount = await acquireAccount(instance, {
+      label: `分析预检（${instance.label}）`,
+      onWait: ({ holder, queued, waitMs }) =>
+        log.info(`分析预检在等邮箱空闲（当前占用：${holder}，前面 ${queued - 1} 个，最多等 ${Math.round(waitMs / 1000)} 秒）`),
+    });
     imap = await connect(instance);
     const mailboxes = await listMailboxes(imap);
     for (const folder of config.scan.folders) {
@@ -137,6 +145,7 @@ export async function previewScan({ instanceId, windowHours } = {}) {
     }
   } finally {
     if (imap) await safeLogout(imap);
+    releaseAccount?.();
   }
 
   const taken = folders.reduce((sum, f) => sum + f.taken, 0);
@@ -304,9 +313,38 @@ export async function runScan({ instanceId, windowHours, force = false, trigger 
   };
 
   let imap;
+  let releaseAccount = null;
   const errors = [];
   try {
     /* ---------------------------------------------------------- 1. 连接 */
+    /*
+     * 同账号串行化：整个运行周期只允许这个账号上有一条 IMAP 连接。
+     *
+     * 这里复用**已有的**「同一实例同时只允许一个运行」语义（上面的 isRunning → RUN_IN_PROGRESS），
+     * 不另造第二套：isRunning 负责「再点一次分析」立刻被拒，
+     * acquireAccount 负责「别的入口（预检/检索回补/正文回源/草稿同步/诊断）正开着连接」时排队。
+     * 两个都必须有：前者是快速失败，后者才是真正防并发连接。
+     */
+    releaseAccount = await acquireAccount(instance, {
+      label: `分析（${instance.label}）`,
+      waitMs: RUN_WAIT_MS,
+      // 排队期间用户点「取消」要能立刻停，而不是干等满两分钟
+      signal: abort,
+      cancelCode: 'RUN_CANCELLED',
+      onWait: ({ holder, queued, waitMs }) => {
+        // 相位写成 queued：运行列表与顶部进度条都能显示「在排队」，不会让人以为卡死
+        phase('queued', {
+          message: `邮箱正忙（${holder}），已排队等待，最多 ${Math.round(waitMs / 1000)} 秒`,
+        });
+        emit(run.id, {
+          type: 'account:queued',
+          holder,
+          queued: queued - 1,
+          waitMs,
+          message: `另一个邮箱操作正在进行：${holder}`,
+        });
+      },
+    });
     phase('connecting', { message: `连接 ${instance.imap.host}:${instance.imap.port}` });
     imap = await connect(instance);
     const mailboxes = await listMailboxes(imap);
@@ -794,6 +832,8 @@ export async function runScan({ instanceId, windowHours, force = false, trigger 
   } finally {
     activeRuns.delete(instance.id);
     if (imap) await safeLogout(imap);
+    // 释放账号许可：无论成功、失败还是排队超时，都要放，否则这个账号就再也用不了了
+    releaseAccount?.();
   }
 }
 

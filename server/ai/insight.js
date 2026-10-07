@@ -288,22 +288,36 @@ export async function loadRawFor({ folder, uid, instanceId } = {}) {
       return { raw: null, source: 'none', reason: '本地没有归档原文，且邮箱配置不完整，无法回源获取' };
     }
     const { connect, fetchRawSourceWithin, safeLogout } = await import('../mail/imap.js');
-    const client = await connect(instance);
-    let raw = null;
+    const { acquireAccount } = await import('../mail/account-lock.js');
+    // 查看正文/下载附件的回源也要排同一个账号的队：点一下详情不该在旁边多开一条连接
+    const releaseAccount = await acquireAccount(instance, { label: `邮件正文回源（${instance.label}）` });
+    let client;
     try {
-      const lock = await client.getMailboxLock(folder, { readOnly: true });
+      client = await connect(instance);
+      let raw = null;
       try {
-        raw = await fetchRawSourceWithin(client, numUid);
+        const lock = await client.getMailboxLock(folder, { readOnly: true });
+        try {
+          raw = await fetchRawSourceWithin(client, numUid);
+        } finally {
+          lock.release();
+        }
       } finally {
-        lock.release();
+        await safeLogout(client);
       }
+      if (!raw) return { raw: null, source: 'none', reason: '服务器上没有找到这封邮件（可能已被移动或删除）' };
+      store.saveRaw(folder, numUid, null, raw);
+      return { raw, source: 'imap', reason: '' };
     } finally {
-      await safeLogout(client);
+      releaseAccount();
     }
-    if (!raw) return { raw: null, source: 'none', reason: '服务器上没有找到这封邮件（可能已被移动或删除）' };
-    store.saveRaw(folder, numUid, null, raw);
-    return { raw, source: 'imap', reason: '' };
   } catch (err) {
+    /*
+     * 「邮箱正忙」要原样抛给接口（HTTP 409 + code=ACCOUNT_BUSY），不能降级成
+     * 「取不到原文」那种 404 通用文案：前者用户知道等一会儿再点，后者会让人以为邮件丢了。
+     * 其余失败仍然软降级（页面照样能看，只是没有正文）。
+     */
+    if (err?.code === 'ACCOUNT_BUSY') throw err;
     log.debug(`回源取原文失败（${folder}:${numUid}）：${err?.message || err}`);
     return { raw: null, source: 'none', reason: `本地没有归档原文，回源获取失败：${err?.message || err}` };
   }

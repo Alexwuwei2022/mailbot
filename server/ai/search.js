@@ -644,7 +644,7 @@ export function applyFilters(records, filters) {
  *
  * 只做一次有上限的补充，且失败不影响主流程。
  */
-async function searchImapBodies({ instanceId, filters, need }) {
+async function searchImapBodies({ instanceId, filters, need, onProgress }) {
   if (!need || !filters.content.length) return [];
   const timeZone = filters.timeZone || getConfig().calendar.timeZone;
   let instance;
@@ -654,6 +654,7 @@ async function searchImapBodies({ instanceId, filters, need }) {
     return [];
   }
   const { connect, fetchSince, safeLogout } = await import('../mail/imap.js');
+  const { acquireAccount } = await import('../mail/account-lock.js');
   const { parseMessage, stripQuoted } = await import('../mail/parse.js');
   const config = getConfig();
 
@@ -664,8 +665,20 @@ async function searchImapBodies({ instanceId, filters, need }) {
   }
 
   let client;
+  let releaseAccount = null;
   const hits = [];
   try {
+    // 与「按需回补」一样排同一个账号的队（两者是一次检索里先后发生的两段，不是嵌套）
+    releaseAccount = await acquireAccount(instance, {
+      label: `检索正文回退（${instance.label}）`,
+      onWait: ({ holder, queued, waitMs }) =>
+        onProgress?.({
+          phase: 'queued',
+          message: `邮箱正忙（${holder}），正文检索已排队（前面 ${queued - 1} 个，最多等 ${Math.round(waitMs / 1000)} 秒）…`,
+          queued: queued - 1,
+          holder,
+        }),
+    });
     client = await connect(instance);
     for (const folder of config.scan.folders) {
       if (hits.length >= need) break;
@@ -711,6 +724,7 @@ async function searchImapBodies({ instanceId, filters, need }) {
     log.warn(`正文检索失败（不影响已分析结果）：${err?.message || err}`);
   } finally {
     if (client) await safeLogout(client);
+    releaseAccount?.();
   }
   return hits;
 }
@@ -859,7 +873,7 @@ export async function searchEmails({ query, instanceId, now = new Date(), limit,
   // 注意这里的 need 用列表硬上限，不再跟模型的展示上限走（不再是 30 这种小数字）。
   let bodyHits = [];
   if (filters.content.length && matched.length < 5) {
-    bodyHits = await searchImapBodies({ instanceId: instance.id, filters, need: MAX_LIST_LIMIT });
+    bodyHits = await searchImapBodies({ instanceId: instance.id, filters, need: MAX_LIST_LIMIT, onProgress });
   }
 
   // 排序
