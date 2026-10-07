@@ -342,6 +342,52 @@ export function __setKeychainPathForTest(file) {
   keychainPath = file ? String(file) : null;
 }
 
+/**
+ * 把 macOS `security find-generic-password -w` 的输出还原成**原文**。
+ *
+ * ## 为什么需要这一步（CI 实测，不是猜）
+ *
+ * run 37629230504 的 macOS 作业上，钥匙串里明明存着一份带金丝雀的 JSON，后端读回来的却是
+ * `7b0a20202276657273696f6e223a…`（334 个十六进制字符，**正好**是那份 JSON 的 hex）。
+ * 也就是 `security` 把数据**以十六进制打印**了。同一次运行里短小的单行探测值
+ * （`probe-<pid>-<ts>`）却是原样回来的——所以这既不是"读失败"，也不是"写坏"，
+ * 而是"输出形式随内容变"：macOS 26（Tahoe）上，凡不是"干净可打印单行文本"的内容都会被 hex 打印，
+ * 而我们保管库的载荷是**带换行的 pretty JSON**，正好中招。
+ * 不还原就会让真机读回在 `decodeVault` 里红掉，等于 macOS 上这条后端不能用。
+ *
+ * ## 判据必须保守：宁可漏判，绝不误判
+ *
+ *   - 整段必须是**偶数长度的纯十六进制**——原文是我们自己的保管内容，一定是 JSON、以 `{` 开头，
+ *     永远不可能是纯十六进制，所以这条不可能把真原文误判成 hex；
+ *   - 解出来的字节必须是**合法 UTF-8**，且解析出来是一个 **JSON 对象**（不是数组、不是 null、不是别的东西）。
+ *
+ * 任何一条不满足就**原样返回**：那样后面的 JSON 解析会带着原始输出红掉，
+ * 而不是被悄悄改写成另一种东西（这是本文件里反复强调的那条规矩）。
+ * 第二条不是多余的：`7b0a` 这种片段也是合法 hex、解出来还以 `{` 开头，但它**不是**合法 JSON，
+ * 靠 JSON.parse 才能把它挡在外面。
+ *
+ * ⚠️ 残留的、如实说明的不精确：`security` 不告诉你它这次打印的是原文还是 hex，
+ * 所以"某段文本恰好是合法 hex、解码后又恰好是一个 JSON 对象"在原理上无法区分（例如 `7b7d` → `{}`）。
+ * 我们的载荷由 `encodeVault` 产出、形状固定，不会撞上这种情况；这里把话说清楚，而不是假装万无一失。
+ */
+export function decodeKeychainOutput(stdout) {
+  const s = String(stdout ?? '');
+  if (!/^(?:[0-9a-fA-F]{2})+$/.test(s)) return s;
+  let text;
+  try {
+    text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(s, 'hex'));
+  } catch {
+    return s;
+  }
+  try {
+    const parsed = JSON.parse(text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return s;
+  } catch {
+    return s;
+  }
+  return text;
+}
+
 const keychainBackend = {
   id: 'keychain',
   label: 'macOS 钥匙串',
@@ -391,10 +437,24 @@ const keychainBackend = {
      * 免得看日志的人以为读也用了那个被钉住的路径（`keychain` 字段对读没有作用，只是诊断信息）。
      * 注意**不记录写入路径里的 argv**（那里可能带明文密钥），只记录查询命令的原始输出。
      */
+    /*
+     * `security` 可能把数据**以十六进制打印**（macOS 26 上，非"干净可打印单行文本"的内容就会这样，
+     * 而我们的载荷是带换行的 pretty JSON）。这里用 decodeKeychainOutput 还原成原文；
+     * 证据里保留 **原始 stdout**，并在 `how` 里注明"这次是 hex、已还原"——
+     * 排查的人一眼能看出到底是哪种形式，不用猜。
+     */
+    const value = decodeKeychainOutput(res.stdout);
+    const hexPrinted = value !== res.stdout;
     return {
       ok: true,
-      value: res.stdout,
-      evidence: { status: res.status, stdout: res.stdout, stderr: res.stderr, keychain: keychainPath, how: '搜索列表' },
+      value,
+      evidence: {
+        status: res.status,
+        stdout: res.stdout,
+        stderr: res.stderr,
+        keychain: keychainPath,
+        how: hexPrinted ? '搜索列表（security 以十六进制打印，已还原）' : '搜索列表',
+      },
     };
   },
   write(dataDir, plaintext) {

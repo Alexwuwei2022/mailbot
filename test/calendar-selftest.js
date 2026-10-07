@@ -14,7 +14,7 @@ import { fileURLToPath } from 'node:url';
 import { listenRandom } from './lib/port.js';
 import { makeTempDir } from './lib/tmp.js';
 // 只为"证书材料指纹"这条诊断证据：自签证书每次重签指纹都会变，指纹能区分"复用/重签"
-import { fingerprintOf } from '../server/lib/x509.js';
+import { fingerprintOf, makeSelfSignedCert } from '../server/lib/x509.js';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const tmpDir = makeTempDir('mailbot-cal-');
@@ -3846,6 +3846,72 @@ async function tlsPeerCertificate(tlsMod, { host, port, url, certFiles }) {
     sock.on('error', (err) => reject(tlsFail(`tls.connect ${hostResolved}:${port} 的 TLS 握手`, err, { url, certFiles })));
   });
 }
+
+await test('自签证书：序列号冗余前导零与 PEM 空行两个缺陷都必须被挡住（都能让 OpenSSL 拒收整张证书）', async () => {
+  /*
+   * 背景：CI run 37629230504 的 `windows-latest / node 22` 报
+   *   `ERR_OSSL_ASN1_ILLEGAL_PADDING : asn1 encoding routines::illegal padding`
+   * 失败在 `createServer` → `setSecureContext`，也就是**证书本身**被 OpenSSL 拒收，
+   * 而测试数据目录里 cert/key 两个文件都读得到、指纹也在——不是文件坏了，是 DER 非法。
+   *
+   * 本机压测查出**两个**独立缺陷（都不是推断，是可复现的实测：
+   * 正常随机 300 次失败 2 次；强制首字节 0x00 几乎必现 `illegal padding`；强制 0x01 则 5/5 通过）：
+   *
+   *   ① **序列号冗余前导零**（约 1/150 概率的偶发红）
+   *      `serial[0] &= 0x7f` 保证为正，但有 1/128 的概率把首字节变成 0x00；DER 的 INTEGER 要求
+   *      最短编码，首字节 0x00 且下一个字节最高位为 0 时那个 0x00 就是非法的冗余前导零。
+   *      修法是重摇到首字节非零。
+   *   ② **PEM 里多一个空行**（由允许的域名/IP 列表长度决定，约 1/16 的配置会撞上）
+   *      base64 正文长度**正好是 64 的整数倍**时，`replace(/(.{64})/g, '$1\n')` 会在末尾多留一个
+   *      换行，模板里紧接着又有一个 `\n`，BEGIN/END 之间就多出一个空行；OpenSSL 读到空行即停，
+   *      DER 被截断。本机实测：DER 767 字节（base64 恰好 1024 = 16×64）时
+   *      `createSecureContext` 报 `SSL_CTX_use_certificate_chain`、`X509Certificate` 报
+   *      `ERR_OSSL_ASN1_WRONG_TAG`；把 commonName 改一个字母（DER 761 → base64 1016）立刻就好。
+   *
+   * 下面**确定性地**构造这两档，而不是靠运气等那 1/150。
+   */
+  const tls = await import('node:tls');
+  const crypto = await import('node:crypto');
+
+  // ② 先钉住"触发了空行那一档"：这组名字的 base64 正文长度正好整除 64
+  const b64Body = (pem) => pem.replace(/-----[^-]+-----/g, '').replace(/\s+/g, '');
+  const trigger = makeSelfSignedCert({ commonName: 'localhost', altNames: ['127.0.0.1'] });
+  const bodyLen = b64Body(trigger.cert).length;
+  assertEqual(bodyLen % 64, 0, `这组名字必须落在"base64 长度整除 64"那一档上，否则下面的断言就不是在测它（实际 ${bodyLen}）`);
+  assert(
+    !trigger.cert.includes('\n\n-----END'),
+    'PEM 里不许出现空行（空行会让 OpenSSL 读到这里就停、把 DER 截断）',
+  );
+  // 真正说话的是这一句：DER 非法时它会抛错
+  tls.createSecureContext({ cert: trigger.cert, key: trigger.key });
+  assertEqual(
+    new crypto.X509Certificate(trigger.cert).subject,
+    'CN=localhost',
+    '这张证书必须能被 X509 解析回它的 subject',
+  );
+
+  // ① 再确定性地制造"序列号首字节为 0x00"的那一档
+  const realRandomBytes = crypto.default.randomBytes;
+  let calls = 0;
+  crypto.default.randomBytes = (n) => {
+    const b = realRandomBytes(n);
+    if (n === 8) {
+      calls += 1;
+      b[0] &= 0x7f; // 与 x509.js 同样的"保证为正"掩位
+      if (calls === 1) b[0] = 0x00; // 第一次刻意制造冗余前导零
+    }
+    return b;
+  };
+  try {
+    const made = makeSelfSignedCert({ commonName: 'mailbot', altNames: ['127.0.0.1'] });
+    tls.createSecureContext({ cert: made.cert, key: made.key });
+    assert(calls >= 2, `首字节为 0x00 时必须重摇序列号（实际只摇了 ${calls} 次，说明冗余前导零会被写进证书）`);
+  } finally {
+    crypto.default.randomBytes = realRandomBytes;
+  }
+
+  return `确定性回归：PEM 空行那一档（base64 正文 ${bodyLen} 字符，整除 64）+ 序列号首字节 0x00 那一档，两张证书都被 OpenSSL 接受（原本分别报 wrong tag / illegal padding）`;
+});
 
 await test('安全：启用 HTTPS 后真的走 TLS，Cookie 变 Secure，且报告指纹', async () => {
   const fs = await import('node:fs');

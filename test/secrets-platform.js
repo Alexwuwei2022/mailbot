@@ -98,6 +98,7 @@ const {
   KEYRING_SERVICE,
   DPAPI_FILE,
   FILE_VAULT,
+  decodeKeychainOutput,
 } = await import('../server/lib/secrets.js');
 const {
   loadConfig,
@@ -913,6 +914,59 @@ await test('搜索列表守卫（离线仿真）：记下 → 设为唯一 → �
   return '离线仿真通过：解析（含"同行两个引号路径不许丢项"）、钉住判定（CI 实测形态放行 / 登录钥匙串在场或不在首位一律拦下）、设为唯一、逐项还原、还原失效会被 ok=false + 原值/现值暴露（真机结论仍由 macOS CI 给出）';
 });
 
+/* -------------------------------------------------- B2-1. macOS：security 的十六进制打印（离线） */
+
+await test('macOS security 输出还原（离线仿真）：十六进制打印必须还原成原文，且不许误判', async () => {
+  /*
+   * 为什么单独一条、而且放在跨平台区：这个还原逻辑**只在 macOS 上被真正用到**，本机（Windows）
+   * 跑不到；而它一旦判错方向，后果是"把合法原文改坏"或"把 hex 当原文"，两种都会让真机结论失真。
+   *
+   * 真实形态取自 CI run 37629230504 的 macOS 作业：后端读回来的是
+   *   `7b0a20202276657273696f6e223a…`（334 个十六进制字符），decodeVault 直接报
+   *   「Unexpected non-whitespace character after JSON at position 1」——因为那段文本本身就是 hex，
+   *   不是 JSON。下面用**同样形状**（带换行的 pretty JSON + 金丝雀）的载荷把两种形态都钉住。
+   */
+  const payload = JSON.stringify(
+    { version: 1, updatedAt: '2026-10-07T13:33:15.496Z', secrets: { 'imap:test': CANARY_IMAP, llm: CANARY_LLM } },
+    null,
+    2,
+  );
+  // 载荷必须真的是多行的，否则就复现不出 macOS 那个"不是干净单行文本"的触发条件
+  assert(payload.includes('\n'), '载荷应当是多行 pretty JSON（这才是 macOS 26 上被 hex 打印的触发条件）');
+
+  const hexForm = Buffer.from(payload, 'utf8').toString('hex');
+  assertEqual(decodeKeychainOutput(hexForm), payload, 'macOS 26 的十六进制打印必须被还原成原文');
+  assertEqual(decodeKeychainOutput(payload), payload, '本来就是原文的输出不许被改动（老 macOS / 干净文本走这条路）');
+
+  // 反向：不许把"长得像 hex 的普通值"改坏
+  for (const plain of ['probe-1234-5678', CANARY_IMAP, '7b0a', '', '   ']) {
+    assertEqual(decodeKeychainOutput(plain), plain, `不是完整 hex 形式的值必须原样返回（例：${JSON.stringify(plain)}）`);
+  }
+  // 合法 hex、解出来还以 `{` 开头，但**不是合法 JSON**：必须原样返回（只靠"以 { 开头"是不够的）
+  assertEqual(decodeKeychainOutput('7b0a'), '7b0a', 'hex 解出来不是合法 JSON 时必须原样返回，不许只看首字符');
+  // 合法 hex 但解出来不是 JSON 对象：同样原样返回
+  const notJsonHex = Buffer.from('hello world', 'utf8').toString('hex');
+  assertEqual(decodeKeychainOutput(notJsonHex), notJsonHex, 'hex 解出来不是 JSON 对象时必须原样返回，不许猜');
+  assertEqual(decodeKeychainOutput(Buffer.from('[1,2,3]', 'utf8').toString('hex')), Buffer.from('[1,2,3]', 'utf8').toString('hex'), 'hex 解出来是数组（不是对象）时必须原样返回');
+  // 合法 hex 但解出来不是合法 UTF-8（0xff 0xfe）：同样原样返回
+  assertEqual(decodeKeychainOutput('fffe'), 'fffe', 'hex 解出来不是合法 UTF-8 时必须原样返回');
+  // 奇数长度的 hex 不可能是完整字节序列
+  assertEqual(decodeKeychainOutput('7b0'), '7b0', '奇数长度的 hex 必须原样返回');
+  /*
+   * 残留的不精确，**如实钉在这里**而不是假装不存在：`7b7d` 是合法 hex、解码后是合法 JSON 对象 `{}`，
+   * 所以会被当成 hex 还原。原理上 `security` 不告诉你它打印的是原文还是 hex，这种撞车无法区分；
+   * 但我们的载荷由 `encodeVault` 产出（一定是 {version,updatedAt,secrets} 形状），
+   * 绝不可能是字面量 `7b7d`，所以这条不会在真实路径上触发。
+   */
+  assertEqual(decodeKeychainOutput('7b7d'), '{}', '（已知且无害的残留）纯 hex 且解码为 JSON 对象时会被还原；真实载荷不可能长这样');
+
+  // 与后端口径对齐：还原后的文本必须能被 JSON.parse 读出那两条金丝雀
+  const parsed = JSON.parse(decodeKeychainOutput(hexForm));
+  assertEqual(parsed.secrets['imap:test'], CANARY_IMAP, '还原之后要能被 JSON.parse 读出金丝雀（否则等于没修）');
+
+  return '离线仿真通过：hex 打印（macOS 26 实测形态）还原成原文、原文与各种"像 hex 但不是"的值一律原样返回、还原结果可被 JSON.parse 读出金丝雀';
+});
+
 /* -------------------------------------------------- B2. macOS：钥匙串真跑（临时钥匙串 + 搜索列表） */
 
 await test('macOS 钥匙串：临时钥匙串 + 搜索列表把它排在第一位的真跑往返（结束严格还原并核对；登录钥匙串一个字节都不碰）', async () => {
@@ -1085,8 +1139,18 @@ await test('macOS 钥匙串：临时钥匙串 + 搜索列表把它排在第一�
         inStore() {
           const got = keychainReadRaw();
           assertEqual(got.status, 0, `① 用后端那种读法（不带钥匙串参数、靠搜索列表）应当查得到：${evidenceText(got)}`);
+          /*
+           * 读回来可能是**原文**，也可能是 `security` 的**十六进制打印**（macOS 26 上，凡不是
+           * "干净可打印单行文本"的内容都会这样，而保管内容正是带换行的 pretty JSON——CI 实测）。
+           * 这里用与后端**同一个**还原函数，所以这条断言的语义没变：钥匙串里确实存着那份含金丝雀的
+           * 内容。顺便把"这次是哪种形式"打出来，免得下一个人以为 macOS 的读坏了。
+           */
+          const text = decodeKeychainOutput(got.stdout);
+          if (text !== got.stdout) {
+            console.log(`      ① 证据：security 以十六进制打印（${got.stdout.length} 个 hex 字符），已还原`);
+          }
           assert(
-            got.stdout.includes(CANARY_IMAP),
+            text.includes(CANARY_IMAP),
             `① 钥匙串里存的应当就是那份保管内容（含金丝雀）；原始输出=${clip(got.stdout)}；status=${got.status}`,
           );
           return true;

@@ -118,8 +118,24 @@ export function makeSelfSignedCert({ commonName = 'localhost', altNames = [], da
   const now = new Date();
   const notBefore = new Date(now.getTime() - 5 * 60_000);
   const notAfter = new Date(now.getTime() + days * 86_400_000);
-  const serial = crypto.randomBytes(8);
-  serial[0] &= 0x7f; // 正数
+  /*
+   * 序列号：必须是一个**最短编码**的 DER INTEGER。
+   *
+   *   - INTEGER 是**有符号**的，首字节最高位为 1 会被读成负数，所以先掩成 0x7f；
+   *   - 但掩位有 1/128 的概率把首字节变成 **0x00**，那就多出一个"冗余前导零"——
+   *     DER 不允许（只有当下一个字节最高位为 1 时，前导 0x00 才是必需的）。
+   *
+   * 这不是纸上谈兵：OpenSSL 3.x 会**直接拒收**整张证书，报
+   * `ERR_OSSL_ASN1_ILLEGAL_PADDING : asn1 encoding routines::illegal padding`。
+   * CI 上就是这么偶发红的（`test (windows-latest / node 22)` 的"启用 HTTPS 后真的走 TLS"），
+   * 本机压测 300 次复现 2 次；把首字节强制成 0x00 时几乎必现，强制成 0x01 时 5/5 通过。
+   * 所以这里**重摇**到首字节非零为止，而不是把非法编码交给运气。
+   */
+  let serial;
+  do {
+    serial = crypto.randomBytes(8);
+    serial[0] &= 0x7f;
+  } while (serial[0] === 0);
 
   const extensions = seq(
     // basicConstraints: CA=FALSE（critical）
@@ -148,7 +164,20 @@ export function makeSelfSignedCert({ commonName = 'localhost', altNames = [], da
   );
   const signature = crypto.sign('sha256', tbs, privateKey);
   const certDer = seq(tbs, SHA256_RSA, tlv(0x03, Buffer.concat([Buffer.from([0]), signature])));
-  const b64 = (buf) => buf.toString('base64').replace(/(.{64})/g, '$1\n');
+  /*
+   * PEM 正文每行 64 字符。
+   *
+   * ⚠️ 这里的 `(?=.)` 不是装饰：写成 `replace(/(.{64})/g, '$1\n')` 时，**base64 长度正好是 64 的整数倍**
+   * 的那一档会在末尾多出一个换行，而模板里紧接着又有一个 `\n`，于是 BEGIN/END 之间多出一个**空行**——
+   * OpenSSL 读到空行就停了，DER 被截断，整张证书被拒收。
+   *
+   * 这不是理论：本机实测（证书 DER 767 字节 → base64 恰好 1024 = 16×64）
+   * `tls.createSecureContext` 报 `SSL_CTX_use_certificate_chain`、`new X509Certificate()` 报
+   * `ERR_OSSL_ASN1_WRONG_TAG ... wrong tag`；把 commonName 改一个字母（DER 761 字节 → base64 1016）
+   * 立刻就好。而这个长度由**允许的域名/IP 列表**决定，也就是说约 1/16 的配置会撞上——
+   * 用户开启 HTTPS 后证书直接被拒，正是 CI 上"启用 HTTPS 后真的走 TLS"偶发红的那一类。
+   */
+  const b64 = (buf) => buf.toString('base64').replace(/(.{64})(?=.)/g, '$1\n');
 
   return {
     commonName,

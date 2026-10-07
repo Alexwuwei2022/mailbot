@@ -51,8 +51,17 @@ export function makeSelfSignedCert(commonName = 'target.invalid') {
    */
   const name = seq(set(seq(CN, utf8(commonName))));
   const now = new Date();
-  const serial = crypto.randomBytes(8);
-  serial[0] &= 0x7f; // 正数
+  /*
+   * 序列号必须是**最短编码**的 DER INTEGER：INTEGER 有符号，先掩成 0x7f；
+   * 而掩位有 1/128 的概率把首字节变成 0x00，那会多出一个"冗余前导零"，OpenSSL 3.x
+   * 直接拒收整张证书（`ERR_OSSL_ASN1_ILLEGAL_PADDING`）。所以重摇到首字节非零。
+   * 同一处修复也在 server/lib/x509.js（那份是真正在用的，这份是测试夹具）。
+   */
+  let serial;
+  do {
+    serial = crypto.randomBytes(8);
+    serial[0] &= 0x7f; // 正数
+  } while (serial[0] === 0);
 
   const tbs = seq(
     tlv(0xa0, int(Buffer.from([2]))), // version v3
@@ -65,7 +74,9 @@ export function makeSelfSignedCert(commonName = 'target.invalid') {
   );
   const signature = crypto.sign('sha256', tbs, privateKey);
   const certDer = seq(tbs, SHA256_RSA, tlv(0x03, Buffer.concat([Buffer.from([0]), signature])));
-  const b64 = (buf) => buf.toString('base64').replace(/(.{64})/g, '$1\n');
+  // PEM 正文每行 64 字符；`(?=.)` 保证 base64 长度正好整除 64 时**不会**多留一个空行
+  //（空行会让 OpenSSL 停读、DER 被截断 —— 同一处修复见 server/lib/x509.js 的详细说明）
+  const b64 = (buf) => buf.toString('base64').replace(/(.{64})(?=.)/g, '$1\n');
   return {
     commonName,
     key: `-----BEGIN PRIVATE KEY-----\n${b64(privateKey.export({ type: 'pkcs8', format: 'der' }))}\n-----END PRIVATE KEY-----\n`,
