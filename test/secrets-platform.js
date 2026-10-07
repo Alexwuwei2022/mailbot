@@ -10,9 +10,9 @@
  * | 平台 | 本套件做什么 |
  * | --- | --- |
  * | Windows | 真跑 DPAPI（`powershell` + `ProtectedData`）：写入 → 读回 → 校验 → 清除 |
- * | macOS | 真跑钥匙串：`security create-keychain` 建**临时钥匙串**（不碰登录钥匙串），同样整条往返 |
+ * | macOS | 真跑钥匙串：`security create-keychain` 建**临时钥匙串**（不碰登录钥匙串），同样整条往返；读靠"搜索列表只含临时钥匙串"，结束**严格还原并核对** |
  * | Linux | 先尝试真跑（`dbus-run-session` + `gnome-keyring` + 真 `secret-tool`）；起不来就**显式跳过**并打印原因，改由"命令级"验证兜住 |
- * | 任意 | 后端探测口径、"降级必然可见"的断言（这条三个平台都真跑） |
+ * | 任意 | 后端探测口径、"降级必然可见"的断言（这条三个平台都真跑）、搜索列表守卫的**离线仿真**（本机可跑） |
  *
  * ## 两条不可退让的规矩
  *
@@ -21,9 +21,16 @@
  *    ⚠️ 因此"跳过"只允许用在**该能力在该平台确实不存在**的时候；
  *    某个平台本来该有的能力挂了，这里只会**变红**，不会被悄悄跳过。
  * 2. **不留痕迹**：
- *    - macOS 用临时钥匙串，并把它**显式钉给后端**（`__setKeychainPathForTest`），
- *      所以压根不需要改默认钥匙串/搜索列表——用户的登录钥匙串一个字节都不会被碰；
- *      用例结束（含失败）都 `security delete-keychain` + 删目录。
+ *    - macOS 用临时钥匙串，并把它**钉给后端**（`__setKeychainPathForTest`）：写/清带临时钥匙串的位置参数，
+ *      **读**则靠"把搜索列表临时设成只含它"——因为 `security` 的读命令没有"指定钥匙串"的选项
+ *      （`find-generic-password` 的 `[keychain...]` 只是"搜索列表兜底"语义，裸路径照样会先命中
+ *      搜索列表里同名旧条目）。搜索列表是**全局状态**，所以只在 macOS 用例里动、无论成功失败都在
+ *      finally **严格还原**，并在用例内部断言"已还原"（守卫逻辑见 test/lib/keychain-searchlist.mjs）。
+ *      唯一兜不住的是进程被 **SIGKILL**（`finally` 不会执行）——CI 是一次性 runner，真机跑也只是
+ *      临时改一次搜索列表，且下次运行开头就会重新记下并还原。
+ *      临时钥匙串本身用完就删（含目录）。
+ *    - 用户的登录钥匙串**一个字节都不会被碰**：只读它的条目存在性，**不带 `-w`**（不解密、不触发
+ *      口令校验/弹窗），且带超时。
  *    - Linux 的钥匙环数据落在临时目录（`XDG_DATA_HOME`），不写进 runner 的 HOME。
  *    - 假 `secret-tool` 是**测试自己生成的**可执行文件（不是项目依赖），用完即删。
  *
@@ -36,6 +43,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { makeTempDir } from './lib/tmp.js';
+import { createSearchListGuard } from './lib/keychain-searchlist.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -160,6 +168,17 @@ const SPAWN_PROBE = probePipedSubprocess();
 const CAN_SPAWN = SPAWN_PROBE.ok;
 
 /* ------------------------------------------------------------ 小工具 */
+
+/**
+ * macOS 用例期间**实际生效**的搜索列表（读就是靠它定位条目的）。
+ *
+ * 声明在整个文件最前面、而不是放在 macOS 用例旁边：`vaultEvidenceText` 在**前面**的用例里
+ * （骨架自检、DPAPI 等）也会被调用，模块级的 `let` 在初始化之前被访问会直接 TDZ 报错。
+ */
+let activeSearchList = null;
+function searchListNote() {
+  return activeSearchList ? ` 当时搜索列表=${JSON.stringify(activeSearchList)}` : '';
+}
 
 /** 递归找"某个明文值出现在哪些文件里"（② 的判据：必须是空数组）。 */
 function findPlaintext(dir, needle) {
@@ -452,10 +471,10 @@ async function realBackendRoundtrip({ mode, label, hooks = {} }) {
 
     // ③ 清除之后读不到，系统保管里也确实没有
     const cleared = clearVault(mode, { dataDir });
-    assert(cleared.ok, `清除「${label}」失败：${cleared.error || ''}`);
+    assert(cleared.ok, `清除「${label}」失败：${cleared.error || ''}；原始证据=${vaultEvidenceText(cleared)}`);
     resetVaultCache();
     const after = readVault(mode, { dataDir, force: true });
-    assert(after.ok, '清除后读取不应报错');
+    assert(after.ok, `清除后读取不应报错；原始证据=${vaultEvidenceText(after)}`);
     const afterDecoded = after.data ? decodeVault(after.data) : { ok: true, secrets: {} };
     assertEqual(afterDecoded.secrets['imap:test'] || null, null, `③ 清除后「${label}」里不应还能读到值`);
     if (hooks.notInStore) assert(hooks.notInStore(), `③ 清除后系统保管里也应该没有（${label}）`);
@@ -583,7 +602,42 @@ await test('Windows DPAPI：真跑往返（密文落盘、明文不落盘、清�
   });
 });
 
-/* -------------------------------------------------- B2. macOS：钥匙串真跑（临时钥匙串） */
+/* -------------------------------------------------- B2. macOS：钥匙串真跑（临时钥匙串 + 搜索列表） */
+
+/*
+ * ## 用到的 `security` 子命令与旗标（逐条核对）
+ *
+ * **依据**：macOS 自带 `security` 工具打印的用法文本，即 `security <子命令> -h` 的 `Usage:` 一行
+ * （也就是 SecurityTool 的 man page `security(1)`）。本机是 Windows，跑不了 macOS，所以这里逐条列出
+ * "用法行里我们用到的那几个"，不用到的可选旗标一律不写、也不猜。
+ *
+ *   子命令                     用法行里我们用到的（★ = 我们真的传了）                       用在哪
+ *   create-keychain            ★ -p <口令> + 位置参数（钥匙串名）                            ② 建临时钥匙串
+ *   unlock-keychain            ★ -p <口令> + 位置参数                                       ② 解锁
+ *   list-keychains             ★ -s [钥匙串...]（不带 -s 即打印当前搜索列表）                ③ 记下 / 设为唯一 / 还原 / 核对
+ *   default-keychain           ★ -d user（只读查询）                                         ① 取登录钥匙串路径
+ *   set-key-partition-list     ★ -S <分区表> ★ -s ★ -k <口令> + 位置参数                     ④ 让"读"能非交互解密
+ *   add-generic-password       ★ -a <账号> ★ -s <服务> ★ -w <口令> ★ -U + 位置参数           ⑤⑥ 写入（U = 存在就覆盖）
+ *   find-generic-password      ★ -a <账号> ★ -s <服务> ★ -w，**没有 -k**，位置参数可选        读（后端 read() 不带位置参数）
+ *   delete-generic-password    ★ -a <账号> ★ -s <服务> + 位置参数                            清除
+ *   delete-keychain            位置参数                                                       清理
+ *
+ * 两条**硬事实**（不是推断）：
+ *   1. `find-generic-password` 上**没有** `-k`：上一轮 CI 的原始报错就是
+ *      `find-generic-password: illegal option -- k`。`-k` 只出现在别的子命令语义里
+ *      （`set-key-partition-list -k <口令>`）。
+ *   2. 读命令末尾那个 `[keychain...]` 是**兜底**语义（先搜搜索列表），所以"钉住读取"只能靠改搜索列表。
+ *
+ * 为了不把"我引用的用法文本对不对"变成赌注，这里还有两层保险：
+ *   - 每条命令都用 `sec()` 跑：一旦 `security` 回显 `illegal option` / `unknown option`，
+ *     立刻**带着原始输出**判失败（正是上一轮让我三分钟定位真因的那种输出）；
+ *   - 每条命令都断言退出码为 0（`list-keychains -s`、`add/delete-*` 等），等于在 macOS CI 上
+ *     把"这些旗标真实存在"再复核一遍。
+ *
+ * 附：项目里没有用到 `find-keychain`——`security` 里也没有这个子命令。
+ * （本会话的联网抓取被环境挡住，无法在此附 man page 原文链接；上面这套"逐条列出 + CI 退出码复核"
+ *   就是为了不依赖任何无法在 CI 之前证伪的说法。）
+ */
 
 function security(args, { timeout = 20000 } = {}) {
   const res = spawnSync('security', args, { encoding: 'utf8', timeout, windowsHide: true });
@@ -596,11 +650,34 @@ function security(args, { timeout = 20000 } = {}) {
 }
 
 /**
+ * `security` 遇到**该子命令不存在**的旗标时的原样回显。
+ *
+ * 为什么单独盯这个：上一轮 macOS CI 红的真因，就是读命令上拼了一个不存在的 `-k`，
+ * 报错是 `find-generic-password: illegal option -- k`。这类错误与"钥匙串里没这个条目"
+ * 长得完全不同，一旦出现就必须立刻按原始输出失败，绝不能被别的分支吞掉、也不能改写成笼统文案。
+ */
+const ILLEGAL_OPTION = /illegal option|unknown option|invalid option|unrecognized option/i;
+
+/**
+ * 跑一条 `security` 命令，并**当场核对旗标是否存在**（只看 security 的原样回显）。
+ *
+ * 只在主流程里用：清理（finally）里必须用裸 `security()`——清理阶段抛错会把真正的失败原因顶掉。
+ */
+function sec(args, opts) {
+  const res = security(args, opts);
+  const text = `${res.stdout || ''}\n${res.stderr || ''}`;
+  if (ILLEGAL_OPTION.test(text)) {
+    throw new Error(`security ${args[0]}：命令行里出现了该子命令不存在的旗标（security 原样回显：${evidenceText(res)}）`);
+  }
+  return res;
+}
+
+/**
  * 把一条 `security` 调用的**原始证据**压成一行，供断言消息使用。
  *
  * 为什么非要有这个：这一套件本来的失败信息是「保管内容应能解析」——在 CI 日志里
- * 那句话等于零信息（2026-xx 的 macOS 红就是这么被发现的：知道它红了，但完全不知道
- * `security` 到底回了什么）。从现在起，凡是"读回来的东西不对劲"的断言，都必须把
+ * 那句话等于零信息（macOS 那次红就是这么被发现的：知道它红了，但完全不知道
+ * `security` 到底回了什么）。凡是"读/写/清除不对劲"的断言，都必须把
  * stdout / stderr / 退出码原样贴出来。
  */
 function evidenceText(res) {
@@ -611,15 +688,22 @@ function evidenceText(res) {
 }
 
 /**
- * 后端读回来的结果里的原始证据（`security find-generic-password -w` 的输出）。
+ * 后端读/写/清除结果里的原始证据。
  *
  * 顺带解释一个反直觉之处：`readVault` 成功时 `data` 是 `stdout`，而 `stdout` 为**空串**
  * 时会被归一成 `null`——所以"能读到条目、但内容是空的"在调用方看来是 `data === null`，
  * 与"没存过"长得一模一样。这正是必须看原始 `status/stdout` 而不能只看 `ok/data` 的原因。
+ *
+ * `定位方式`（`how`）如实说明这条命令是怎么找到条目的：读命令**不带钥匙串参数**，靠搜索列表；
+ * 写/清带钥匙串位置参数。特意不把两者混为一谈——上一轮的坑就是"以为读也钉住了"。
  */
 function vaultEvidenceText(rb) {
   const e = rb?.evidence || null;
-  return `status=${e?.status ?? '未知'} stdout=${JSON.stringify(e?.stdout ?? null)} stderr=${JSON.stringify(e?.stderr ?? null)} keychain=${e?.keychain ?? '(未钉住)'}`;
+  const raw =
+    e && ('stdout' in e || 'stderr' in e)
+      ? `stdout=${JSON.stringify(e.stdout ?? null)} stderr=${JSON.stringify(e.stderr ?? null)}`
+      : 'stdout/stderr=（刻意未记录：写命令的原始输出可能回显含明文的命令行）';
+  return `status=${e?.status ?? '未知'} ${raw} keychain=${e?.keychain ?? '(未钉住)'} 定位方式=${e?.how ?? '未标注'}${searchListNote()}`;
 }
 
 /** 一行化 + 截断（raw 证据可能很长，但关键的前若干字符通常就够定位） */
@@ -629,55 +713,139 @@ function clip(text, n = 400) {
 }
 
 /**
- * 用 `-w` 真读一次，返回**命令的原始结果**（退出码 / stdout / stderr 都在）。
+ * 用**后端实际用的那种读法**真读一次，返回命令的原始结果（退出码 / stdout / stderr 都在）。
  *
- * ⚠️ 刻意**不**用 `security find-generic-password`（不带 `-w`）判断条目存在性：
- * 两者在真实钥匙串上的授权路径不同（不带 `-w` 只读属性，可能根本不触发口令校验），
- * 拿它当"条目在不在"的证据会给出误导性的结论。这里一律用真读。
+ * ⚠️ 这里刻意**不带任何钥匙串参数**：`security find-generic-password` 没有"指定钥匙串"的选项
+ * （用法行：`find-generic-password [-h] [-a account] [-s service] [options...] [-g] [keychain...]`，
+ * 里面没有 `-k`），它末尾的 `[keychain...]` 只是"搜索列表兜底"语义。所以"读到底落在哪个钥匙串"
+ * **完全由搜索列表决定**——macOS 用例把搜索列表设成只含临时钥匙串，这条读法才会落在临时钥匙串上。
+ * 也正因为如此，这里用的是与后端 `read()` **一字不差**的命令：换个形式问出来的结论不构成证据。
  */
-function keychainReadRaw(kc, { pinned = true } = {}) {
-  const base = ['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w'];
-  return security(pinned && kc ? [...base, '-k', kc] : base);
-}
-
-/** 解析 `security list-keychains` 的输出（每行一个带引号的路径） */
-function parseSearchList(res) {
-  if (!res || res.status !== 0 || !res.stdout) return [];
-  return res.stdout
-    .split('\n')
-    .map((line) => {
-      const m = line.match(/"([^"]+)"/);
-      return m ? m[1] : line.trim();
-    })
-    .filter(Boolean);
+function keychainReadRaw() {
+  return security(['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w']);
 }
 
 /** 默认（登录）钥匙串路径；拿不到就返回 null（那就不做"没被碰过"的附加断言） */
 function defaultKeychainPath() {
-  const res = security(['default-keychain', '-d', 'user']);
+  // `default-keychain -d user` 是**只读**查询
+  // （用法行：`default-keychain [-h] [-d user|system|common|dynamic] [-s [keychain]]`）；
+  // 带超时，杜绝任何形式的等待
+  const res = security(['default-keychain', '-d', 'user'], { timeout: 10000 });
   if (res.status !== 0) return null;
   const m = res.stdout.match(/"([^"]+)"/);
   return m ? m[1] : null;
 }
 
 /**
- * 某个钥匙串里有没有 mailbot 的条目。
+ * 登录（默认）钥匙串里有没有 mailbot 的条目：**只读条目属性、绝不带 `-w`**。
  *
- * 这里用 `-w` 真读：**只有真读**才对"这个隔离方式到底成立不成立"有说服力
- * （不带 `-w` 只读属性，权限/授权路径不同，会给出误导性的"存在"）。真读失败时
- * 如实把原始输出带出来，而不是笼统一句 unknown。
+ * 为什么不带 `-w`：这条检查只是"用户在登录钥匙串里原有的东西有没有被我们改动"的**附加证据**，
+ * 而 `-w` 要解密数据，可能弹"允许访问钥匙串"窗口——在 CI 非交互环境里那是既危险又无必要
+ * （弹窗 = 挂住或直接失败）。不带 `-w` 只读属性，不触发口令校验；再配 10s 超时。
+ *
+ * 为什么把钥匙串路径当**位置参数**：搜索列表在用例期间被设成只含临时钥匙串，而这条检查问的是
+ * 登录钥匙串。调用点只有两处——"动搜索列表之前"和"临时钥匙串已经删掉之后"——两处的搜索列表
+ * 都是原始值，位置参数把目标钉在登录钥匙串上。
+ * 拿不到结论就如实记 `unknown(...)`（带原始输出），不猜。
  */
-function keychainHasItem(keychainPath) {
-  if (!keychainPath) return 'unknown';
-  // 用与后端 Query 完全一致的 `-k` 形式（而不是裸路径）：这条断言的意思是"我们只动了临时钥匙串"，
-  // 那就必须用**我们实际用的那种读法**去问，换个形式问出来的结论不构成证据。
-  const res = security(['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w', '-k', keychainPath]);
+function loginKeychainHasItem() {
+  const kc = defaultKeychainPath();
+  if (!kc) return 'unknown';
+  const res = security(['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', kc], { timeout: 10000 });
   if (res.status === 0) return true;
-  if (res.status === 44 || /could not be found/i.test(res.stderr)) return false;
+  if (res.status === 44 || /could not be found/i.test(`${res.stderr}\n${res.stdout}`)) return false;
   return `unknown(${evidenceText(res)})`;
 }
 
-await test('macOS 钥匙串：临时钥匙串里的真跑往返（登录钥匙串一个字节都不碰）', async () => {
+/* -------------------------------------------------- B2-0. 搜索列表守卫（离线仿真，跨平台） */
+
+await test('搜索列表守卫（离线仿真）：记下 → 设为唯一 → 逐项还原 → 核对，"没还原回去"必须被发现', async () => {
+  /*
+   * 这段逻辑（记下原始搜索列表 → 设为只含临时钥匙串 → finally 严格还原 → 核对一致）真正跑在
+   * macOS 上，本机是 Windows 跑不到。为了不靠"读代码觉得对"，这里用**注入的假 `security`**
+   * 把**同一份守卫代码**（test/lib/keychain-searchlist.mjs）在本地跑一遍，包括反例：
+   *
+   *   - 好的假 security：还原后必须报 ok，且列表与原始值**逐项含顺序**一致；
+   *   - 坏的假 security（只让第一条 `-s` 生效 = "还原命令执行了但没生效"）：必须报 ok=false，
+   *     并把原值/现值都带出来——"看起来还原了"是这里最不能接受的事；
+   *   - 没记下原始值就想改搜索列表：必须被直接拦住（否则改了就没法还原）。
+   *
+   * ⚠️ 这是**逻辑仿真，不是真机验证**：它只证明分支逻辑对，真机结论仍只由 macOS CI 给出。
+   * 用注入假实现而不是起一个真的假 `security` 脚本，是因为受限沙箱里起不了管道子进程；
+   * 好处是验的确实是同一份守卫代码，而不是另写一套仿真。
+   */
+  const fakeSecurity = ({ applySetCommands = Infinity } = {}) => {
+    const state = {
+      // 刻意放一个**带空格**的路径：证明解析与还原都是按"引号里的整条路径"来的，不是按空格切
+      list: ['/Users/test/Library/Keychains/login.keychain-db', '/Library/Keychains/我的 钥匙串.keychain-db'],
+      calls: [],
+      applied: 0,
+    };
+    const run = (args) => {
+      state.calls.push(args.join(' '));
+      if (args[0] !== 'list-keychains') {
+        return { status: 1, stdout: '', stderr: `fake security: 不认识的子命令 ${args[0]}`, error: null };
+      }
+      const rest = args.slice(1);
+      if (rest[0] === '-s') {
+        state.applied += 1;
+        if (state.applied <= applySetCommands) state.list = rest.slice(1);
+        return { status: 0, stdout: '', stderr: '', error: null };
+      }
+      return { status: 0, stdout: state.list.map((p) => `    "${p}"`).join('\n') + '\n', stderr: '', error: null };
+    };
+    return { state, run };
+  };
+
+  // ① 正常路径
+  const good = fakeSecurity();
+  const guard = createSearchListGuard({ run: good.run });
+  assertEqual(guard.touched(), false, '还没动过搜索列表时不该报"动过"');
+  const snap = guard.snapshot();
+  assert(snap.ok, `记下原始搜索列表应成功（假 security 原始输出=${JSON.stringify(snap.res?.stdout)}）`);
+  assertEqual(snap.list.length, 2, '带引号的多行输出应被如实解析成 2 项');
+  assertEqual(snap.list[0], '/Users/test/Library/Keychains/login.keychain-db', '第一项应是登录钥匙串');
+  assertEqual(snap.list[1], '/Library/Keychains/我的 钥匙串.keychain-db', '带空格的路径必须整条保留（不能按空格切）');
+
+  const restrict = guard.restrictTo('/tmp/mailbot-test.keychain-db');
+  assert(restrict.ok, `把搜索列表设为只含临时钥匙串应成功（假 security 原样输出=${JSON.stringify(restrict.res)}）`);
+  assertEqual(guard.read().list.join('|'), '/tmp/mailbot-test.keychain-db', '设置之后搜索列表应只剩临时钥匙串（读就是靠它定位）');
+  assertEqual(guard.touched(), true, '动过搜索列表之后必须如实标记（否则就不会还原）');
+
+  const back = guard.restore();
+  assertEqual(back.skipped, false, '动过就必须真的执行还原命令，不能跳过');
+  assert(back.ok, `还原后核对应当通过：原始=${JSON.stringify(back.before)} 现值=${JSON.stringify(back.after)}`);
+  assertEqual(back.after.join('|'), snap.list.join('|'), '还原必须**逐项含顺序**一致（顺序就是查找优先级）');
+  assertEqual(guard.read().list.join('|'), snap.list.join('|'), '最终搜索列表必须真的回到原值');
+
+  // ② 反例：还原命令"执行了但没生效"——必须被发现，且把原值/现值都带出来
+  const bad = fakeSecurity({ applySetCommands: 1 });
+  const guard2 = createSearchListGuard({ run: bad.run });
+  assert(guard2.snapshot().ok, '反例前置：记下原始列表应成功');
+  assert(guard2.restrictTo('/tmp/mailbot-test.keychain-db').ok, '反例前置：设为唯一应成功');
+  const badBack = guard2.restore();
+  assertEqual(badBack.ok, false, '还原没生效时必须如实报 ok=false（"看起来还原了"是这里最不能接受的事）');
+  assertEqual(badBack.sameSet, false, '少了一个钥匙串，应能被 sameSet 区分出来（而不是与"只是顺序不同"混为一谈）');
+  assertEqual(badBack.before.length, 2, '失败信息里必须带**原始值**');
+  assertEqual(badBack.after.join('|'), '/tmp/mailbot-test.keychain-db', '失败信息里必须带**现值**');
+
+  // ③ 没记下原始值就不许动搜索列表（否则改了没法还原）
+  const guard3 = createSearchListGuard({ run: fakeSecurity().run });
+  let blocked = '';
+  try {
+    guard3.restrictTo('/tmp/x');
+  } catch (err) {
+    blocked = err.message;
+  }
+  assertIncludes(blocked, 'snapshot', '没记下原始列表就想改搜索列表，必须被直接拦住');
+  assertEqual(guard3.restore().skipped, true, '没动过就不该执行还原命令（空操作）');
+
+  return '离线仿真通过：解析带引号（含空格）的路径、设为唯一、逐项还原、还原失效会被 ok=false + 原值/现值暴露（真机结论仍由 macOS CI 给出）';
+});
+
+/* -------------------------------------------------- B2. macOS：钥匙串真跑（临时钥匙串 + 搜索列表） */
+
+await test('macOS 钥匙串：临时钥匙串 + 搜索列表只含它的真跑往返（结束严格还原并核对；登录钥匙串一个字节都不碰）', async () => {
   if (process.platform !== 'darwin') {
     return { skip: `macOS 钥匙串只在 darwin 上存在（本机是 ${process.platform}，该能力在本平台确实不存在）` };
   }
@@ -688,18 +856,29 @@ await test('macOS 钥匙串：临时钥匙串里的真跑往返（登录钥匙�
   const kcDir = makeTempDir('mailbot-keychain-');
   const kcName = path.join(kcDir, 'mailbot-test.keychain');
   const pw = `mailbot-test-${process.pid}`;
+  /** 搜索列表守卫：记下原始值 → 设为只含临时钥匙串 → finally 严格还原 + 核对 */
+  const guard = createSearchListGuard({ run: (args, opts) => security(args, opts) });
   let created = false;
+  let kc = null;
+  let restored = null;
   let cleanedUp = false;
+  let mainError = null;
   let detail = '';
-  /** 实际生效的隔离方式：'钉住路径' 或 '搜索列表'（后者是钉住路径对**读取**不生效时的兜底） */
-  let isolation = '钉住路径';
-  /** `security` 的原始搜索列表：**必须在 finally 里严格还原** */
-  let searchListBefore = null;
-  let searchListAdded = false;
-  /** 为什么降级到"搜索列表"方式（只在真的降级时有值，用于报告与失败信息） */
-  let fallbackWhy = null;
+  let loginBefore = 'unknown';
   try {
-    const made = security(['create-keychain', '-p', pw, kcName]);
+    /*
+     * ① 先取基线，且必须在动任何全局状态**之前**：
+     *    - 搜索列表的原始值（守卫之后拿它还原）；
+     *    - 登录钥匙串里 mailbot 条目的存在性（只读属性、不带 -w 的检查）。
+     */
+    const snap = guard.snapshot();
+    assert(snap.ok, `应能读到原始的钥匙串搜索列表（list-keychains 原样输出=${evidenceText(snap.res)}）`);
+    console.log(`      原始搜索列表（${snap.list.length} 项）：${snap.list.join(' | ')}`);
+    loginBefore = loginKeychainHasItem();
+    console.log(`      登录钥匙串基线：mailbot 条目存在性=${loginBefore}（只读属性、不带 -w、10s 超时）`);
+
+    // ② 建临时钥匙串（用完必删）
+    const made = sec(['create-keychain', '-p', pw, kcName]);
     assertEqual(made.status, 0, `security create-keychain 失败：${evidenceText(made)}`);
     created = true;
 
@@ -709,103 +888,90 @@ await test('macOS 钥匙串：临时钥匙串里的真跑往返（登录钥匙�
      */
     const files = fs.readdirSync(kcDir).filter((f) => f.startsWith('mailbot-test.keychain'));
     assertEqual(files.length, 1, `应正好建出一个临时钥匙串文件（实际：${files.join('、') || '无'}）`);
-    const kc = path.join(kcDir, files[0]);
+    kc = path.join(kcDir, files[0]);
 
-    const unlocked = security(['unlock-keychain', '-p', pw, kc]);
+    const unlocked = sec(['unlock-keychain', '-p', pw, kc]);
     assertEqual(unlocked.status, 0, `临时钥匙串应能解锁：${evidenceText(unlocked)}`);
 
     /*
-     * 关键一步之一（标准做法）：`security set-key-partition-list`。
+     * ③ 把搜索列表**设为只包含临时钥匙串**——这是让"读"也落到它的**唯一可靠**办法。
      *
-     * `security add-generic-password` 建出来的条目，其访问控制默认只认"创建者的分区"。
-     * 于是**写入**（`add-generic-password`）成功，之后**读取**（`find-generic-password -w`
-     * 要解密数据）却会被系统拒绝——非交互环境下拿不到用户确认，结果就是退出码非 0
-     * （或输出为空）。把分区列表设成 `apple-tool:,apple:` 正是让 `security` 自身能
-     * 非交互读取自己写的条目的标准前置步骤。
+     * 为什么不是给读命令加参数：`find-generic-password` 没有"指定钥匙串"的选项
+     * （上一轮 CI 的 `find-generic-password: illegal option -- k` 就是证据），它末尾那个
+     * `[keychain...]` 位置参数是"搜索列表兜底"语义——搜索列表里命中同名旧条目时根本轮不到它，
+     * 于是读可能落到用户的登录钥匙串上。
      *
-     * 全程不触发任何交互：`-k` 提供钥匙串口令，命令带超时，绝不用会弹"取密码"窗口的形式。
+     * 改搜索列表动的是**全局状态**，因此：只在 macOS 用例里做；无论成功失败都在 finally 还原；
+     * 用例内部还会**断言**"最终搜索列表已还原"（见本用例收尾那段）。
+     * 守卫逻辑单独成模块（test/lib/keychain-searchlist.mjs），本机可用假 security 离线仿真它。
+     *
+     * 刻意**不**保留系统钥匙串：本用例只读/写自己建的临时钥匙串，不需要任何别的钥匙串。
+     * 若 CI 证明 `security` 自身非要有系统钥匙串才肯工作，再按**实测结论**调整（不是靠猜）。
      */
-    const part = security(['set-key-partition-list', '-S', 'apple-tool:,apple:', '-s', '-k', pw, kc], { timeout: 60000 });
-    if (part.status !== 0) {
-      /*
-       * 某些 macOS 版本要求钥匙串**已在搜索列表里**才肯接受这条命令。那就不把它当致命错误：
-       * 先按标准路径试一次，失败就交给下面的"搜索列表"兜底（那一步做完会再设一次分区列表）。
-       * 但绝不静默——原始输出必须留下。
-       */
-      console.log(`      ⚠️ security set-key-partition-list（未加入搜索列表时）退出码 ${part.status}：${evidenceText(part)}`);
+    const restrict = guard.restrictTo(kc);
+    assert(restrict.ok, `把搜索列表设为只含临时钥匙串应成功：${evidenceText(restrict.res)}`);
+    const nowList = guard.read();
+    assert(
+      nowList.list.length === 1 && nowList.list[0] === kc,
+      `前置条件：搜索列表此刻应当**只有**临时钥匙串；原样输出=${evidenceText(nowList.res)}`,
+    );
+    // 之后所有失败证据里都会带上"当时生效的搜索列表"（读就是靠它定位的）
+    activeSearchList = nowList.list;
+
+    /*
+     * ④ 标准做法：`security set-key-partition-list`。
+     *
+     * `add-generic-password` 建出来的条目，其访问控制只认"创建者的分区"，非交互环境下
+     * 读取（`-w` 要解密）可能被系统拒绝。把分区列表设成 `apple-tool:,apple:` 是让 `security`
+     * 能非交互读回自己写的条目的常规前置步骤（用法行：
+     * `set-key-partition-list -S partition-list [-s] [-k password] [keychain...]`）。
+     *
+     * 这条命令的退出码**不当致命错误**：它只是"让读能成功"的准备步骤，真正有发言权的是下面
+     * 那次**真读**（读不回来就会带着原始证据红）。但绝不静默——非 0 时原样打印原始输出。
+     */
+    const partition = sec(['set-key-partition-list', '-S', 'apple-tool:,apple:', '-s', '-k', pw, kc], { timeout: 60000 });
+    if (partition.status !== 0) {
+      console.log(`      ⚠️ security set-key-partition-list 退出码 ${partition.status}：${evidenceText(partition)}`);
+      console.log('      （先不据此判失败：接下来那次真读若读不回来，会带着原始证据红）');
     }
 
     /*
-     * 关键一步之二：把钥匙串后端**钉到临时钥匙串**上（后端命令显式带钥匙串参数）。
-     *
-     * 这里刻意**不动**搜索列表——搜索列表是全局机器状态，进程被强杀就可能留下痕迹。
+     * ⑤ 把钥匙串后端钉到临时钥匙串上：**写 / 清**用钥匙串位置参数指定目标（那是明确的语义），
+     *    **读**不带任何钥匙串参数、靠上面刚设好的搜索列表。
      */
     __setKeychainPathForTest(kc);
 
-    // 前置条件：临时钥匙串此刻是空的（用真读判断，不看"属性可读"这种间接信号）
-    const empty = keychainReadRaw(kc);
+    // 前置条件：临时钥匙串此刻是空的（用与后端 `read()` **一字不差**的读法判断）
+    const empty = keychainReadRaw();
     assertEqual(empty.status === 0, false, `前置条件：临时钥匙串建出来时应当没有这个条目；原始证据=${evidenceText(empty)}`);
 
     /*
-     * 钉住路径对**读取**到底生不生效？先用真读探一次，别等真跑里再猜。
+     * ⑥ 真读校验（**替代**上一轮那个"要不要用 -k"的隔离探测——`-k` 根本不存在，探测没有意义）：
+     *    往临时钥匙串写一条探测条目，再用**后端那种不带钥匙串参数的读法**把它读回来。
      *
-     * 已知行为：`security find-*` 的**裸路径位置参数**是"搜索列表兜底"语义——先在搜索列表里
-     * 找，找不到才拿这个路径兜底。也就是说**写入**（`add-generic-password` 的钥匙串参数是明确
-     * 的写入目标）可以完全落到临时钥匙串，而**读取**可能仍然按搜索列表走，拿不到这个不在
-     * 列表里的钥匙串。真出现这种情况就降级到"搜索列表"方式（下面那段），
-     * 而不是把用例改成"看起来通过"。
-     *
-     * 生产代码里的读已改用 `-k <钥匙串>`（显式指定，不做列表兜底），所以这条探测**故意仍用
-     * 裸路径形式**：它要回答的是"这个隔离方式对读取到底可靠不可靠"，而不是"我们的代码对不对"。
+     *    这条要证明的正是我们实际依赖的机制："搜索列表 = 只含临时钥匙串"之后，读确实落到它里面，
+     *    而且能非交互解密（分区/ACL 那一步真的起了作用）。读不回来就在这里红，不必等到真跑里再猜。
      */
-    const isolated = security(['add-generic-password', '-U', '-s', 'mailbot-isolation-probe', '-a', 'mailbot', '-w', 'probe', kc]);
-    assertEqual(isolated.status, 0, `隔离探测：往临时钥匙串写一条探测条目应当成功：${evidenceText(isolated)}`);
-    const isolatedRead = security(['find-generic-password', '-s', 'mailbot-isolation-probe', '-a', 'mailbot', '-w', kc]);
-    const pinWorks = isolatedRead.status === 0 && isolatedRead.stdout === 'probe';
-    security(['delete-generic-password', '-s', 'mailbot-isolation-probe', '-a', 'mailbot', kc]);
-    if (!pinWorks) {
-      fallbackWhy = `钉住路径的写入生效，但**读取**没落到临时钥匙串（探测读：${evidenceText(isolatedRead)}）`;
-      console.log(`      ⚠️ ${fallbackWhy}\n      → 改用"把临时钥匙串加入搜索列表"的隔离方式（结束时严格还原）`);
-    }
-    if (!pinWorks) {
-      /*
-       * 兜底：把临时钥匙串加进搜索列表——这是让 `security find-*` 真正到它里面找的唯一可靠办法。
-       *
-       * 两件事一起做：
-       *   ① 先记下**原始搜索列表**（下面 `searchListBefore`），结束时严格还原；
-       *   ② 只**追加**临时钥匙串，绝不删除用户的任何钥匙串，更不碰登录钥匙串的内容
-       *      （只是"搜索时也会看一眼这个临时钥匙串"，登录钥匙串一个字节都没被改）。
-       */
-      const listBefore = security(['list-keychains']);
-      searchListBefore = parseSearchList(listBefore);
-      assert(searchListBefore.length > 0, `应能读到当前搜索列表（原始证据=${evidenceText(listBefore)}）`);
-      const addList = security(['list-keychains', '-s', ...searchListBefore, kc]);
-      assertEqual(addList.status, 0, `把临时钥匙串加入搜索列表应成功：${evidenceText(addList)}`);
-      searchListAdded = true;
-      // 加入之后分区列表再设一次：新加入搜索列表的钥匙串上这一步才算真正完成
-      const part2 = security(['set-key-partition-list', '-S', 'apple-tool:,apple:', '-s', '-k', pw, kc], { timeout: 60000 });
-      if (part2.status !== 0) console.log(`      （注意：加入搜索列表后 set-key-partition-list 退出码 ${part2.status}：${evidenceText(part2)}）`);
-      const nowList = security(['list-keychains']);
-      assert(
-        parseSearchList(nowList).includes(kc),
-        `前置条件：临时钥匙串应已出现在搜索列表里（原始证据=${evidenceText(nowList)}）`,
-      );
-      isolation = '搜索列表（钉住路径对读取无效，已严格还原）';
-      // 搜索列表方式下真读不再带 -k（让 security 按搜索列表自己找），这正是要验证的路径
-      const viaList = keychainReadRaw(kc, { pinned: false });
-      assertEqual(viaList.status === 0, false, `前置条件：搜索列表方式下此刻也应当读不到（还没写入）：${evidenceText(viaList)}`);
-    }
+    const probeName = 'mailbot-searchlist-probe';
+    const probeWrite = sec(['add-generic-password', '-U', '-s', probeName, '-a', 'mailbot', '-w', 'probe', kc]);
+    assertEqual(probeWrite.status, 0, `搜索列表真读校验：往临时钥匙串写探测条目应成功：${evidenceText(probeWrite)}`);
+    const probeRead = sec(['find-generic-password', '-s', probeName, '-a', 'mailbot', '-w']);
+    assertEqual(
+      probeRead.status === 0 && probeRead.stdout === 'probe',
+      true,
+      `搜索列表真读校验：不带钥匙串参数的读必须能读回刚写进临时钥匙串的值；原始证据=${evidenceText(probeRead)}`,
+    );
+    const probeDel = sec(['delete-generic-password', '-s', probeName, '-a', 'mailbot', kc]);
+    assertEqual(probeDel.status, 0, `搜索列表真读校验：探测条目应能删掉（不留痕迹）：${evidenceText(probeDel)}`);
 
-    // 附加证据的**基准值**：必须在动搜索列表**之前**取，否则"没被碰过"就无从谈起
-    const loginBefore = keychainHasItem(defaultKeychainPath());
-    const usePin = pinWorks;
+    // ⑦ 真跑整条往返：写 → 读回 → 明文检查 → 清除（用户实际点的那条路）
     detail = await realBackendRoundtrip({
       mode: 'keychain',
       label: 'macOS 钥匙串',
       hooks: {
         inStore() {
-          const got = keychainReadRaw(kc, { pinned: usePin });
-          assertEqual(got.status, 0, `① 直接用 security 查临时钥匙串应当查得到：${evidenceText(got)}`);
+          const got = keychainReadRaw();
+          assertEqual(got.status, 0, `① 用后端那种读法（不带钥匙串参数、靠搜索列表）应当查得到：${evidenceText(got)}`);
           assert(
             got.stdout.includes(CANARY_IMAP),
             `① 钥匙串里存的应当就是那份保管内容（含金丝雀）；原始输出=${clip(got.stdout)}；status=${got.status}`,
@@ -813,36 +979,35 @@ await test('macOS 钥匙串：临时钥匙串里的真跑往返（登录钥匙�
           return true;
         },
         notInStore() {
-          const got = keychainReadRaw(kc, { pinned: usePin });
-          assert(got.status !== 0, `③ 清除后直接用 security 也应查不到（退出码不为 0）；原始证据=${evidenceText(got)}`);
+          const got = keychainReadRaw();
+          assert(got.status !== 0, `③ 清除后用后端那种读法也应查不到（退出码不为 0）；原始证据=${evidenceText(got)}`);
           return true;
         },
       },
     });
-
-    // 附加证据：用户登录钥匙串的状态前后完全一致（我们只动了临时钥匙串）
-    const loginAfter = keychainHasItem(defaultKeychainPath());
-    if (loginBefore !== 'unknown' && loginAfter !== 'unknown') {
-      assertEqual(loginAfter, loginBefore, '登录钥匙串里 mailbot 条目的存在性不得被本次测试改变');
-    }
-    detail = `${detail}（临时钥匙串 ${path.basename(kc)}；隔离方式=${isolation}；登录钥匙串未触碰）`;
+  } catch (err) {
+    /*
+     * 主流程的错误先接住，**不立刻抛**：收尾核对必须照跑（搜索列表是全局状态），
+     * 不能因为主流程失败就把"到底还原了没有"这件事跳过。错误留到最后再抛。
+     */
+    mainError = err;
   } finally {
     /*
-     * 无论成功失败，顺序都是：**解除钉住** → **还原搜索列表** → 删钥匙串 → 删目录。
+     * 无论成功失败，顺序都是：**解除钉住** → **还原搜索列表（严格）** → 删钥匙串 → 删目录。
      *
-     * 清理里**刻意不做断言**：否则清理失败会把"真正的失败原因"顶掉，
-     * 排查的人只会看到一个莫名其妙的清理错误。清理结论放到 finally 之后单独断言。
+     * 清理里**刻意不做断言**、也不用会因旗标报错的 `sec()`：否则清理失败会把"真正的失败原因"顶掉，
+     * 排查的人只会看到一个莫名其妙的清理错误。清理结论放到 finally 之后单独断言/上报。
      */
     __setKeychainPathForTest(null);
-    if (searchListAdded && searchListBefore) {
-      const back = security(['list-keychains', '-s', ...searchListBefore]);
-      if (back.status !== 0) console.log(`      （注意：搜索列表还原失败，退出码 ${back.status}：${evidenceText(back)}）`);
-      const check = security(['list-keychains']);
-      const now = parseSearchList(check);
-      if (now.join('\n') !== searchListBefore.join('\n')) {
-        console.log(`      （注意：搜索列表与原始值不一致：原始=${JSON.stringify(searchListBefore)} 现在=${JSON.stringify(now)}）`);
+    activeSearchList = null;
+    if (guard.touched()) {
+      restored = guard.restore();
+      if (!restored.ok) {
+        console.log(
+          `      ⚠️ 搜索列表还原核对未通过：原始=${JSON.stringify(restored.before)} 现值=${JSON.stringify(restored.after)}` +
+            `（集合一致=${restored.sameSet}）；还原命令原样输出=${evidenceText(restored.res)}；核对命令原样输出=${evidenceText(restored.check)}`,
+        );
       }
-      searchListAdded = false;
     }
     if (created) {
       const del = security(['delete-keychain', kcName]);
@@ -857,9 +1022,39 @@ await test('macOS 钥匙串：临时钥匙串里的真跑往返（登录钥匙�
     cleanedUp = !fs.existsSync(kcDir);
     if (!cleanedUp) console.log(`      （注意：临时钥匙串目录还在 ${kcDir}，tmp.js 会在进程退出时再删一次）`);
   }
-  // 主流程没抛错时才走到这里：此时"4 清理彻底"才是一条有效的结论
-  assertEqual(cleanedUp, true, '④ 临时钥匙串（含目录）必须被删掉，不留痕迹');
-  return fallbackWhy ? `${detail}；降级原因：${fallbackWhy}` : detail;
+
+  /*
+   * 收尾核对：**无论主流程成功还是失败都要做**。
+   *
+   * 搜索列表是全局状态，"改过就必须严格还原、还原了还必须核对一致"这句话得由**断言**兑现，
+   * 不能只写一行日志（日志在 CI 里不会被当成失败）。这里把收尾问题单独收集，
+   * 最后与主流程的错误一起报出来——两边都不吞。
+   */
+  let cleanupError = null;
+  try {
+    if (guard.touched()) {
+      assert(restored, '内部错误：动过搜索列表却没有还原结果');
+      assert(
+        restored.ok,
+        `搜索列表必须严格还原成原始值：原始=${JSON.stringify(restored.before)} 现值=${JSON.stringify(restored.after)}` +
+          `（集合一致=${restored.sameSet}）；还原命令原样输出=${evidenceText(restored.res)}；核对命令原样输出=${evidenceText(restored.check)}`,
+      );
+    }
+    assertEqual(cleanedUp, true, '④ 临时钥匙串（含目录）必须被删掉，不留痕迹');
+    // 附加证据：登录钥匙串的状态前后完全一致（我们只动了临时钥匙串，且此刻已删掉）
+    const loginAfter = loginKeychainHasItem();
+    if (loginBefore !== 'unknown' && loginAfter !== 'unknown') {
+      assertEqual(loginAfter, loginBefore, '登录钥匙串里 mailbot 条目的存在性不得被本次测试改变');
+    }
+  } catch (err) {
+    cleanupError = err;
+  }
+  if (mainError && cleanupError) {
+    throw new Error(`${mainError.message}\n  同时，收尾核对也发现问题：${cleanupError.message}`);
+  }
+  if (cleanupError) throw cleanupError;
+  if (mainError) throw mainError;
+  return `${detail}（临时钥匙串 ${path.basename(kc || kcName)}；隔离方式=搜索列表只含临时钥匙串，结束时已核对还原；登录钥匙串未触碰）`;
 });
 
 /* -------------------------------------------------- B3. Linux：libsecret */

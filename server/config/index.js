@@ -1019,6 +1019,26 @@ function notCoveredList({ tokenInVault, token, tokenLabel, diskVault }) {
 }
 
 /**
+ * 把 `readVault` / `writeVault` / `clearVault` 带回的**原始证据**压成一句，贴进错误信息里。
+ *
+ * 为什么非要有这个：迁移失败时用户（和 CI）看到的不能只有一句"读不回来"或者"校验不一致"——
+ * macOS 那次红就是被这种零信息的文案拖了好几轮（真因其实是命令里拼了一个不存在的旗标，
+ * 而 `security` 的原始回显里写得清清楚楚）。读/清除本来就带 stdout/stderr；
+ * 写失败**刻意只带退出码**（那条命令行里可能含明文），所以 `stdout` 缺失时如实说明，不装作有。
+ */
+function vaultEvidenceText(res) {
+  const e = res?.evidence || null;
+  const how = e?.how ? ` 定位方式=${e.how}` : '';
+  const keychain = ` keychain=${e?.keychain ?? '(未钉住)'}`;
+  if (!e) return `${res?.error || '无证据'}${keychain}${how}`;
+  const raw =
+    'stdout' in e || 'stderr' in e
+      ? `stdout=${JSON.stringify(String(e.stdout ?? '').slice(0, 300))} stderr=${JSON.stringify(String(e.stderr ?? '').slice(0, 300))}`
+      : 'stdout/stderr=（写命令刻意不记录原始输出：可能回显含明文的命令行）';
+  return `status=${e.status ?? 'null'} ${raw}${keychain}${how}`;
+}
+
+/**
  * 把明文密钥迁进保管库。
  *
  * 顺序是刻意的，**任何一步失败都不会留下半个状态**：
@@ -1065,7 +1085,10 @@ export function migrateSecrets({ mode = 'auto' } = {}) {
   const dataDir = dataDirOf(config, root);
   const written = writeVault(resolved, { dataDir }, encodeVault(payload));
   if (!written.ok) {
-    throw new AppError(`写入保管库失败，未改动任何配置：${written.error}`, { code: 'SECRETS_WRITE_FAILED', status: 500 });
+    throw new AppError(`写入保管库失败，未改动任何配置：${written.error}；原始证据=${vaultEvidenceText(written)}`, {
+      code: 'SECRETS_WRITE_FAILED',
+      status: 500,
+    });
   }
 
   // ③ 读回逐项比对——不比对就等于没验证，"搬过去打不开"是最糟的结果
@@ -1073,7 +1096,10 @@ export function migrateSecrets({ mode = 'auto' } = {}) {
   const readBack = readVault(resolved, { dataDir, force: true });
   if (!readBack.ok) {
     clearVault(resolved, { dataDir });
-    throw new AppError(`保管库写进去了却读不回来，已回滚：${readBack.error}`, { code: 'SECRETS_VERIFY_FAILED', status: 500 });
+    throw new AppError(`保管库写进去了却读不回来，已回滚：${readBack.error}；原始证据=${vaultEvidenceText(readBack)}`, {
+      code: 'SECRETS_VERIFY_FAILED',
+      status: 500,
+    });
   }
   const decoded = decodeVault(readBack.data);
   const mismatch = Object.keys(payload).filter((k) => decoded.secrets?.[k] !== payload[k]);
@@ -1083,10 +1109,14 @@ export function migrateSecrets({ mode = 'auto' } = {}) {
      * 这也是"宁可不迁也不能弄丢 refresh token"的落点——用户最多重新点一次迁移。
      */
     clearVault(resolved, { dataDir });
-    throw new AppError(`保管库内容校验不一致（${mismatch.join('、') || decoded.error}），已回滚，密钥仍在原处`, {
-      code: 'SECRETS_VERIFY_FAILED',
-      status: 500,
-    });
+    throw new AppError(
+      `保管库内容校验不一致（${mismatch.join('、') || decoded.error}），已回滚，密钥仍在原处；` +
+        `读回长度=${readBack.data ? String(readBack.data).length : 0} 原始证据=${vaultEvidenceText(readBack)}`,
+      {
+        code: 'SECRETS_VERIFY_FAILED',
+        status: 500,
+      },
+    );
   }
 
   // ④ 校验通过，这才开始"搬走"
