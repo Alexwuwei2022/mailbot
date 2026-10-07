@@ -44,6 +44,250 @@ const ANALYSIS_BASIS_LIMIT = 40;
 /** 结论依据的 40 封之外，还额外列出多少封的「标题+时间」给它做主题参考（不带摘录）。 */
 const ANALYSIS_HEADLINE_LIMIT = 40;
 
+/* ================================================================ 结论范围策略 */
+
+/**
+ * 「结论范围」：决定把命中里的**哪** ANALYSIS_BASIS_LIMIT 封交进模型写结论。
+ *
+ * 为什么需要这个开关：上限本身必须钉死（额度闸门，绝不放大），但「取哪 40 封」直接决定
+ * 结论能看到什么。原先是硬编码「按时间倒序取前 40 封」，于是「7 月份以来某人发来的邮件」
+ * 这类跨 3 个月的查询里，第 41 封（实测 07-16）之后的邮件完全没有摘录进入结论——
+ * 结论表面上在回答「7 月以来」，实际只看了最近一个月，而界面上看不出来。
+ *
+ * 所以把选择权交给用户，并且**在界面上写清每种策略的代价**：
+ *   - recent ：看得最细（连续的最新一批），但范围较宽时早期邮件进不了结论；
+ *   - monthly：覆盖整段时间（每个自然月都有代表），但每个月的细节看得少；
+ *   - even   ：比按月更均匀（含最早与最新各一封），但会跳过中间月份的大部分邮件。
+ *
+ * 三种策略的带摘录总数恒为 `min(ANALYSIS_BASIS_LIMIT, 命中数)`——策略只决定「哪 40 封」，
+ * 不决定「多少封」。所有选择都是**本地确定性算法**（无随机数、无模型参与），
+ * 同一输入跑两次结果完全一致，可测试也可解释。
+ */
+const BASIS_MONTHLY_PER_MONTH = 8;
+
+export const BASIS_STRATEGIES = {
+  recent: {
+    id: 'recent',
+    /** 策略名（界面下拉、提示词里都用它） */
+    name: '最近 N 封',
+    /** 口径前缀：「最近 40 封」 */
+    scope: '最近',
+    detail: '看得最细（连续的最新一批，每封都有摘录），但范围较宽时早期邮件进不了结论。',
+  },
+  monthly: {
+    id: 'monthly',
+    name: '按月节选',
+    scope: '按月节选',
+    detail: `覆盖整段时间：每个自然月都有代表（每月最多 ${BASIS_MONTHLY_PER_MONTH} 封），但每个月的细节看得少。`,
+  },
+  even: {
+    id: 'even',
+    name: '均衡采样',
+    scope: '均衡采样',
+    detail: '在全范围内等间隔取样（含最早与最新各一封），比按月更均匀，但会跳过中间月份的大部分邮件。',
+  },
+};
+export const BASIS_STRATEGY_IDS = Object.keys(BASIS_STRATEGIES);
+export const DEFAULT_BASIS_STRATEGY = 'recent';
+
+/**
+ * 归一化请求里的策略值。
+ *
+ * 非法值**回落到默认并说明**（而不是静默当成默认）：与全项目「绝不静默少给/静默改口径」
+ * 的原则一致——界面会把这句说明显示出来，调用方也能从 `fellBack` 判断出发生了回落。
+ */
+export function normalizeBasis(raw) {
+  const requested = raw === undefined || raw === null ? '' : String(raw).trim();
+  const id = requested.toLowerCase();
+  if (Object.prototype.hasOwnProperty.call(BASIS_STRATEGIES, id)) {
+    return { strategy: id, requested: id, fellBack: false, note: '' };
+  }
+  if (!requested) return { strategy: DEFAULT_BASIS_STRATEGY, requested: '', fellBack: false, note: '' };
+  return {
+    strategy: DEFAULT_BASIS_STRATEGY,
+    requested,
+    fellBack: true,
+    note: `结论范围「${requested}」不是有效选项，已按「${BASIS_STRATEGIES[DEFAULT_BASIS_STRATEGY].name}」处理。可选：${BASIS_STRATEGY_IDS.join(' / ')}。`,
+  };
+}
+
+/** 条目所属的自然月（按配置时区折算，与列表展示的日期同一把尺子）。 */
+function basisMonthKey(item, timeZone) {
+  const day = item?.day || localDay(item?.date, timeZone);
+  return day ? day.slice(0, 7) : '';
+}
+
+/** 条目的展示日（YYYY-MM-DD）。 */
+function basisDay(item, timeZone) {
+  return item?.day || localDay(item?.date, timeZone) || '';
+}
+
+/**
+ * 时间倒序（同一时刻按 key 兜底）。
+ *
+ * 兜底比较是**确定性**的关键：同一时刻的邮件若靠 `Array.prototype.sort` 的稳定性决定顺序，
+ * 一旦上游顺序变化（例如换排序、多线程补数据）结果就会变，测试也就无法解释。
+ */
+function timeDesc(a, b) {
+  const da = new Date(a?.date || 0).getTime();
+  const db = new Date(b?.date || 0).getTime();
+  if (db !== da) return db - da;
+  return String(a?.key ?? a?.uid ?? '').localeCompare(String(b?.key ?? b?.uid ?? ''));
+}
+
+/**
+ * 均衡采样：在长度为 m 的序列里等间隔取 n 个**下标**（含首尾），无随机数。
+ *
+ * `idx_i = round(i * (m-1) / (n-1))`：步长 ≥ 1，因此相邻下标必然不同（重复下标另有兜底去重）。
+ * n 小于 m 时首下标恒为 0、末下标恒为 (m-1)——即**范围内最新与最早各取一封**，
+ * 这正是「均衡采样」要保证的：视野拉到整段时间，而不是只看最近一批。
+ * n=1 时给最新的那封（与「最近」策略的首条一致，避免出现「唯一一个名额给了中间某封」这种怪事）。
+ */
+function evenSample(sorted, n) {
+  const m = sorted.length;
+  if (n <= 0 || m === 0) return [];
+  if (n >= m) return [...sorted];
+  if (n === 1) return [sorted[0]];
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < n; i += 1) {
+    const idx = Math.round((i * (m - 1)) / (n - 1));
+    if (seen.has(idx)) continue;
+    seen.add(idx);
+    out.push(sorted[idx]);
+  }
+  return out;
+}
+
+/** 一组条目的时间跨度与覆盖的自然月数。 */
+function spanOf(items, timeZone) {
+  const days = items.map((it) => basisDay(it, timeZone)).filter(Boolean).sort();
+  const months = new Set(items.map((it) => basisMonthKey(it, timeZone)).filter(Boolean));
+  return {
+    coveredFrom: days[0] || '',
+    coveredTo: days[days.length - 1] || '',
+    months: months.size,
+  };
+}
+
+/**
+ * 按策略挑出结论依据的邮件（本地确定性）。
+ *
+ * 边界口径（三种策略一致）：
+ *   - 命中不足上限时有多少给多少（cap = min(limit, 命中数)），不会凑数、不会重复；
+ *   - 某个月没有邮件就不参与按月节选（不会凭空造出代表），`months` 只数真的有邮件的月份；
+ *   - 没有日期的条目归不进任何自然月（monthly 里被跳过），recent/even 不受影响。
+ *
+ * @returns {{strategy: string, items: Array, months: number, rangeMonths: number,
+ *            monthCounts: Array|null, coveredFrom: string, coveredTo: string}}
+ */
+export function selectBasisItems(items, { strategy = DEFAULT_BASIS_STRATEGY, limit = ANALYSIS_BASIS_LIMIT, maxPerMonth = BASIS_MONTHLY_PER_MONTH, timeZone } = {}) {
+  const list = Array.isArray(items) ? items : [];
+  const cap = Math.max(0, Math.min(limit, list.length));
+  // 选中结果一律**按列表原顺序**返回：提示词与界面看到的顺序始终与命中列表一致
+  const order = new Map(list.map((it, i) => [it, i]));
+  const byListOrder = (a, b) => (order.get(a) ?? 0) - (order.get(b) ?? 0);
+  const allMonths = new Set(list.map((it) => basisMonthKey(it, timeZone)).filter(Boolean));
+  const rangeMonths = allMonths.size;
+
+  let picked = [];
+  let monthCounts = null;
+
+  if (cap > 0 && strategy === 'monthly') {
+    const groups = new Map();
+    for (const it of list) {
+      const key = basisMonthKey(it, timeZone);
+      if (!key) continue;
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(it);
+    }
+    // 月份倒序：同一批里取数顺序固定，与上游排序无关
+    const months = [...groups.keys()].sort().reverse();
+    for (const key of months) groups.get(key).sort(timeDesc);
+    /*
+     * 轮转取（先每月第 1 新，再每月第 2 新……）而不是「整体按时间取前 40」：
+     * 后者在月份多、每月邮件多时会又一次把早期月份整段挤掉，等于换个方式重演原缺陷。
+     * 轮转保证：只要总量没被 cap 卡死，每个月都有代表；被卡死时也是**从最老的月份开始少给**，
+     * 而不是从最老的月份开始全丢。
+     */
+    for (let depth = 0; depth < maxPerMonth && picked.length < cap; depth += 1) {
+      for (const key of months) {
+        if (picked.length >= cap) break;
+        const group = groups.get(key);
+        if (depth < group.length) picked.push(group[depth]);
+      }
+    }
+    monthCounts = months
+      .map((key) => ({ month: key, selected: picked.filter((it) => basisMonthKey(it, timeZone) === key).length, total: groups.get(key).length }))
+      .sort((a, b) => b.month.localeCompare(a.month));
+    picked.sort(byListOrder);
+  } else if (cap > 0 && strategy === 'even') {
+    picked = evenSample([...list].sort(timeDesc), cap).sort(byListOrder);
+  } else if (cap > 0) {
+    // recent：与旧行为逐条一致——就是当前列表顺序的前 cap 条（默认按时间倒序，即最新的一批）
+    picked = list.slice(0, cap);
+  }
+
+  const span = spanOf(picked, timeZone);
+  return {
+    strategy: BASIS_STRATEGIES[strategy] ? strategy : DEFAULT_BASIS_STRATEGY,
+    items: picked,
+    months: span.months,
+    rangeMonths,
+    monthCounts,
+    coveredFrom: span.coveredFrom,
+    coveredTo: span.coveredTo,
+  };
+}
+
+/**
+ * 把策略与选择结果拼成**唯一一处**的口径文案（界面、提示词、本地降级摘要共用），
+ * 避免三处各写一套、数字与说法对不上。
+ */
+export function describeBasis({
+  strategy,
+  count,
+  limit = ANALYSIS_BASIS_LIMIT,
+  months = 0,
+  maxPerMonth = BASIS_MONTHLY_PER_MONTH,
+  coveredFrom = '',
+  coveredTo = '',
+  matched = 0,
+  headlines = 0,
+  order = 'date_desc',
+}) {
+  const meta = BASIS_STRATEGIES[strategy] || BASIS_STRATEGIES[DEFAULT_BASIS_STRATEGY];
+  /*
+   * `recent` 取的是「当前列表顺序的前 N 封」（这正是它向后兼容的旧语义）。默认排序是时间倒序，
+   * 于是它就是「最新的一批」；但模型也可以选 `priority` / `date_asc` 排序，那时前 40 封并不是最新的，
+   * 口径必须如实改写——否则界面写着「最近 40 封」、实际给的却是另一批，又回到了这次要修的毛病。
+   */
+  const scope = strategy === 'recent' && order !== 'date_desc' ? '列表前' : meta.scope;
+  const label = `${scope} ${count} 封`;
+  const extra = strategy === 'monthly' ? `，每月最多 ${maxPerMonth} 封` : '';
+  const span = coveredFrom && coveredTo ? `覆盖 ${coveredFrom} ~ ${coveredTo}` : '覆盖范围未知';
+  /** 送给模型的这批是按什么顺序列的（界面与提示词共用，别再各写一套三元表达式） */
+  const orderLabel = order === 'date_asc' ? '时间正序' : order === 'priority' ? '按优先级' : '时间倒序';
+  return {
+    strategy: meta.id,
+    strategyName: meta.name,
+    label,
+    /** 一句话口径：界面与提示词都用它（两边口径天然一致） */
+    line: `结论基于${label}（${span}${extra}）`,
+    count,
+    limit,
+    months,
+    maxPerMonth: strategy === 'monthly' ? maxPerMonth : null,
+    coveredFrom,
+    coveredTo,
+    matched,
+    headlines,
+    order,
+    orderLabel,
+    detail: meta.detail,
+  };
+}
+
 /**
  * 把时刻换算成配置时区下的日期键（YYYY-MM-DD）。
  *
@@ -545,10 +789,11 @@ function toResultItem(record, timeZone) {
 /**
  * 对话式检索入口。
  *
- * @param {object} options { query, instanceId, now, limit, onProgress }
- * @returns {Promise<object>} 意图、命中邮件、分析文本
+ * @param {object} options { query, instanceId, now, limit, basis, onProgress }
+ *   `basis` 是「结论范围」策略：'recent'（默认）| 'monthly' | 'even'，非法值回落到 recent 并说明。
+ * @returns {Promise<object>} 意图、命中邮件、分析文本、结论范围口径（basis/analysisBasis）
  */
-export async function searchEmails({ query, instanceId, now = new Date(), limit, onProgress } = {}) {
+export async function searchEmails({ query, instanceId, now = new Date(), limit, basis: basisStrategy, onProgress } = {}) {
   const config = getConfig();
   const timeZone = config.calendar.timeZone;
   const text = String(query || '').trim();
@@ -663,23 +908,57 @@ export async function searchEmails({ query, instanceId, now = new Date(), limit,
   /** 命中数超过可展示上限 → 必须如实标注，绝不静默少给 */
   const listTruncated = totalMatched > finalItems.length;
 
-  // 结果分析：只把有界的子集交给模型，并如实告知「结论基于其中 N 封」
-  const basisCap = Math.min(ANALYSIS_BASIS_LIMIT + ANALYSIS_HEADLINE_LIMIT, finalItems.length);
-  const basisItems = finalItems.slice(0, basisCap);
+  /*
+   * 结果分析：只把有界的子集交给模型，并如实告知「结论基于哪些邮件、覆盖到哪」。
+   *
+   * 视野分两层，额度闸门只有第一层：
+   *   ① 带摘录：最多 ANALYSIS_BASIS_LIMIT（40）封——「结论范围」策略决定取**哪** 40 封；
+   *   ② 只给标题与时间：再最多 ANALYSIS_HEADLINE_LIMIT（40）封，仅供判断话题分布。
+   * 策略永远不改变 ① 的条数，只改变它覆盖的时间段——所以换策略不会放大模型额度。
+   */
+  const basisChoice = normalizeBasis(basisStrategy);
+  const basisSelect = selectBasisItems(finalItems, {
+    strategy: basisChoice.strategy,
+    limit: ANALYSIS_BASIS_LIMIT,
+    maxPerMonth: BASIS_MONTHLY_PER_MONTH,
+    timeZone,
+  });
+  const answerItems = basisSelect.items;
+  const answerSet = new Set(answerItems);
+  const headlineItems = finalItems.filter((it) => !answerSet.has(it)).slice(0, ANALYSIS_HEADLINE_LIMIT);
   const analyzedCount = finalItems.filter((it) => it.analyzed).length;
   const analysisBasis = {
-    /** 送给模型的邮件条数（按当前排序，通常是最新优先） */
-    count: basisItems.length,
-    /** 其中带模型摘要的封数 */
-    analyzed: basisItems.filter((it) => it.analyzed).length,
-    /** 带摘要子集的硬上限（额度与上下文长度控制） */
-    maxAnalyzed: Math.min(ANALYSIS_BASIS_LIMIT, basisItems.length),
-    limit: ANALYSIS_BASIS_LIMIT,
-    order: sortKey === 'date_asc' ? 'date_asc' : 'date_desc',
-    /** 是否只看了命中列表的一部分 */
-    partial: basisItems.length < finalItems.length,
+    ...describeBasis({
+      strategy: basisSelect.strategy,
+      count: answerItems.length,
+      limit: ANALYSIS_BASIS_LIMIT,
+      months: basisSelect.months,
+      maxPerMonth: BASIS_MONTHLY_PER_MONTH,
+      coveredFrom: basisSelect.coveredFrom,
+      coveredTo: basisSelect.coveredTo,
+      matched: finalItems.length,
+      headlines: headlineItems.length,
+      /* 列表顺序如实带出去：priority / date_asc 时 `recent` 的「最近」说法要被改写成「列表前」 */
+      order: sortKey === 'date_asc' ? 'date_asc' : sortKey === 'priority' ? 'priority' : 'date_desc',
+    }),
+    /** 带摘录的这批里有几封有模型摘要（其余只有信封信息） */
+    analyzed: answerItems.filter((it) => it.analyzed).length,
+    /** 命中里共有多少个自然月（用于核对「按月节选」是否真的每月都有代表） */
+    rangeMonths: basisSelect.rangeMonths,
+    /** 每个自然月实际选中的封数（仅 monthly 有值） */
+    monthCounts: basisSelect.monthCounts,
+    /** 有没有命中没拿到摘录（即结论视野小于命中范围）——界面必须说清 */
+    excerptPartial: answerItems.length < finalItems.length,
+    /** 连「标题+时间」都没装下的命中（模型完全没看到） */
+    partial: answerItems.length + headlineItems.length < finalItems.length,
+    /** 带摘录子集的硬上限（额度与上下文长度控制） */
+    maxAnalyzed: Math.min(ANALYSIS_BASIS_LIMIT, finalItems.length),
+    /** 请求里的策略值不合法时回落并说明（绝不静默改口径） */
+    requested: basisChoice.requested,
+    fellBack: basisChoice.fellBack,
+    note: basisChoice.note,
   };
-  const answerMails = basisItems.slice(0, ANALYSIS_BASIS_LIMIT).map((it) => ({
+  const answerMails = answerItems.map((it) => ({
     subject: it.subject,
     date: it.day,
     from: it.from?.name ? `${it.from.name} <${it.from.address}>` : it.from?.address || '未知',
@@ -691,7 +970,7 @@ export async function searchEmails({ query, instanceId, now = new Date(), limit,
     actions: it.actions,
     body: truncate(String(it.snippet || ''), 300),
   }));
-  const headlineMails = basisItems.slice(ANALYSIS_BASIS_LIMIT).map((it) => ({
+  const headlineMails = headlineItems.map((it) => ({
     subject: it.subject,
     date: it.day,
     from: it.from?.name ? `${it.from.name} <${it.from.address}>` : it.from?.address || '未知',
@@ -720,6 +999,8 @@ export async function searchEmails({ query, instanceId, now = new Date(), limit,
             hasUnanalyzed: analysisBasis.count > analysisBasis.analyzed,
             partial: analysisBasis.partial,
             analysisOrder: analysisBasis.order,
+            /** 结论范围口径（策略名 + 覆盖区间），提示词与界面用同一份文案 */
+            scope: analysisBasis,
           },
         }),
         temperature: 0.3,
@@ -761,7 +1042,7 @@ export async function searchEmails({ query, instanceId, now = new Date(), limit,
       analyzed: analyzedCount,
       /** 命中里只有信封（未分析、无摘要）的封数 */
       envelopeOnly: finalItems.filter((it) => it.source === 'envelope').length,
-      /** 结论依据的封数（按时间倒序取有界子集） */
+      /** 结论依据的封数（带摘录的有界子集） */
       basis: analysisBasis.count,
       scanned: all.length,
       coverage: totals,
@@ -790,8 +1071,12 @@ export async function searchEmails({ query, instanceId, now = new Date(), limit,
           }
         : null,
     },
-    /** 结论依据的有界性与列表截断说明，界面直接展示 */
+    /**
+     * 结论依据的有界性与列表截断说明，界面直接展示。
+     * `basis` 与 `analysisBasis` 是同一份口径（`basis` 为规范名，`analysisBasis` 保留向后兼容）。
+     */
     analysisBasis,
+    basis: analysisBasis,
     truncationNote: buildTruncationNote({
       stats: {
         matched: totalMatched,
@@ -866,7 +1151,9 @@ function localSummary(items, understood, basis) {
     else lines.push('  （仅信封命中，无摘要）');
   }
   if (items.length > 15) lines.push(`（列表已截断显示前 15 条，共 ${items.length} 条）`);
-  if (basis) lines.push('', `以上依据列表前 ${basis.count} 封（按时间${basis.order === 'date_asc' ? '正序' : '倒序'}）。`);
+  // 口径用与提示词/界面同一份文案（scope.line），降级摘要也不能换一种说法
+  if (basis?.line) lines.push('', `${basis.line}；命中共 ${basis.matched ?? items.length} 封。`);
+  else if (basis) lines.push('', `以上依据列表前 ${basis.count} 封（${basis.orderLabel ? `按${basis.orderLabel}` : `按时间${basis.order === 'date_asc' ? '正序' : '倒序'}`}）。`);
   return lines.filter(Boolean).join('\n');
 }
 

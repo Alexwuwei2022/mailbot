@@ -1740,6 +1740,8 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       query: body.query ?? body.message,
       instanceId: body.instanceId || instanceIdFrom(url),
       limit: body.limit,
+      // 结论范围策略：recent（默认）/ monthly / even；非法值由 search.js 回落并说明
+      basis: body.basis ?? body.basisStrategy,
       onProgress: (p) => progressBus.emit('event', { type: 'search:progress', at: new Date().toISOString(), ...p }),
     });
     return sendJson(res, 200, { ok: true, ...out });

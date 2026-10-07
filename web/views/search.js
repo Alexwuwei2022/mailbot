@@ -3,6 +3,9 @@
  *
  * 支持按发件人 / 主题 / 正文内容 / 类型 / 优先级 / 时间范围检索，
  * 默认回看近 30 天，最长一年。筛选由服务端程序执行，模型只负责理解与总结。
+ *
+ * 「结论范围」下拉决定结论（模型分析）看命中里的哪 40 封：带摘录上限恒为 40 封，
+ * 换策略只换视野（最近一批 / 每月都有代表 / 全范围等间隔），不会放大模型额度。
  */
 
 import { api } from '../api.js';
@@ -20,6 +23,35 @@ const EXAMPLES = [
 ];
 
 /*
+ * 「结论范围」：决定把命中里的**哪** 40 封交给模型写结论。
+ *
+ * 三种策略的带摘录上限**都是 40 封**（额度闸门，与服务端 ANALYSIS_BASIS_LIMIT 一致），
+ * 策略只决定「哪 40 封」——所以换策略不会多花模型额度，改变的只是结论的视野。
+ * 因此每一项都必须把代价写出来（与 server/ai/search.js 的 BASIS_STRATEGIES 同一口径）：
+ * 用户是在「看得细」和「看得全」之间做取舍，不写清代价就等于诱导他选错。
+ */
+const BASIS_OPTIONS = [
+  {
+    id: 'recent',
+    name: '最近 40 封（默认）',
+    short: '看得最细',
+    cost: '看得最细：连续的最新一批，每封都有摘录。代价是范围较宽时（例如「7 月份以来」）早期邮件进不了结论。',
+  },
+  {
+    id: 'monthly',
+    name: '按月节选（每月最多 8 封）',
+    short: '覆盖整段时间',
+    cost: '覆盖整段时间：每个自然月都有代表，范围再宽也不会丢掉早期月份。代价是每个月的细节看得少。',
+  },
+  {
+    id: 'even',
+    name: '均衡采样（全范围等间隔）',
+    short: '视野最匀',
+    cost: '在全范围内等间隔取样（含最早与最新各一封），比按月节选更均匀。代价是会跳过中间月份的大部分邮件。',
+  },
+];
+
+/*
  * 「命中的邮件」列表最多渲染多少条。
  *
  * 服务端默认最多返回 1000 条，一次性铺 1000 个 DOM 行会让页面卡住。
@@ -34,6 +66,8 @@ export function renderSearch(root, app) {
     history: [],
     searching: false,
     result: null,
+    /** 「结论范围」策略：recent（默认）/ monthly / even */
+    basis: 'recent',
     /** 检索结果里展开详情的条目 key */
     expanded: null,
     /** 命中列表当前渲染了多少条 */
@@ -90,6 +124,7 @@ export function renderSearch(root, app) {
             h('button', { class: 'btn btn-primary', disabled: state.searching, onclick: run }, state.searching ? '检索中…' : '检索并分析'),
           ),
           h('p', { class: 'muted small', text: '支持：发件人 / 主题 / 正文内容 / 类型 / 优先级 / 时间范围。默认回看近 30 天，最长一年。' }),
+          basisControl(),
           h(
             'div',
             { class: 'chip-row' },
@@ -154,6 +189,50 @@ export function renderSearch(root, app) {
 
   /* ---------------------------------------------------------- 结果 */
 
+  /**
+   * 「结论范围」控件：下拉 + 代价小字 + 生效提示。
+   *
+   * 命中列表本身永远是完整的；这里选的只是「结论（模型分析）看哪一批」。
+   * 改动不会自动重跑检索（那会悄悄多花一次模型额度），而是明确提示需要重新检索。
+   */
+  function basisControl() {
+    const current = BASIS_OPTIONS.find((o) => o.id === state.basis) || BASIS_OPTIONS[0];
+    const select = h(
+      'select',
+      {
+        id: 'search-basis',
+        class: 'input search-basis-select',
+        title: '决定结论依据哪 40 封邮件（带摘录上限恒为 40 封）',
+        onchange: (ev) => {
+          state.basis = ev.target.value;
+          // 重新渲染，让代价小字与「需重新检索」提示跟着切换
+          paint();
+        },
+      },
+      /*
+       * 选中项用 option 的 `selected` 属性表达，而不是事后写 `select.value`：
+       * 后者在部分环境（linkedom 的渲染自检）里是只读的 getter，直接抛错会让整页白屏。
+       * 属性在插入文档前设置，真实浏览器同样会选中它。
+       */
+      ...BASIS_OPTIONS.map((o) => h('option', { value: o.id, selected: o.id === current.id, text: `${o.name}｜${o.short}` })),
+    );
+    // 结果里带的口径与当前所选不一致时才提示「需重新检索」：
+    // 老结果没有 strategy 字段（或还没检索过）时不该伪造一个「已改动」提示
+    const shown = (state.result?.basis || state.result?.analysisBasis)?.strategy;
+    const pending = !!state.result && !state.searching && typeof shown === 'string' && shown !== state.basis;
+    return h(
+      'div',
+      { class: 'basis-row' },
+      h('label', { class: 'muted small', for: 'search-basis', text: '结论范围（结论看哪些邮件）' }),
+      select,
+      h('span', { class: 'muted small search-basis-cost', text: current.cost }),
+      h('span', {
+        class: 'muted small search-basis-note',
+        text: pending ? '已改动——点「检索并分析」后生效（命中列表不变，只换结论依据的那 40 封）。' : '三种策略的带摘录上限都是 40 封：换策略只换「哪 40 封」，不会放大模型额度。',
+      }),
+    );
+  }
+
   function resultView(result, app) {
     if (result.needMore) {
       return h(
@@ -165,6 +244,8 @@ export function renderSearch(root, app) {
     }
     const s = result.stats || {};
     const bf = s.backfill;
+    /** 结论范围口径（basis 为规范名，analysisBasis 保留向后兼容） */
+    const basis = result.basis || result.analysisBasis || null;
     const items = result.items || [];
     const listed = s.listed ?? items.length;
     const matched = s.matched ?? items.length;
@@ -206,13 +287,17 @@ export function renderSearch(root, app) {
           s.coverage
             ? h('div', { class: 'muted small' }, `本地已分析邮件覆盖 ${s.coverage.oldest} ~ ${s.coverage.newest}（共 ${s.coverage.count} 封）`)
             : h('div', { class: 'muted small' }, '本地还没有已分析的邮件，请先到「邮件总览」运行一次分析。'),
-          // 结论依据：模型只读了有界子集，必须如实说清
-          result.analysisBasis
+          // 结论范围：模型只读了有界子集，必须如实说清「基于哪一批、覆盖到哪一天」。
+          // 一封都没命中时不写这句——「结论基于 0 封」只会让人困惑。
+          basis && basis.count > 0
             ? h(
                 'div',
                 { class: 'muted small' },
-                `结论基于其中 ${result.analysisBasis.count} 封（按时间${result.analysisBasis.order === 'date_asc' ? '正序' : '倒序'}，上限 ${result.analysisBasis.limit} 封）` +
-                  (result.analysisBasis.partial ? '，其余命中只列出标题与时间，未交给模型' : ''),
+                `${basis.line || `结论基于其中 ${basis.count} 封`}` +
+                  `（带摘录上限 ${basis.limit ?? 40} 封，与列表上限无关；` +
+                  `按${basis.orderLabel || (basis.order === 'date_asc' ? '时间正序' : '时间倒序')}）` +
+                  (basis.headlines ? `；另有 ${basis.headlines} 封只给了标题与时间，不作逐条断言依据` : '') +
+                  (basis.fellBack ? `。${basis.note}` : ''),
               )
             : null,
           s.envelopeOnly
@@ -407,7 +492,7 @@ export function renderSearch(root, app) {
     state.shown = RENDER_STEP;
     paint();
     try {
-      state.result = await api.searchEmails({ query: q });
+      state.result = await api.searchEmails({ query: q, basis: state.basis });
       state.history = [q, ...state.history.filter((x) => x !== q)].slice(0, 10);
     } catch (err) {
       toastError(err);

@@ -180,6 +180,16 @@ const llm = await mocks2StartMockLlm({
           sort: 'date_desc',
         });
       }
+      // 结论范围（basis）用例：跨 3 个自然月、每月 25 封的范围
+      if (/结论范围/.test(q)) {
+        return JSON.stringify({
+          understood: '查找 7 月以来 basis@example.com 发来的邮件',
+          action: 'search',
+          needMore: false,
+          filters: { dateFrom: '2026-07-01', dateTo: '2026-09-27', from: ['basis@example.com'] },
+          sort: 'date_desc',
+        });
+      }
       if (/不知道/.test(q)) {
         return JSON.stringify({ understood: '', action: 'search', needMore: true, question: '你想找哪个发件人、或者哪个关键词的邮件？' });
       }
@@ -2597,8 +2607,326 @@ await test('检索回补：配置为 0 时关闭，并给出可执行提示', as
   }
 });
 
-/* ------------------------------------------------------------ 代理（访问 Google） */
+/* -------------------------------------------------- 12. 检索「结论范围」（basis） */
 
+/**
+ * 夹具：某发件人在「7 月以来」范围内**跨 3 个自然月、每月 25 封**（共 75 封）。
+ *
+ * 这正是用户报的现象：命中 63 封，按时间倒序第 40 封是 07-20、第 41 封是 07-16——
+ * 也就是 07-20 之前的邮件完全没有摘录进入结论。用「3 个月 × 25 封」把
+ * 「recent 丢掉早期月份 / monthly 每月都有代表」这一对对照钉死。
+ */
+function seedBasisMonths() {
+  const records = [];
+  let uid = 8800;
+  for (const month of [7, 8, 9]) {
+    for (let day = 1; day <= 25; day += 1) {
+      // UTC 02:00 → 北京时间当天 10:00，日期不会跨天，断言里能直接按 YYYY-MM-DD 对账
+      const date = new Date(Date.UTC(2026, month - 1, day, 2)).toISOString();
+      const dayKey = `2026-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      uid += 1;
+      records.push({
+        key: `analysis:INBOX:${uid}`,
+        instanceId: 'default',
+        folder: 'INBOX',
+        uid,
+        type: 'notification',
+        priority: 'normal',
+        needsReply: false,
+        recipientKind: 'direct',
+        summary: `结论范围验证第 ${dayKey} 封`,
+        actions: [],
+        reason: '通知类邮件',
+        analyzedAt: date,
+        mail: {
+          uid,
+          folder: 'INBOX',
+          subject: `结论范围验证 ${dayKey}`,
+          from: { name: '范围测试', address: 'basis@example.com' },
+          to: [{ address: 'me@company.com' }],
+          cc: [],
+          date,
+          snippet: `结论范围验证正文 ${dayKey}`,
+          messageId: `<basis-${uid}@example.com>`,
+          hasAttachments: false,
+          attachments: [],
+        },
+      });
+    }
+  }
+  return records;
+}
+
+/** 最近一次「检索结果分析」调用的完整提示词（system + user）。 */
+function lastAnswerPrompt() {
+  const call = [...llmCalls].reverse().find((c) => (c.messages || []).some((m) => String(m.content).includes('检索结果分析师')));
+  return call ? call.messages.map((m) => m.content).join('\n') : '';
+}
+
+/**
+ * 从提示词里抠出「带摘录」那批邮件的日期（`- 时间：YYYY-MM-DD`）。
+ *
+ * 只数带摘录的那批：标题清单用的是 `- [YYYY-MM-DD] 发件人：主题` 另一种格式，
+ * 所以这个正则正好只命中**结论依据**的邮件——断言的是模型真正看到的那批，
+ * 而不是返回值里的列表（列表本来就有 75 封，说明不了结论看到了什么）。
+ */
+function excerptDays(prompt) {
+  return [...String(prompt).matchAll(/^- 时间：(\d{4}-\d{2}-\d{2})$/gm)].map((m) => m[1]);
+}
+
+await test('检索结论范围：三种策略都只取 ≤40 封带摘录，且同一输入两次选择完全一致', async () => {
+  const { searchEmails } = await import('../server/ai/search.js');
+  const seeded = seedBasisMonths();
+  store.upsertAnalyses(seeded);
+  store.persistState();
+
+  const query = '请分析7月份以来，basis@example.com 发给我的邮件（结论范围测试）';
+  const picked = {};
+  for (const strategy of ['recent', 'monthly', 'even']) {
+    const out = await searchEmails({ query, instanceId: 'default', now: NOW, basis: strategy });
+    assertEqual(out.basis.strategy, strategy, `应回显所选策略（${strategy}）`);
+    assertEqual(out.filters.dateFrom, '2026-07-01', '范围应为 7-01 起');
+    assertEqual(out.items.length, seeded.length, `命中列表应完整列出 ${seeded.length} 封（与策略无关）`);
+    assertEqual(out.stats.matched, seeded.length, '命中总数不因策略改变');
+    // 额度闸门：带摘录恒为 40 封上限，策略只决定「哪 40 封」
+    assertEqual(out.basis.limit, 40, '带摘录上限必须是 40（额度闸门）');
+    assert(out.basis.count <= 40, `${strategy} 带摘录条数不得超过 40（实际 ${out.basis.count}）`);
+    assert(out.basis.count > 0, `${strategy} 应有带摘录的邮件`);
+
+    const prompt = lastAnswerPrompt();
+    const days = excerptDays(prompt);
+    assertEqual(days.length, out.basis.count, `提示词里带摘录的封数应与 basis.count 一致（${strategy}）`);
+    assertEqual(new Set(days).size, days.length, `带摘录的邮件不应重复（${strategy}）`);
+    // 「只能依据下面这 N 封」的口径与带摘录条数必须是同一个数
+    assertIncludes(prompt, `只能依据下面这 ${out.basis.count} 封`, '提示词应写明依据的封数');
+    picked[strategy] = days.join(',');
+  }
+
+  // ① 确定性：同一输入连跑两次，选中的邮件完全一致（无随机数）
+  const again = await searchEmails({ query, instanceId: 'default', now: NOW, basis: 'monthly' });
+  assertEqual(excerptDays(lastAnswerPrompt()).length, again.basis.count, '二次运行带摘录条数一致');
+  assertEqual(excerptDays(lastAnswerPrompt()).join(','), picked.monthly, '二次运行选中的邮件必须逐条一致（确定性）');
+  const evenAgain = await searchEmails({ query, instanceId: 'default', now: NOW, basis: 'even' });
+  assertEqual(evenAgain.basis.strategy, 'even', '二次运行仍应用均衡采样');
+  assertEqual(excerptDays(lastAnswerPrompt()).join(','), picked.even, '均衡采样二次运行也必须完全一致');
+
+  // 纯函数层面再钉一次确定性（不经过模型，排除提示词顺序等干扰）
+  const { selectBasisItems } = await import('../server/ai/search.js');
+  const listOrder = (rs) => rs.map((r) => r.key).join(',');
+  for (const strategy of ['recent', 'monthly', 'even']) {
+    const a = selectBasisItems(again.items, { strategy, timeZone: TZ });
+    const b = selectBasisItems(again.items, { strategy, timeZone: TZ });
+    assertEqual(listOrder(a.items), listOrder(b.items), `selectBasisItems(${strategy}) 两次结果必须一致`);
+    assert(a.items.length <= 40, `selectBasisItems(${strategy}) 不得超过 40 封`);
+  }
+});
+
+await test('检索结论范围：按月节选每月都有代表，而「最近 40 封」会丢掉早期月份（用户报的现象）', async () => {
+  const { searchEmails, selectBasisItems } = await import('../server/ai/search.js');
+  store.upsertAnalyses(seedBasisMonths());
+  store.persistState();
+
+  const query = '请分析7月份以来，basis@example.com 发给我的邮件（结论范围测试）';
+  const monthsOf = (days) => [...new Set(days.map((d) => d.slice(0, 7)))].sort();
+
+  // 默认策略（recent）：第 41 封之后（较早的月份）完全没有摘录进入结论
+  const recent = await searchEmails({ query, instanceId: 'default', now: NOW });
+  assertEqual(recent.basis.strategy, 'recent', '缺省策略必须是 recent（向后兼容）');
+  const recentDays = excerptDays(lastAnswerPrompt());
+  assertEqual(recentDays.length, 40, '最近策略应恰好取 40 封');
+  const recentMonths = monthsOf(recentDays);
+  assertEqual(recentMonths.includes('2026-07'), false, '最近 40 封里不应有 7 月的邮件（这正是用户报的现象）');
+  assertEqual(recentMonths.join(','), '2026-08,2026-09', `最近 40 封只覆盖 8/9 月（实际 ${recentMonths.join(',')}）`);
+  assertEqual(recent.basis.months, 2, 'basis.months 应如实报出只覆盖了 2 个月');
+  assertEqual(recent.basis.rangeMonths, 3, '命中范围内共有 3 个自然月');
+
+  // 按月节选：3 个月每个月都有代表
+  const monthly = await searchEmails({ query, instanceId: 'default', now: NOW, basis: 'monthly' });
+  const monthlyDays = excerptDays(lastAnswerPrompt());
+  const monthlyMonths = monthsOf(monthlyDays);
+  assertEqual(monthly.basis.rangeMonths, 3, '范围内应有 3 个自然月');
+  assertEqual(monthlyMonths.length, monthly.basis.rangeMonths, `按月节选覆盖到的月份数必须等于范围内月份数（实际 ${monthlyMonths.join(',')}）`);
+  assertEqual(monthly.basis.months, 3, 'basis.months 应为 3');
+  for (const month of ['2026-07', '2026-08', '2026-09']) {
+    assert(monthlyMonths.includes(month), `按月节选必须给 ${month} 至少一封代表`);
+  }
+  // 每月最多 K 封（默认 8）：25 封/月时每月只能是 8 封，总量 24
+  assertEqual(monthly.basis.months, 3, '月度覆盖数');
+  assertEqual(monthly.basis.maxPerMonth, 8, '月度策略应报出每月上限 8 封');
+  assertEqual(monthlyDays.length, 24, `3 个月 × 每月最多 8 封 = 24 封（实际 ${monthlyDays.length}）`);
+  const perMonth = monthly.basis.monthCounts.map((m) => m.selected);
+  assert(perMonth.every((n) => n <= 8), `每月选中的封数都不得超过 8（实际 ${perMonth.join('/')}）`);
+  assertEqual(perMonth.reduce((a, b) => a + b, 0), 24, '每月选中数之和应等于带摘录总数');
+  // 早期月份的覆盖区间必须真的被拉到 7 月
+  assert(monthly.basis.coveredFrom < recent.basis.coveredFrom, `按月节选的起点应早于最近策略（${monthly.basis.coveredFrom} < ${recent.basis.coveredFrom}）`);
+  assertEqual(recent.basis.coveredFrom, '2026-08-11', '最近 40 封的覆盖起点应为 8-11（第 40 封）');
+  assertEqual(monthly.basis.coveredFrom, '2026-07-18', '按月节选的覆盖起点应为 7-18（7 月第 8 新的那封）');
+
+  // 边界：命中不足 40 封时三种策略都只能有多少给多少
+  const few = recent.items.slice(0, 7);
+  for (const strategy of ['recent', 'monthly', 'even']) {
+    assertEqual(selectBasisItems(few, { strategy, timeZone: TZ }).items.length, 7, `命中不足上限时 ${strategy} 应全部取用`);
+  }
+  // 边界：空输入不报错、不硬凑
+  assertEqual(selectBasisItems([], { strategy: 'monthly' }).items.length, 0, '空命中不应产出代表');
+  assert(selectBasisItems([], { strategy: 'even' }).items.length === 0, '空命中不应产出采样点');
+});
+
+await test('检索结论范围：均衡采样覆盖首尾（含范围内最早与最新各一封）', async () => {
+  const { searchEmails } = await import('../server/ai/search.js');
+  store.upsertAnalyses(seedBasisMonths());
+  store.persistState();
+
+  const out = await searchEmails({
+    query: '请分析7月份以来，basis@example.com 发给我的邮件（结论范围测试）',
+    instanceId: 'default',
+    now: NOW,
+    basis: 'even',
+  });
+  const days = excerptDays(lastAnswerPrompt());
+  assertEqual(out.basis.strategy, 'even', '应回显均衡采样');
+  assertEqual(days.length, 40, '均衡采样应取满 40 封');
+  // 设计如此：等间隔下标必然含首个（最新 09-25）与末个（最早 07-01）
+  assertEqual(out.basis.coveredFrom, '2026-07-01', '均衡采样必须含范围内最早的一封（7-01）');
+  assertEqual(out.basis.coveredTo, '2026-09-25', '均衡采样必须含范围内最新的一封（9-25）');
+  assert(days.includes('2026-07-01'), '提示词里应含 7-01 那封（最早）');
+  assert(days.includes('2026-09-25'), '提示词里应含 9-25 那封（最新）');
+  // 采样点单调递减且互不相同（确定性算法：等间隔下标）
+  const sorted = [...days].sort().reverse();
+  assertEqual(days.join(','), sorted.join(','), '采样结果应按时间倒序且无重复');
+});
+
+await test('检索结论范围：返回的 basis 与送进模型的提示词口径一致（策略名 + 覆盖区间）', async () => {
+  const { searchEmails } = await import('../server/ai/search.js');
+  store.upsertAnalyses(seedBasisMonths());
+  store.persistState();
+
+  const query = '请分析7月份以来，basis@example.com 发给我的邮件（结论范围测试）';
+  /** 每种策略在文案里必须出现的名字（= 界面上给用户看的名字） */
+  const STRATEGY_WORD = { recent: '最近', monthly: '按月节选', even: '均衡采样' };
+  for (const strategy of ['recent', 'monthly', 'even']) {
+    const out = await searchEmails({ query, instanceId: 'default', now: NOW, basis: strategy });
+    const prompt = lastAnswerPrompt();
+    // 同一份口径文案同时出现在返回值与提示词里（界面直接展示 basis.line）
+    assertIncludes(out.basis.line, STRATEGY_WORD[strategy], 'basis.line 应含策略名');
+    assertIncludes(out.basis.line, `覆盖 ${out.basis.coveredFrom} ~ ${out.basis.coveredTo}`, 'basis.line 应含覆盖区间');
+    assertIncludes(prompt, out.basis.line, '提示词应原话带上结论范围口径');
+    assertIncludes(prompt, out.basis.label, '提示词应含「策略 + 封数」的口径');
+    assertIncludes(prompt, STRATEGY_WORD[strategy], '提示词应含策略名');
+    assertIncludes(prompt, out.basis.coveredFrom, '提示词应含覆盖起点');
+    assertIncludes(prompt, out.basis.coveredTo, '提示词应含覆盖终点');
+    // 界面用的文案里也要写得清「看了多少封、覆盖到哪」
+    assertIncludes(out.basis.line, `${out.basis.count} 封`, '口径文案应写明封数');
+    if (strategy === 'monthly') {
+      assertIncludes(prompt, `每月最多 ${out.basis.maxPerMonth} 封`, '按月节选应在提示词里写明每月上限');
+    }
+    // 兼容字段：basis 与 analysisBasis 是同一份口径，stats.analysisBasis 也是它
+    assertEqual(out.basis.count, out.analysisBasis.count, 'basis 与 analysisBasis 必须一致');
+    assertEqual(out.basis.strategy, out.analysisBasis.strategy, 'basis 与 analysisBasis 的策略必须一致');
+    assertEqual(out.stats.basis, out.basis.count, 'stats.basis 应等于带摘录封数');
+    assertEqual(out.stats.analysisBasis.coveredFrom, out.basis.coveredFrom, 'stats.analysisBasis 应是同一份口径');
+    // 系统提示词要求模型把策略与区间写进结论
+    const call = [...llmCalls].reverse().find((c) => (c.messages || []).some((m) => String(m.content).includes('检索结果分析师')));
+    const system = String(call.messages.find((m) => String(m.content).includes('检索结果分析师'))?.content || '');
+    assertIncludes(system, '覆盖哪个时间段', '系统提示词应要求写明覆盖时间段');
+  }
+});
+
+await test('检索结论范围：非法策略值回落到默认并说明（绝不静默）', async () => {
+  const { searchEmails, normalizeBasis } = await import('../server/ai/search.js');
+  store.upsertAnalyses(seedBasisMonths());
+  store.persistState();
+
+  // ① 归一化函数：合法（大小写不敏感）/ 空 / 非法
+  assertEqual(normalizeBasis('monthly').strategy, 'monthly', '合法值应原样接受');
+  assertEqual(normalizeBasis('EVEN').strategy, 'even', '策略值应大小写不敏感');
+  assertEqual(normalizeBasis(' monthly ').strategy, 'monthly', '两侧空白应被忽略');
+  assertEqual(normalizeBasis(undefined).strategy, 'recent', '缺省应为 recent');
+  assertEqual(normalizeBasis(null).fellBack, false, '没有值不算回落');
+  const bad = normalizeBasis('随便写的');
+  assertEqual(bad.strategy, 'recent', '非法值应回落到 recent');
+  assertEqual(bad.fellBack, true, '非法值必须标记 fellBack');
+  assertIncludes(bad.note, '随便写的', '说明里应含用户原本给的值');
+  assertIncludes(bad.note, 'recent', '说明里应给出可选值');
+
+  // ② 走完整检索链路：回落 + 说明都要出现在返回值里，且结果本身不受影响
+  const out = await searchEmails({
+    query: '请分析7月份以来，basis@example.com 发给我的邮件（结论范围测试）',
+    instanceId: 'default',
+    now: NOW,
+    basis: '不存在的策略',
+  });
+  assertEqual(out.basis.strategy, 'recent', '非法策略应回落到默认 recent');
+  assertEqual(out.basis.fellBack, true, '必须标记发生了回落');
+  assertIncludes(out.basis.note, '不存在的策略', '说明里应写出被拒的值');
+  assertIncludes(out.basis.note, 'recent / monthly / even', '说明里应列出可选值');
+  assertEqual(out.basis.requested, '不存在的策略', '应保留原始请求值便于排查');
+  assertEqual(out.stats.matched, seedBasisMonths().length, '回落不影响命中结果');
+  // 提示词里也要带上回落说明，模型才不会照着「不存在的策略」写
+  assertIncludes(lastAnswerPrompt(), out.basis.line, '提示词应使用回落后的口径');
+
+  /*
+   * 排序不是时间倒序时，`recent` 取的是「当前排序的前 40 封」而不是最新的 40 封：
+   * 口径必须跟着改写（不能一边取最早/最优先的 40 封、一边写「最近 40 封」）。
+   */
+  const { describeBasis, selectBasisItems: pick } = await import('../server/ai/search.js');
+  const items = out.items;
+  for (const order of ['date_asc', 'priority']) {
+    const sel = pick(items, { strategy: 'recent', timeZone: TZ });
+    const scope = describeBasis({
+      strategy: 'recent',
+      count: sel.items.length,
+      coveredFrom: sel.coveredFrom,
+      coveredTo: sel.coveredTo,
+      order,
+    });
+    assertIncludes(scope.label, '列表前', `排序为 ${order} 时不应自称「最近」（实际 ${scope.label}）`);
+    assertEqual(scope.orderLabel, order === 'date_asc' ? '时间正序' : '按优先级', '应如实给出列表顺序');
+  }
+  const descScope = describeBasis({ strategy: 'recent', count: 40, coveredFrom: '2026-08-11', coveredTo: '2026-09-25', order: 'date_desc' });
+  assertIncludes(descScope.label, '最近', '默认（时间倒序）时仍应写作「最近 40 封」');
+});
+
+await test('HTTP：POST /api/search/emails 接受结论范围策略，缺省为 recent、非法值回落并说明', async () => {
+  const { startServer } = await import('../server/index.js');
+  const { server, url } = await startServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  const H = { 'content-type': 'application/json' };
+  const query = '请分析7月份以来，basis@example.com 发给我的邮件（结论范围测试）';
+  const post = async (body) =>
+    (await fetch(`${url}/api/search/emails`, { method: 'POST', headers: H, body: JSON.stringify(body) })).json();
+  try {
+    store.upsertAnalyses(seedBasisMonths());
+    store.persistState();
+
+    // ① 合法策略经 HTTP 透传到检索层，返回同一份口径
+    const monthly = await post({ query, instanceId: 'default', basis: 'monthly' });
+    assert(monthly.ok, `检索失败：${monthly.message}`);
+    assertEqual(monthly.basis.strategy, 'monthly', '请求体里的 basis 应透传到检索层');
+    assertEqual(monthly.basis.fellBack, false, '合法策略不应标记回落');
+    assertEqual(monthly.stats.analysisBasis.strategy, 'monthly', 'stats.analysisBasis 应是同一份口径');
+    assertEqual(monthly.basis.limit, 40, '带摘录上限必须仍是 40（额度闸门）');
+    assert(monthly.basis.count <= 40, `带摘录条数不得超过 40（实际 ${monthly.basis.count}）`);
+    assertEqual(monthly.basis.months, 3, '按月节选应覆盖 3 个自然月');
+    assertIncludes(monthly.basis.line, '覆盖', '应给出可直接展示的口径文案');
+
+    // ② 缺省（不传 basis）→ recent，向后兼容
+    const dflt = await post({ query, instanceId: 'default' });
+    assertEqual(dflt.basis.strategy, 'recent', '缺省必须是 recent（向后兼容）');
+    assertEqual(dflt.basis.fellBack, false, '缺省不算回落');
+    assertEqual(dflt.basis.count, 40, '缺省语义不变：按时间倒序取前 40 封');
+
+    // ③ 非法值 → 回落 + 说明（绝不静默）
+    const bad = await post({ query, instanceId: 'default', basis: '奇奇怪怪' });
+    assertEqual(bad.basis.strategy, 'recent', '非法值应回落到 recent');
+    assertEqual(bad.basis.fellBack, true, '必须标记发生了回落');
+    assertIncludes(bad.basis.note, '奇奇怪怪', '说明里应写出被拒的值');
+    assertIncludes(bad.basis.note, 'recent / monthly / even', '说明里应列出可选值');
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+/* ------------------------------------------------------------ 代理（访问 Google） */
 await test('代理：地址解析（空/裸地址/带凭据/NO_PROXY/回环/SOCKS 拒绝）', async () => {
   const { parseProxy, resolveProxyFor } = await import('../server/lib/http.js');
 

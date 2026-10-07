@@ -1692,6 +1692,41 @@ body {
   font-size: 14px;
 }
 
+/*
+ * 「结论范围」一行：标签 + 下拉 + 代价小字。
+ *
+ * 下拉必须 width:auto——`.input` 是 width:100%，不覆盖会被拉满整行，
+ * 把旁边的代价小字挤到看不见（而代价正是这次改动要写清的东西）。
+ * 窄屏换行，避免小字被压成一条细缝。
+ */
+.basis-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.basis-row .search-basis-select {
+  width: auto;
+  flex: 0 0 auto;
+  min-width: 240px;
+  height: 34px;
+  padding: 0 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.basis-row .search-basis-cost {
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+/* 「换策略不放大额度 / 已改动」这句单独一行，避免和代价小字挤在一起看不清 */
+.basis-row .search-basis-note {
+  flex: 1 1 100%;
+}
+
 /* 总览页的时间范围选择器 + 分析按钮：同一行、右对齐、不随窗口宽度拉伸 */
 .window-group {
   display: flex;

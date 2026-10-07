@@ -74,7 +74,7 @@ export const SEARCH_ANSWER_SYSTEM = `你是「邮箱数字人」的检索结果�
   ## 结论
   ## 相关邮件
   ## 需要注意
-- 「结论」2-4 句，点出这批邮件的关键信息（涉及谁、什么事、有无时间要求），并**必须写明结论依据了多少封邮件**（例如「以下结论基于其中 40 封」）。
+- 「结论」2-4 句，点出这批邮件的关键信息（涉及谁、什么事、有无时间要求），并**必须写明结论依据了多少封邮件、以及这批邮件覆盖哪个时间段**。提示词里给了现成的口径原话（形如「结论基于最近 40 封（覆盖 2026-07-20 ~ 2026-10-06）」），照它写即可，例如「以下结论基于最近 40 封，覆盖 07-20 ~ 10-06」。
 - 「相关邮件」按重要性挑最多 8 封，每封一行，格式为「- [日期] 发件人：主题 — 要点」。
 - 「需要注意」最多 3 条，只写真正有价值的（未回复的紧急事项、承诺的时间点、反复出现的问题）。
 - 只依据给定的邮件内容，**不得编造**。资料不足时直接说明「给出的邮件里没有相关信息」。
@@ -107,6 +107,7 @@ export function buildSearchIntentPrompt({ query, now, timeZone, coverage }) {
 /** 结果分析的输入。 */
 export function buildSearchAnswerPrompt({ query, understood, mails, headlines = [], now, timeZone, stats }) {
   const basis = stats?.basis ?? mails.length;
+  const scope = stats?.scope || null;
   const lines = [
     '## 当前时间上下文',
     `- 今天：${now.date}（${now.weekday}），时区 ${timeZone}`,
@@ -118,10 +119,17 @@ export function buildSearchAnswerPrompt({ query, understood, mails, headlines = 
     `## 命中的邮件（共 ${stats.matched} 封）`,
     '',
     /*
-     * 结论依据必须**有界且如实**：程序只把前 N 封给了模型，模型不能以为读到了全部。
-     * 这句话同时出现在提示词里（约束模型）与界面文案里（告知用户），两边口径一致。
+     * 结论视野必须**有界、如实、可核对**。
+     * 这一段是本次改动（「结论范围」策略）的核心：用户选了哪种策略、结论实际覆盖哪段时间，
+     * 必须原话出现在提示词里，模型才能在自己的结论里如实交代——否则用户会以为
+     * 「7 月份以来」的结论真的看过了 7 月，而实际只看了最近 40 封。
      */
-    `**重要：你只能依据下面这 ${basis} 封邮件写结论（按时间${stats.analysisOrder === 'date_asc' ? '正序' : '倒序'}，已列出的部分）**，` +
+    scope?.line
+      ? `**本次的结论范围：${scope.line}**——命中 ${stats.matched} 封，其中只有这 ${basis} 封带摘录给你看` +
+        `${headlines.length ? `，另有 ${headlines.length} 封只给标题与时间` : ''}。` +
+        '**写结论时必须照这句口径如实说明你看到的是哪一批、覆盖到哪一天**，不要写成「我看了全部命中邮件」。'
+      : '',
+    `**重要：你只能依据下面这 ${basis} 封邮件写结论（${scope?.orderLabel ? `按${scope.orderLabel}` : `按时间${stats.analysisOrder === 'date_asc' ? '正序' : '倒序'}`}，已列出的部分）**，` +
       `命中总数为 ${stats.matched} 封${stats.partial ? '，其余仅列出标题未提供给你' : ''}。` +
       '结论里必须写明「基于其中 N 封」这样的口径，不得让用户以为你读了全部命中邮件。',
   ].filter(Boolean);
@@ -154,6 +162,6 @@ export function buildSearchAnswerPrompt({ query, understood, mails, headlines = 
   }
 
   lines.push('');
-  lines.push('请按要求输出中文分析，并在「结论」里写明结论基于多少封邮件。');
+  lines.push('请按要求输出中文分析，并在「结论」里写明结论基于多少封邮件、覆盖哪个时间段（照抄上面给出的口径原话）。');
   return lines.join('\n');
 }

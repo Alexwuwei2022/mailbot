@@ -3583,6 +3583,80 @@ await step('对话查邮件页：对话式检索与结果展示', async () => {
   await new Promise((r) => setTimeout(r, 120));
   check(container.innerHTML.includes('附件二.pdf'), '展开后应显示附件明细');
   check(container.innerHTML.includes('条款已更新'), '展开后应显示正文摘录');
+
+  /*
+   * 「结论范围」控件：默认最近 40 封，代价必须写在控件旁；
+   * 改选后请求要带上策略，服务端返回的口径（策略 + 覆盖区间 + 回落说明）必须原样显示。
+   */
+  const { api } = await import('../web/api.js');
+  const basisSelect0 = container.querySelector('.search-basis-select');
+  check(basisSelect0, '缺少「结论范围」选择器');
+  checkEqual(basisSelect0.value, 'recent', '结论范围默认应为「最近 40 封」');
+  check(container.innerHTML.includes('结论范围（结论看哪些邮件）'), '缺少结论范围标签');
+  check(container.innerHTML.includes('看得最细'), '应写明「最近 40 封」的代价');
+  check(container.innerHTML.includes('不会放大模型额度'), '应说明换策略不会放大模型额度');
+  const basisOptions = [...basisSelect0.querySelectorAll('option')].map((o) => o.textContent);
+  checkEqual(basisOptions.length, 3, '应恰好三种结论范围策略');
+  check(basisOptions.join('｜').includes('按月节选') && basisOptions.join('｜').includes('均衡采样'), `下拉应含三种策略（实际 ${basisOptions.join('｜')}）`);
+
+  const basisPayloads = [];
+  const realSearchEmails = api.searchEmails;
+  api.searchEmails = (payload) => {
+    basisPayloads.push(String(payload?.basis));
+    return realSearchEmails(payload);
+  };
+  globalThis.__forceResponses = {
+    '/api/search/emails': {
+      ...responses['/api/search/emails'],
+      // 服务端真实形状的口径对象（含回落说明）
+      basis: {
+        strategy: 'monthly',
+        label: '按月节选 24 封',
+        line: '结论基于按月节选 24 封（覆盖 2026-07-18 ~ 2026-09-25，每月最多 8 封）',
+        count: 24,
+        limit: 40,
+        months: 3,
+        headlines: 40,
+        order: 'date_desc',
+        fellBack: true,
+        note: '结论范围「月度」不是有效选项，已按「最近 N 封」处理。',
+      },
+    },
+  };
+  try {
+    const sel = container.querySelector('.search-basis-select');
+    /*
+     * 模拟用户改选：linkedom 里 `select.value` 只有 getter（赋值会抛错），
+     * 因此改成把目标 option 标为 selected 再派发 change——真实浏览器里用户操作也是这个效果。
+     */
+    const monthlyOption = [...sel.querySelectorAll('option')].find((o) => o.value === 'monthly');
+    monthlyOption.selected = true;
+    sel.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 80));
+    check(container.innerHTML.includes('覆盖整段时间'), '改选后应显示该策略的代价');
+    checkEqual(container.querySelector('.search-basis-select').value, 'monthly', '重新渲染后控件应保持所选策略');
+
+    const btn2 = [...container.querySelectorAll('button')].find((b) => b.textContent === '检索并分析');
+    btn2.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 260));
+    checkEqual(basisPayloads.join(','), 'monthly', '检索请求应带上所选的结论范围策略');
+    const finalHtml = container.innerHTML;
+    check(finalHtml.includes('结论基于按月节选 24 封（覆盖 2026-07-18 ~ 2026-09-25，每月最多 8 封）'), '应原样显示结论范围口径');
+    check(finalHtml.includes('另有 40 封只给了标题与时间'), '应说明还有多少封只给了标题与时间');
+    check(finalHtml.includes('不是有效选项'), '策略值被回落时必须显示回落说明');
+
+    // 再改选一次：必须提示「需重新检索」，且**不得**偷偷再发一次（那会悄悄多花一次模型额度）
+    const payloadsBefore = basisPayloads.length;
+    const sel2 = container.querySelector('.search-basis-select');
+    [...sel2.querySelectorAll('option')].find((o) => o.value === 'even').selected = true;
+    sel2.dispatchEvent(new window.Event('change', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 80));
+    check(container.innerHTML.includes('已改动'), '结果与所选策略不一致时应提示需要重新检索');
+    checkEqual(basisPayloads.length, payloadsBefore, '改选策略本身不应自动重跑检索');
+  } finally {
+    api.searchEmails = realSearchEmails;
+    delete globalThis.__forceResponses;
+  }
 });
 
 await step('对话查邮件页：截断时明确写出「命中 N 封 / 已列出前 M 封」', async () => {
