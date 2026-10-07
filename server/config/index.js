@@ -387,6 +387,7 @@ export function normalize(raw) {
   /* 检索 */
   config.search = deepMerge(DEFAULTS.search, config.search || {});
   config.search.backfillMax = clampNumber(config.search.backfillMax, 0, 300, 40);
+  config.search.envelopeScanMax = clampNumber(config.search.envelopeScanMax, 50, 3000, 3000);
 
   return config;
 }

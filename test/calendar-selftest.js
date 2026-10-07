@@ -159,6 +159,16 @@ const llm = await mocks2StartMockLlm({
       if (/多久|十年|随意/.test(q)) {
         return JSON.stringify({ understood: '时间范围过长', action: 'search', needMore: false, filters: { dateFrom: '2015-01-01', dateTo: '2026-09-27' }, sort: 'date_desc' });
       }
+      // 回归用例：某个发件人在范围内有 34 封（> 旧的默认 limit=30），最早那封在 7-02
+      if (/sumj1@chinatelecom\.cn/.test(q)) {
+        return JSON.stringify({
+          understood: '查找 7 月以来 sumj1@chinatelecom.cn 发来的邮件',
+          action: 'search',
+          needMore: false,
+          filters: { dateFrom: '2026-07-01', dateTo: '2026-09-27', from: ['sumj1@chinatelecom.cn'] },
+          sort: 'date_desc',
+        });
+      }
       if (/不知道/.test(q)) {
         return JSON.stringify({ understood: '', action: 'search', needMore: true, question: '你想找哪个发件人、或者哪个关键词的邮件？' });
       }
@@ -1808,13 +1818,27 @@ await test('检索：意图不明确时反问而不是瞎猜', async () => {
   assertEqual(out.items.length, 0, '追问时不应返回结果');
 });
 
-await test('检索：过长时间范围被收敛到一年内', async () => {
+await test('检索：过长时间范围被收敛到一年内，并说明收敛过程', async () => {
   const { searchEmails } = await import('../server/ai/search.js');
-  const out = await searchEmails({ query: '帮我找十年的邮件', instanceId: 'default' });
+  const out = await searchEmails({ query: '帮我找十年的邮件', instanceId: 'default', now: NOW });
   const from = out.filters.dateFrom;
   const to = out.filters.dateTo;
   const days = (new Date(to).getTime() - new Date(from).getTime()) / 86_400_000;
   assert(days <= 366, `时间范围应不超过一年（实际 ${Math.round(days)} 天）`);
+  // 不能静默改小范围：必须带出「被收敛」的标记与可直接展示的说明
+  assertEqual(out.filters.maxWindowDays, 366, '最长范围应为 366 天（约 1 年）');
+  assertEqual(out.filters.rangeClamped, true, '超出 1 年上限时必须标记 rangeClamped');
+  assertEqual(out.filters.requestedFrom, '2015-01-01', '应保留模型原本要的起点，便于如实说明');
+  assertIncludes(out.filters.rangeNote, '2015-01-01', '说明里应包含原本要的起始日期');
+  assertIncludes(out.filters.rangeNote, '366', '说明里应包含最长天数');
+  assertIncludes(out.filters.rangeNote, '分次查询', '应给出可执行的建议');
+
+  // 一年以内不应被误判为收敛
+  const { normalizeFilters } = await import('../server/ai/search.js');
+  const ok = normalizeFilters({ dateFrom: '2026-07-01', dateTo: '2026-09-27' }, { now: NOW, timeZone: TZ });
+  assertEqual(ok.rangeClamped, false, '一年内的范围不应被标记收敛');
+  assertEqual(normalizeFilters({ dateFrom: '2025-09-27', dateTo: '2026-09-27' }, { now: NOW, timeZone: TZ }).rangeClamped, false, '刚好一年不应被收敛');
+  assertEqual(normalizeFilters({ dateFrom: '2025-09-25', dateTo: '2026-09-27' }, { now: NOW, timeZone: TZ }).rangeClamped, true, '超过 366 天应被收敛');
 });
 
 await test('检索：无时间条件时使用默认 30 天并可被识别', async () => {
@@ -1836,13 +1860,304 @@ await test('检索：非法筛选值被丢弃，不会导致查询异常', async
   assertEqual(f.types.join(','), 'notification', '非法类型应被过滤');
   assertEqual(f.priorities.join(','), 'urgent', '非法优先级应被过滤');
   assertEqual(f.recipientKind, 'any', '非法收件方式应回退为 any');
-  assertEqual(f.limit, 200, 'limit 应被夹到上限');
+  assertEqual(f.limit, 1000, 'limit 应被夹到列表硬上限（列表不再由模型的 30 决定）');
   // 不应抛错
   const res = applyFilters(seedSearchableEmails(), f);
   assert(Array.isArray(res), '应返回数组');
 });
 
 /* -------------------------------------------------- 11. 检索按需回补 */
+
+/**
+ * 回归夹具：某个发件人在检索范围内有 34 封邮件（旧逻辑里 limit 默认 30，会截掉最早的 4 封）。
+ *
+ * 复刻用户报的现象：查「7 月份以来 sumj1@chinatelecom.cn 发给我的邮件」，
+ * 命中列表只到最新 30 封，最早那封（7-02）被静默丢掉。
+ */
+function seedManyFromOneSender({ count = 34, address = 'sumj1@chinatelecom.cn', name = '苏美佳', prefix = '月度对账通知' } = {}) {
+  const base = Date.parse('2026-07-02T02:00:00.000Z');
+  const records = [];
+  for (let i = 0; i < count; i += 1) {
+    // 每 2 天一封：7-02 ~ 9-04，全部落在「7 月以来」范围内
+    const date = new Date(base + i * 2 * 86_400_000).toISOString();
+    records.push({
+      key: `analysis:INBOX:${7700 + i}`,
+      instanceId: 'default',
+      folder: 'INBOX',
+      uid: 7700 + i,
+      type: 'notification',
+      priority: 'normal',
+      needsReply: false,
+      recipientKind: 'direct',
+      summary: `${prefix}第 ${i + 1} 期`,
+      actions: [],
+      reason: '通知类邮件',
+      analyzedAt: date,
+      mail: {
+        uid: 7700 + i,
+        folder: 'INBOX',
+        subject: `${prefix}（第 ${i + 1} 期）`,
+        from: { name, address },
+        to: [{ address: 'me@company.com' }],
+        cc: [],
+        date,
+        snippet: `${prefix}正文`,
+        messageId: `<many-${i}@chinatelecom.cn>`,
+        hasAttachments: false,
+        attachments: [],
+      },
+    });
+  }
+  return records;
+}
+
+await test('检索列表：命中数超过旧默认上限（30）时，列表仍包含范围内最早的那封', async () => {
+  const { searchEmails } = await import('../server/ai/search.js');
+  const seeded = seedManyFromOneSender();
+  store.upsertAnalyses(seeded);
+  store.persistState();
+
+  const out = await searchEmails({
+    query: '请分析7月份以来，sumj1@chinatelecom.cn 发给我的邮件',
+    instanceId: 'default',
+    now: NOW,
+  });
+
+  // 范围解析正确（7-01 ~ 今天），不是被默认 30 天窗口吃掉
+  assertEqual(out.filters.dateFrom, '2026-07-01', '应解析出「7 月以来」的起点');
+  assertEqual(out.filters.dateTo, '2026-09-27', '应到今天');
+
+  // 核心回归：34 封全部列出，且包含最早那封（旧逻辑只给 30 封，最早到 8 月中旬）
+  assertEqual(out.items.length, seeded.length, `应列出全部 ${seeded.length} 封（实际 ${out.items.length} 封）`);
+  assertEqual(out.stats.matched, seeded.length, '命中总数应等于列表长度（未截断）');
+  assertEqual(out.stats.truncated, false, '未超过展示上限时不应标记截断');
+  const earliest = out.items[out.items.length - 1];
+  assertEqual(earliest.day, '2026-07-02', `列表最后一条应是范围内最早的那封 7-02（实际 ${earliest.day}）`);
+  assert(
+    out.items.some((it) => it.subject.includes('第 1 期')),
+    '列表必须包含最早那封（第 1 期）——这正是用户报告缺失的那封',
+  );
+  // 列表默认给足，且不再由模型随手给的 30 决定
+  assertEqual(out.stats.listLimit, 1000, '列表展示上限应是给足的默认值，不再被模型的 limit=30 牵着走');
+  assert(out.items.every((it) => it.analyzed === true), '本地已分析的条目应标记为已分析');
+
+  // 「相关邮件」是界面可读的列表：34 封都在里面
+  assert(out.items.filter((it) => it.summary).length >= 34, '每封都应有摘要（本地已分析）');
+});
+
+await test('检索列表：超过展示上限时如实暴露 truncated 与总数，并给出建议', async () => {
+  const { searchEmails } = await import('../server/ai/search.js');
+  const seeded = seedManyFromOneSender({ prefix: '截断验证通知' });
+  store.upsertAnalyses(seeded);
+  store.persistState();
+
+  // 主动收窄到前 5 条，模拟「可展示上限」被触达
+  const out = await searchEmails({
+    query: '请分析7月份以来，sumj1@chinatelecom.cn 发给我的邮件',
+    instanceId: 'default',
+    now: NOW,
+    limit: 5,
+  });
+
+  assertEqual(out.items.length, 5, '应按请求只列出前 5 条');
+  assert(out.stats.matched >= 34, `命中总数应如实报告（实际 ${out.stats.matched}）`);
+  assertEqual(out.stats.listed, 5, '已列出条数应如实报告');
+  assertEqual(out.stats.truncated, true, '命中数超过展示上限时必须标记 truncated');
+  assertIncludes(out.truncationNote, '命中', '应说明命中数');
+  assertIncludes(out.truncationNote, '已列出前 5 封', '应说明只列出了前 5 封');
+  assertIncludes(out.truncationNote, '缩小时间范围', '应给出可执行的建议');
+  // 绝不静默：note 与 stats 必须同时暴露
+  assert(out.truncationNote.length > 10, '截断说明不能为空');
+});
+
+await test('检索结论：依据条数被如实标注（有界子集，不装成读了全部）', async () => {
+  const { searchEmails } = await import('../server/ai/search.js');
+  const seeded = seedManyFromOneSender({ prefix: '依据标注通知' });
+  store.upsertAnalyses(seeded);
+  store.persistState();
+
+  const out = await searchEmails({
+    query: '请分析7月份以来，sumj1@chinatelecom.cn 发给我的邮件',
+    instanceId: 'default',
+    now: NOW,
+  });
+
+  assert(out.analysisBasis, '应返回结论依据信息');
+  assert(out.analysisBasis.count <= 40, `结论依据应是有界子集（实际 ${out.analysisBasis.count}）`);
+  assertEqual(out.stats.basis, out.analysisBasis.count, 'stats.basis 应与 analysisBasis.count 一致');
+  assert(out.analysisBasis.limit === 40, '依据上限应为 40（与列表上限解耦）');
+  assertEqual(out.analysisBasis.partial, false, '依据覆盖了全部命中时不应标记为部分');
+
+  // 送给模型的提示词里必须写明「只能依据这 N 封」，模型才不会以为读了全部
+  const answerCall = [...llmCalls].reverse().find((c) => (c.messages || []).some((m) => String(m.content).includes('检索结果分析师')));
+  assert(answerCall, '应发生一次检索结果分析调用');
+  const prompt = answerCall.messages.map((m) => m.content).join('\n');
+  assertIncludes(prompt, `只能依据下面这 ${out.analysisBasis.count} 封`, '提示词应写明依据的封数');
+  assertIncludes(prompt, `命中总数为 ${out.stats.matched} 封`, '提示词应写明命中总数');
+});
+
+/**
+ * 信封扫描上限：把 `search.envelopeScanMax` 调到最小（50）再放 60 封以上，
+ * 就能稳定复现「范围太大，信封没扫完」。关键断言是**不静默**。
+ */
+await test('检索列表：信封扫描达到上限时明确暴露「还有更多未列出」', async () => {
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { searchEmails } = await import('../server/ai/search.js');
+  const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
+
+  // 120 封（> 上限 50 且 > 单批 250 之外的下一批判定需要多批；120 会走两批）
+  const messages = [];
+  for (let i = 0; i < 120; i += 1) {
+    const date = new Date(Date.UTC(2026, 6, 2 + i, 2));
+    messages.push({
+      uid: 8100 + i,
+      raw: mailMocks.makeRawMail({
+        subject: `信封上限验证 ${i}`,
+        from: { name: '苏美佳', address: 'sumj1@chinatelecom.cn' },
+        body: `第 ${i} 封`,
+        date,
+        messageId: `<cap-${i}@chinatelecom.cn>`,
+      }),
+      flags: [],
+      internalDate: date.toUTCString(),
+    });
+  }
+  const capImap = await mailMocks.startMockImap({ messages });
+  const savedPath = process.env.MAILBOT_DATA_DIR;
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-cap-'));
+  try {
+    process.env.MAILBOT_DATA_DIR = scratch;
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+    const live = getConfig();
+    live.instances = [
+      {
+        id: 'cap',
+        label: '信封上限邮箱',
+        imap: { host: '127.0.0.1', port: capImap.port, secure: false, authUser: 'bot@example.com', authPass: 'secret' },
+        smtp: { host: '127.0.0.1', port: 1, secure: false, authUser: 'bot@example.com', authPass: 'secret' },
+        identity: { name: '王磊', email: 'bot@example.com' },
+      },
+    ];
+    live.defaultInstanceId = 'cap';
+    live.calendar.timeZone = TZ;
+    live.llm = { ...live.llm, baseUrl: llm.baseUrl, apiKey: 'test', model: 'mock', maxRetries: 1 };
+    // 信封上限 50（最小值）；回补分析额度 5，确保真正花钱的部分仍然有界
+    live.search = { backfillMax: 5, envelopeScanMax: 50 };
+    store.loadState({ force: true });
+    store.persistState({ prune: false });
+    saveConfig(maskConfig(getConfig()));
+
+    const out = await searchEmails({
+      query: '请分析7月份以来，sumj1@chinatelecom.cn 发给我的邮件',
+      instanceId: 'cap',
+      now: NOW,
+    });
+
+    assertEqual(out.stats.backfill?.attempted, true, '应触发按需回补');
+    assertEqual(out.stats.backfill?.scanTruncated, true, '达到信封上限时必须标记 scanTruncated');
+    assert(out.stats.backfill.unscanned > 0, `应报出未扫描的封数（实际 ${out.stats.backfill.unscanned}）`);
+    assertIncludes(out.truncationNote, '信封扫描达到上限', '结论文案应明确说明扫描被截断');
+    assertIncludes(out.truncationNote, '可能不全', '应说明列表可能不全');
+    assertIncludes(out.truncationNote, '缩小时间范围', '应给出可执行的建议');
+    // 模型额度没有被放大：仍然受 backfillMax=5 约束
+    assert(out.stats.backfill.analyzed <= 5, `模型分析量应仍受回补额度约束（实际 ${out.stats.backfill.analyzed}）`);
+    // 列表不能缺：没有花额度分析的那部分邮件也要列出来，并标明「仅信封」
+    assert(out.stats.envelopeOnly > 0, `应列出仅信封命中的邮件（实际 ${out.stats.envelopeOnly}）`);
+    assert(
+      out.items.some((it) => it.analyzed === false && it.source === 'envelope'),
+      '仅信封命中应以 analyzed=false + source=envelope 暴露出来',
+    );
+    assert(
+      out.items.some((it) => it.analyzed === true && it.summary),
+      '已分析的邮件应有摘要',
+    );
+  } finally {
+    process.env.MAILBOT_DATA_DIR = savedPath;
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+    rmTempDir(scratch);
+    await capImap.close();
+  }
+});
+
+await test('检索列表：本地分析已覆盖该范围（信封缓存命中）时不再重扫邮箱', async () => {
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { searchEmails } = await import('../server/ai/search.js');
+  const { saveConfig, maskConfig, resetConfigCache } = await import('../server/config/index.js');
+
+  const messages = [];
+  for (let i = 0; i < 8; i += 1) {
+    const date = new Date(Date.UTC(2026, 7, 20 + i, 3));
+    messages.push({
+      uid: 8300 + i,
+      raw: mailMocks.makeRawMail({
+        subject: `缓存验证通知 ${i}`,
+        from: { name: '苏美佳', address: 'sumj1@chinatelecom.cn' },
+        body: `第 ${i} 封`,
+        date,
+        messageId: `<cache-${i}@chinatelecom.cn>`,
+      }),
+      flags: [],
+      internalDate: date.toUTCString(),
+    });
+  }
+  const imap = await mailMocks.startMockImap({ messages });
+  const savedPath = process.env.MAILBOT_DATA_DIR;
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mailbot-cache-'));
+  try {
+    process.env.MAILBOT_DATA_DIR = scratch;
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+    const live = getConfig();
+    live.instances = [
+      {
+        id: 'cache',
+        label: '信封缓存邮箱',
+        imap: { host: '127.0.0.1', port: imap.port, secure: false, authUser: 'bot@example.com', authPass: 'secret' },
+        smtp: { host: '127.0.0.1', port: 1, secure: false, authUser: 'bot@example.com', authPass: 'secret' },
+        identity: { name: '王磊', email: 'bot@example.com' },
+      },
+    ];
+    live.defaultInstanceId = 'cache';
+    live.calendar.timeZone = TZ;
+    live.llm = { ...live.llm, baseUrl: llm.baseUrl, apiKey: 'test', model: 'mock', maxRetries: 1 };
+    live.search = { backfillMax: 20, envelopeScanMax: 3000 };
+    store.loadState({ force: true });
+    store.persistState({ prune: false });
+    saveConfig(maskConfig(getConfig()));
+
+    const first = await searchEmails({
+      query: '请分析7月份以来，sumj1@chinatelecom.cn 发给我的邮件',
+      instanceId: 'cache',
+      now: NOW,
+    });
+    assert(first.stats.backfill?.attempted, '第一次应触发按需回补');
+    assert(first.items.length >= 8, `第一次应列出全部命中（实际 ${first.items.length}）`);
+
+    // 第二次：本地已覆盖该范围，且信封缓存（5 分钟内、范围覆盖）可用
+    imap.store.log.length = 0;
+    const second = await searchEmails({
+      query: '请分析7月份以来，sumj1@chinatelecom.cn 发给我的邮件',
+      instanceId: 'cache',
+      now: NOW,
+    });
+    assertEqual(second.items.length, first.items.length, '第二次应返回同样完整的列表');
+    assertEqual(second.stats.backfill?.envelopeReused, true, '第二次应复用信封缓存');
+    assert(
+      !imap.store.log.some((line) => /^UID FETCH|^FETCH|^UID SEARCH|^SEARCH/i.test(line)),
+      `本地已覆盖该范围时不应重扫邮箱（实际发生了：${imap.store.log.filter((l) => /FETCH|SEARCH/i.test(l)).join(' / ')}）`,
+    );
+  } finally {
+    process.env.MAILBOT_DATA_DIR = savedPath;
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+    rmTempDir(scratch);
+    await imap.close();
+  }
+});
 
 await test('检索回补：本地未覆盖的时间段会按需拉取并分析，从而查到邮件', async () => {
   const os = await import('node:os');

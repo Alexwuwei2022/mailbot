@@ -19,6 +19,15 @@ const EXAMPLES = [
   '这个月抄送给我的重要邮件',
 ];
 
+/*
+ * 「命中的邮件」列表最多渲染多少条。
+ *
+ * 服务端默认最多返回 1000 条，一次性铺 1000 个 DOM 行会让页面卡住。
+ * 因此这里再收一层：先渲染前 200 条，并**明确告诉用户还剩多少条**（可用「显示更多」继续）。
+ * 与服务端一样的原则：可以少渲染，但绝不静默少给。
+ */
+const RENDER_STEP = 200;
+
 export function renderSearch(root, app) {
   const { state } = viewState(app, 'search', () => ({
     input: '',
@@ -27,6 +36,8 @@ export function renderSearch(root, app) {
     result: null,
     /** 检索结果里展开详情的条目 key */
     expanded: null,
+    /** 命中列表当前渲染了多少条 */
+    shown: RENDER_STEP,
   }));
 
   const container = h('div', { class: 'view view-search' });
@@ -154,6 +165,10 @@ export function renderSearch(root, app) {
     }
     const s = result.stats || {};
     const bf = s.backfill;
+    const items = result.items || [];
+    const listed = s.listed ?? items.length;
+    const matched = s.matched ?? items.length;
+    const shownItems = items.slice(0, state.shown);
     return h(
       'div',
       {},
@@ -164,7 +179,14 @@ export function renderSearch(root, app) {
           'div',
           { class: 'block-head' },
           h('h3', { text: '检索条件与结果' }),
-          h('span', { class: 'muted small', text: `命中 ${s.matched ?? 0} 封 / 已扫描 ${s.scanned ?? 0} 封` }),
+          // 命中数与展示数分开说：截断时用户必须一眼看到「还有多少没列出来」
+          h('span', {
+            class: 'muted small',
+            text:
+              matched > listed
+                ? `命中 ${matched} 封 / 已列出前 ${listed} 封`
+                : `命中 ${matched} 封 / 已扫描 ${s.scanned ?? 0} 封`,
+          }),
         ),
         h(
           'div',
@@ -179,11 +201,29 @@ export function renderSearch(root, app) {
                 filterChips(result.filters),
               )
             : null,
+          // 范围被收敛（超出 1 年上限）：显式说明，不静默改小
+          result.filters?.rangeNote ? h('div', { class: 'muted small' }, `范围说明：${result.filters.rangeNote}`) : null,
           s.coverage
             ? h('div', { class: 'muted small' }, `本地已分析邮件覆盖 ${s.coverage.oldest} ~ ${s.coverage.newest}（共 ${s.coverage.count} 封）`)
             : h('div', { class: 'muted small' }, '本地还没有已分析的邮件，请先到「邮件总览」运行一次分析。'),
+          // 结论依据：模型只读了有界子集，必须如实说清
+          result.analysisBasis
+            ? h(
+                'div',
+                { class: 'muted small' },
+                `结论基于其中 ${result.analysisBasis.count} 封（按时间${result.analysisBasis.order === 'date_asc' ? '正序' : '倒序'}，上限 ${result.analysisBasis.limit} 封）` +
+                  (result.analysisBasis.partial ? '，其余命中只列出标题与时间，未交给模型' : ''),
+              )
+            : null,
+          s.envelopeOnly
+            ? h('div', { class: 'muted small' }, `其中 ${s.envelopeOnly} 封只有信封信息（发件人/时间/主题），没有模型摘要`)
+            : null,
           s.bodyHits ? h('div', { class: 'muted small' }, `其中 ${s.bodyHits} 封是通过 IMAP 正文检索补充的（尚未分析）`) : null,
         ),
+        // 截断说明：命中数超过展示上限 / 信封扫描达到上限，都必须显式提示
+        result.truncationNote
+          ? h('div', { class: 'alert alert-warn block-lead' }, result.truncationNote)
+          : null,
         // 按需回补说明：让用户知道「为什么这次能查到更早的邮件」
         bf?.attempted
           ? h(
@@ -192,8 +232,10 @@ export function renderSearch(root, app) {
               bf.failed
                 ? `按需拉取失败：${result.backfillNote || '未知错误'}`
                 : bf.fetched > 0
-                  ? `本地原先没有覆盖这个时间段，已按需到邮箱拉取 ${bf.fetched} 封并分析 ${bf.analyzed} 封${bf.truncated ? '（已达单次上限）' : ''}。`
-                  : '已按需到邮箱查过这个范围，没有符合时间与发件人条件的邮件。',
+                  ? `本地原先没有覆盖这个时间段，已按需到邮箱拉取 ${bf.fetched} 封并分析 ${bf.analyzed} 封${bf.truncated ? '（分析已达单次额度上限，未分析的命中仍列在下面）' : ''}。`
+                  : bf.matched > 0
+                    ? `已按需核对该范围的信封，命中 ${bf.matched} 封（都已分析过，无需重复分析）。`
+                    : '已按需到邮箱查过这个范围，没有符合时间与发件人条件的邮件。',
             )
           : null,
         bf?.truncated && result.backfillNote ? h('p', { class: 'muted small pad', text: result.backfillNote }) : null,
@@ -203,12 +245,38 @@ export function renderSearch(root, app) {
         result.assistant ? h('div', { class: 'markdown', html: renderMarkdown(result.assistant) }) : null,
         result.analysisError ? h('p', { class: 'muted small pad', text: `（分析降级为本地摘要：${result.analysisError}）` }) : null,
       ),
-      result.items?.length
+      items.length
         ? h(
             'section',
             { class: 'block' },
-            h('div', { class: 'block-head' }, h('h3', { text: `命中邮件（${result.items.length}）` })),
-            h('div', { class: 'kb-list' }, ...result.items.map((it) => resultRow(it, app))),
+            h(
+              'div',
+              { class: 'block-head' },
+              h('h3', { text: `命中邮件（${matched}）` }),
+              listed < matched ? h('span', { class: 'muted small', text: `仅列出前 ${listed} 封` }) : null,
+            ),
+            h(
+              'div',
+              { class: 'kb-list' },
+              ...shownItems.map((it) => resultRow(it, app)),
+            ),
+            items.length > shownItems.length
+              ? h(
+                  'div',
+                  { class: 'editor-actions' },
+                  h(
+                    'button',
+                    {
+                      class: 'btn btn-small',
+                      onclick: () => {
+                        state.shown += RENDER_STEP;
+                        paint();
+                      },
+                    },
+                    `显示更多（还有 ${items.length - shownItems.length} 条）`,
+                  ),
+                )
+              : null,
           )
         : null,
     );
@@ -246,7 +314,10 @@ export function renderSearch(root, app) {
         h('span', { class: `tag ${it.recipientKind === 'cc' ? 'tag-cc' : 'tag-quiet'}`, text: it.recipientLabel }),
         it.needsReply ? h('span', { class: 'tag tag-need', text: '需回复' }) : null,
         it.hasAttachments ? h('span', { class: 'tag tag-quiet', text: '有附件' }) : null,
-        it.notAnalyzed ? h('span', { class: 'tag tag-quiet', text: '未分析' }) : null,
+        // 区分「有摘要（已分析）」与「仅信封命中」：后者没有模型结论，用户不该以为它被分析过
+        it.analyzed === false || it.notAnalyzed
+          ? h('span', { class: 'tag tag-quiet', title: '只匹配到信封（发件人/时间/主题），没有模型摘要', text: '仅信封·未分析' })
+          : null,
         h('span', { class: 'muted small', text: fmtFull(it.date) }),
       ),
       h('h4', { class: 'kb-subject', text: it.subject || '(无主题)' }),
@@ -333,6 +404,7 @@ export function renderSearch(root, app) {
     if (state.searching) return;
     state.searching = true;
     state.expanded = null;
+    state.shown = RENDER_STEP;
     paint();
     try {
       state.result = await api.searchEmails({ query: q });

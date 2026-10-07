@@ -413,7 +413,22 @@ const responses = {
         hasDraft: false,
       },
     ],
-    stats: { matched: 2, scanned: 12, coverage: { count: 12, oldest: '2026-09-01', newest: '2026-09-27' }, bodyHits: 0, sort: 'date_desc' },
+    stats: {
+      matched: 2,
+      listed: 2,
+      truncated: false,
+      listLimit: 1000,
+      analyzed: 2,
+      envelopeOnly: 0,
+      basis: 2,
+      scanned: 12,
+      coverage: { count: 12, oldest: '2026-09-01', newest: '2026-09-27' },
+      bodyHits: 0,
+      sort: 'date_desc',
+      analysisBasis: { count: 2, analyzed: 2, maxAnalyzed: 2, limit: 40, order: 'date_desc', partial: false },
+    },
+    analysisBasis: { count: 2, analyzed: 2, maxAnalyzed: 2, limit: 40, order: 'date_desc', partial: false },
+    truncationNote: '',
     assistant: '# 结论\n张总在近一个月内发来 1 封关于合同的邮件。',
     analysisError: null,
   },
@@ -3556,6 +3571,8 @@ await step('对话查邮件页：对话式检索与结果展示', async () => {
   check(html.includes('直接发给我'), '应标注收件方式');
   check(html.includes('抄送给我'), '应标注抄送');
   check(!html.includes('附件二.pdf'), '未展开时不应显示附件明细');
+  // 结论依据必须如实标注（不能让用户以为模型读了全部命中）
+  check(html.includes('结论基于其中 2 封'), '应标注结论依据的封数');
 
   // 展开带附件的那一条（第 1 条没有附件，需按行定位而不是取第一个「展开」）
   const targetRow = [...container.querySelectorAll('.kb-row')].find((r) => r.textContent.includes('合同附件二条款'));
@@ -3566,6 +3583,67 @@ await step('对话查邮件页：对话式检索与结果展示', async () => {
   await new Promise((r) => setTimeout(r, 120));
   check(container.innerHTML.includes('附件二.pdf'), '展开后应显示附件明细');
   check(container.innerHTML.includes('条款已更新'), '展开后应显示正文摘录');
+});
+
+await step('对话查邮件页：截断时明确写出「命中 N 封 / 已列出前 M 封」', async () => {
+  const search = await import('../web/views/search.js');
+  const base = responses['/api/search/emails'];
+  const many = Array.from({ length: 12 }, (_v, i) => ({
+    ...base.items[0],
+    key: `INBOX:${300 + i}`,
+    uid: 300 + i,
+    subject: `截断验证邮件 ${i + 1}`,
+    day: '2026-09-20',
+    analyzed: i < 10,
+    source: i < 10 ? 'analysis' : 'envelope',
+    summary: i < 10 ? '需要确认交付时间。' : '',
+    notAnalyzed: i >= 10,
+  }));
+  globalThis.__forceResponses = {
+    '/api/search/emails': {
+      ...base,
+      items: many,
+      stats: {
+        ...base.stats,
+        matched: 34,
+        listed: 12,
+        truncated: true,
+        truncatedBy: 'list',
+        analyzed: 10,
+        envelopeOnly: 2,
+        basis: 12,
+      },
+      analysisBasis: { count: 12, analyzed: 10, maxAnalyzed: 12, limit: 40, order: 'date_desc', partial: false },
+      truncationNote: '命中 34 封，已列出前 12 封（单次展示上限）。请缩小时间范围或加上发件人/主题条件后分次查询，以免漏看较早的邮件。',
+    },
+  };
+  try {
+    const container = document.createElement('div');
+    const appStub = { navigate() {}, refreshCounts() {}, showMail() {} };
+    search.renderSearch(container, appStub);
+    await new Promise((r) => setTimeout(r, 120));
+    const input = container.querySelector('.search-main-input');
+    input.value = '请分析7月份以来 someone@x.com 发给我的邮件';
+    input.dispatchEvent(new window.Event('input', { bubbles: true }));
+    const btn = [...container.querySelectorAll('button')].find((b) => b.textContent === '检索并分析');
+    btn.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 220));
+
+    const html = container.innerHTML;
+    // 核心：命中总数与实际列出数都要出现，不能只写「命中 12 封」
+    check(html.includes('命中 34 封 / 已列出前 12 封'), '应同时展示命中总数与已列出条数');
+    check(html.includes('命中 34 封，已列出前 12 封'), '应展示服务端的截断说明');
+    check(html.includes('缩小时间范围'), '截断说明应给出可执行的建议');
+    check(html.includes('命中邮件（34）'), '标题里的命中数应是总数而不是列出数');
+    check(html.includes('仅列出前 12 封'), '标题区应补充实际列出条数');
+    // 仅信封命中的条目要标注出来，用户才知道它没有摘要
+    check(html.includes('仅信封·未分析'), '仅信封命中应有明显标记');
+    check(html.includes('其中 2 封只有信封信息'), '应说明仅信封命中的封数');
+    // 结论依据有界且如实
+    check(html.includes('结论基于其中 12 封'), '应标注结论依据的封数');
+  } finally {
+    delete globalThis.__forceResponses;
+  }
 });
 
 await step('知识库：邮件知识库 / 日历知识库 两个标签页', async () => {

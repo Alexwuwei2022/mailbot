@@ -166,6 +166,13 @@ export function renderSettings(root, app) {
             }, { min: 0, max: 300 }),
             '对话查邮件时若本地未覆盖该时间段，最多按需拉取并分析多少封；0 = 关闭',
           ),
+          field(
+            '检索信封扫描上限',
+            numberInput(cfg.search?.envelopeScanMax ?? 3000, (v) => {
+              cfg.search = { ...(cfg.search || {}), envelopeScanMax: v };
+            }, { min: 50, max: 3000 }),
+            '只读信头（不花模型额度）的扫描上限；命中列表靠它保证完整，达到上限会明确提示「还有邮件未检查到」',
+          ),
           field('单次最大处理邮件数', numberInput(cfg.scan.maxMessages, (v) => (cfg.scan.maxMessages = v), { min: 1, max: 2000 })),
           field('扫描文件夹（逗号分隔）', textInput((cfg.scan.folders || []).join(','), (v) => (cfg.scan.folders = v.split(',').map((s) => s.trim()).filter(Boolean)))),
           field('会话上下文条数', numberInput(cfg.scan.threadContextCount, (v) => (cfg.scan.threadContextCount = v), { min: 0, max: 10 })),
