@@ -18,6 +18,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { makeTempDir } from './lib/tmp.js';
+import { failureText, installFetchDiagnostics } from './lib/http.js';
+
+// 让本套件里每一处 fetch 失败时都带上确切 URL 与完整 cause 链（只加证据，不改判定）
+installFetchDiagnostics();
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -47,15 +51,15 @@ async function test(name, fn) {
     console.log(`  ✓ ${name}${detail ? ` — ${detail}` : ''}`);
   } catch (err) {
     /*
-     * 把底层 `cause` 也打出来。
+     * 把底层 `cause` 链与确切 URL 都打出来。
      *
      * `fetch` 抛出的信息就是一句 "fetch failed"，真正的原因（ECONNREFUSED / 端口没起来 /
-     * 沙箱拦截……）全在 `err.cause` 里。只打印 message 等于把线索丢掉，
-     * 排查的人只能靠猜——这个坑我踩过一次，不留第二次。
+     * 沙箱拦截 / fetch 禁用端口……）全在 `err.cause` 里，URL 则由 test/lib/http.js 的诊断层补上。
+     * 只打印 message 等于把线索丢掉，排查的人只能靠猜——这个坑我踩过一次，不留第二次。
      */
-    const cause = err?.cause ? ` ← ${err.cause.code || err.cause.name || ''} ${err.cause.message || err.cause}` : '';
-    failures.push({ name, message: (err?.stack || String(err)) + cause });
-    console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}`);
+    const extra = failureText(err);
+    failures.push({ name, message: (err?.stack || String(err)) + extra });
+    console.log(`  ✗ ${name}\n      ${err?.message || err}${extra}`);
   }
 }
 function assert(cond, msg) {

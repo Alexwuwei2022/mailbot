@@ -7,7 +7,7 @@
 
 import net from 'node:net';
 
-import { resolvePort } from './lib/port.js';
+import { listenOn, listenRandom } from './lib/port.js';
 
 const CRLF = '\r\n';
 
@@ -429,8 +429,12 @@ export async function startMockImap({
     socket.on('close', markClosed);
   });
 
-  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  const actualPort = await resolvePort(server);
+  /*
+   * 端口 0（默认）表示"让系统挑一个"：那条路径走 listenRandom——它除了重试读 `address()`，
+   * 还会避开 fetch/浏览器禁用端口。IMAP 是裸 socket，本身不受那份名单限制；
+   * 让所有 mock 都走同一条"抽一个能用的端口"的路径，就不必逐个判断谁会被 fetch 打到。
+   */
+  const actualPort = port === 0 ? await listenRandom(server) : await listenOn(server, port);
 
   return {
     port: actualPort,
@@ -631,9 +635,10 @@ export async function startMockSmtp({  user = 'bot@example.com',
     socket.on('close', () => sockets.delete(socket));
   });
 
-  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
+  // 端口 0 → 让系统挑，并避开 fetch 禁用端口（同 startMockImap 的说明）
+  const actualPort = port === 0 ? await listenRandom(server) : await listenOn(server, port);
   return {
-    port: await resolvePort(server),
+    port: actualPort,
     host: '127.0.0.1',
     received,
     get authAttempts() {
@@ -689,8 +694,8 @@ export async function startMockLlm({ port = 0, handler } = {}) {
       );
     });
   });
-  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  const actualPort = await resolvePort(server);
+  // 端口 0 → 让系统挑，并避开 fetch 禁用端口（大模型是**用 fetch 打的**，这条尤其关键）
+  const actualPort = port === 0 ? await listenRandom(server) : await listenOn(server, port);
   return {
     port: actualPort,
     baseUrl: `http://127.0.0.1:${actualPort}`,

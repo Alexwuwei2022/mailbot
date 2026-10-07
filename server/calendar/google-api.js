@@ -63,9 +63,11 @@ async function apiFetch(pathname, { method = 'GET', query, body, expect = 'json'
     });
   } catch (err) {
     if (err?.code === 'ETIMEDOUT') {
-      throw new AppError(`Google Calendar 请求超时（>${DEFAULT_TIMEOUT_MS / 1000}s）`, {
+      // 超时同样要把"确切打的是哪个地址"带上，否则只看到一句"请求超时"还是不知道打哪儿
+      throw new AppError(`Google Calendar 请求超时（>${DEFAULT_TIMEOUT_MS / 1000}s）：${method} ${url.href}`, {
         code: 'GOOGLE_TIMEOUT',
         status: 504,
+        detail: { requestUrl: err?.requestUrl || url.href, requestMethod: method, errorChain: err?.errorChain || null },
       });
     }
     // 把底层错误码（ENOTFOUND / ECONNREFUSED / ECONNRESET / 代理相关）翻成可执行提示，
@@ -75,6 +77,16 @@ async function apiFetch(pathname, { method = 'GET', query, body, expect = 'json'
     e.code = info.code;
     e.networkHint = info.hint;
     e.proxyAdvice = info.advice;
+    /*
+     * 保留失败现场：确切 URL、method 与完整 cause 链（由 `httpRequest` 在原错误上补齐）。
+     * 这里重新包了一个 Error，若不显式搬运，线索就在这一行断掉——
+     * 上层 `wrapGoogleError` 的 detail 也就只剩一句"网络失败"。
+     */
+    e.cause = err;
+    e.requestUrl = err?.requestUrl || url.href;
+    e.requestMethod = err?.requestMethod || method;
+    e.errorChain = err?.errorChain || err?.detail?.errorChain || null;
+    e.diagnostic = err?.diagnostic || null;
     throw e;
   }
 
@@ -197,6 +209,10 @@ export function wrapGoogleError(err, action = 'Calendar 操作') {
         proxy: proxy?.raw || null,
         proxyError: proxy?.error || null,
         advice: where,
+        // 失败现场：确切 URL 与完整 cause 链（否则 "Google Calendar ...失败" 又成了瞎猜）
+        requestUrl: err?.requestUrl || null,
+        requestMethod: err?.requestMethod || null,
+        errorChain: err?.errorChain || null,
       },
     });
   }

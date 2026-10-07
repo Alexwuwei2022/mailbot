@@ -10,6 +10,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { makeTempDir } from './lib/tmp.js';
+import { failureText, installFetchDiagnostics } from './lib/http.js';
+
+// 让本套件里每一处 fetch 失败时都带上确切 URL 与完整 cause 链（只加证据，不改判定）
+installFetchDiagnostics();
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -134,7 +138,8 @@ const step = async (name, fn) => {
     console.log(`  ✓ ${name}${detail ? ` — ${detail}` : ''}`);
   } catch (err) {
     failures += 1;
-    console.log(`  ✗ ${name}\n      ${err?.message || err}`);
+    // 同样带上 cause 链与确切 URL（诊断层补的 err.diagnostic）；判定没有放宽
+    console.log(`  ✗ ${name}\n      ${err?.message || err}${failureText(err)}`);
   }
 };
 const check = (cond, msg) => {

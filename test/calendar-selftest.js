@@ -12,9 +12,17 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { listenRandom } from './lib/port.js';
+import { failureText, installFetchDiagnostics } from './lib/http.js';
 import { makeTempDir } from './lib/tmp.js';
 // 只为"证书材料指纹"这条诊断证据：自签证书每次重签指纹都会变，指纹能区分"复用/重签"
 import { fingerprintOf, makeSelfSignedCert } from '../server/lib/x509.js';
+
+/*
+ * 让本套件里**每一处** `fetch` 在失败时都带上确切 URL 与完整 cause 链。
+ * 必须在任何请求发生之前装好；它只加证据，不改 name/message/code，也不加重试。
+ */
+installFetchDiagnostics();
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
 const tmpDir = makeTempDir('mailbot-cal-');
@@ -47,15 +55,13 @@ async function test(name, fn) {
     passed += 1;
     console.log(`  ✓ ${name}`);
   } catch (err) {
-    // `fetch` 只说 "fetch failed"，真正原因在 cause 里（详见 fresh-install.js 的同类注释）
-    const cause = err?.cause ? ` ← ${err.cause.code || err.cause.name || ''} ${err.cause.message || err.cause}` : '';
     /*
-     * 带 `diagnostic` 的错误（HTTPS/TLS 那类网络用例）把现场证据序列化进去。
-     * 目的只有一个：失败信息在 CI 日志里要能自证——**判定一个字都没放宽**。
+     * 失败信息必须能自证：`fetch failed` 的真实原因在 cause 链里、确切的 URL 在
+     * `err.diagnostic` 里（由 test/lib/http.js 的诊断层补上）。判定一个字都没放宽。
      */
-    const diag = err?.diagnostic ? `\n      诊断=${JSON.stringify(err.diagnostic)}` : '';
-    failures.push({ name, message: (err?.stack || String(err)) + cause + diag });
-    console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}${diag}`);
+    const extra = failureText(err);
+    failures.push({ name, message: (err?.stack || String(err)) + extra });
+    console.log(`  ✗ ${name}\n      ${err?.message || err}${extra}`);
   }
 }
 function assert(cond, msg) {

@@ -70,7 +70,14 @@ export function toErrorPayload(err) {
     return { ok: false, code: err.code, message: err.message, detail: err.detail ?? null };
   }
   const message = err?.message || String(err);
-  return { ok: false, code: err?.code || 'INTERNAL_ERROR', message, detail: null };
+  /*
+   * 非 AppError 也要把 `detail` 带出去。
+   *
+   * 大模型的网络失败（`LlmClient`）是普通 Error：它现在带着「确切 URL + 完整 cause 链」，
+   * 若在这里被丢掉，接口响应里就只剩一句 `网络错误：fetch failed`，
+   * 测试与用户都看不到真正的原因——那正是这次要堵的窟窿。
+   */
+  return { ok: false, code: err?.code || 'INTERNAL_ERROR', message, detail: err?.detail ?? null };
 }
 
 /** 服务端日志里绝不落授权码 / apiKey 明文。 */

@@ -1014,12 +1014,15 @@ mailbot/
 ├── test/
 │   ├── mocks.js                模拟 IMAP / SMTP / 大模型（真实协议）
 │   ├── mocks-google.js         模拟 Google Calendar / OAuth（真实 REST 语义）
-│   ├── selftest.js             129 项邮件侧自检（含 ZIP/备份/跟催/同账号 IMAP 串行化）
-│   ├── calendar-selftest.js    104 项日历侧自检（含备份/体检/安全/跟催接口/结论范围策略）
+│   ├── selftest.js             130 项邮件侧自检（含 ZIP/备份/跟催/同账号 IMAP 串行化/临时端口）
+│   ├── calendar-selftest.js    105 项日历侧自检（含备份/体检/安全/跟催接口/结论范围策略）
 │   ├── smoke-e2e.js            端到端：真实 HTTP + 模拟邮箱
 │   ├── ui-render.js            前端渲染自检
-│   └── secrets-platform.js     平台密钥保管：真机跑 DPAPI / 钥匙串 / libsecret 往返 + 降级可见性
-│       lib/libsecret-roundtrip.mjs  在真 D-Bus 会话里跑 libsecret 往返的子进程
+│   ├── secrets-platform.js     平台密钥保管：真机跑 DPAPI / 钥匙串 / libsecret 往返 + 降级可见性
+│   ├── lib/port.js             抽临时端口：重试读端口 + 避开 fetch/浏览器禁用端口
+│   ├── lib/http.js             测试期 fetch 诊断层：失败时补上确切 URL 与完整 cause 链
+│   ├── tools/scan-bad-ports.mjs 手动工具：把禁用端口名单与 undici 的真实行为逐个对一遍
+│   └── lib/libsecret-roundtrip.mjs  在真 D-Bus 会话里跑 libsecret 往返的子进程
 └── data/                       运行时生成（已 gitignore）
     ├── config.json             非密钥配置
     ├── state.json              分析结论 / 草稿 / 日历会话
@@ -1036,13 +1039,19 @@ mailbot/
 
 ```powershell
 npm test              # 全部：邮件单元 + 日历单元 + 全新安装 + 端到端 + 前端渲染 + 平台密钥保管
-npm run test:unit     # 129 项：解析/组装/模型/分类/起草/IMAP/SMTP/引擎/发送/签名/详情/配置/HTTP/ZIP/备份/密钥保管（含 Google 令牌）/同账号串行化
-npm run test:calendar # 104 项：时区换算/OAuth/REST CRUD/对话建日程/邮件转日程/日程分析/检索回补/结论范围策略/代理转发/备份与体检与密钥接口
+npm run test:unit     # 130 项：解析/组装/模型/分类/起草/IMAP/SMTP/引擎/发送/签名/详情/配置/HTTP/ZIP/备份/密钥保管（含 Google 令牌）/同账号串行化/临时端口
+npm run test:calendar # 105 项：时区换算/OAuth/REST CRUD/对话建日程/邮件转日程/日程分析/检索回补/结论范围策略/代理转发/备份与体检与密钥接口
 npm run test:fresh    # 14 项：全新机器首启（空数据目录 + 清空环境变量 + 首次上手判定 + start.cmd 格式 + .env 自动生成）
 npm run test:e2e      # 端到端：真实 HTTP 服务 + 模拟邮箱，走完整 Web 路径
 npm run test:ui       # 前端：十个页面渲染（含配置向导、合并后的「跟进」两页签与控制台锚点定位）+ 品牌外壳 + 跳转 + API 调用路径（需 linkedom）
 npm run test:secrets  # 平台密钥保管：真机跑 DPAPI / macOS 钥匙串 / Linux libsecret 的写→读→校验→清除，外加"降级必须可见"（不支持的平台显式跳过并打印原因）
 ```
+
+> 测试里**不用 `listen(0)` 之后直接读端口**那种写法：临时端口统一走 `test/lib/port.js`，
+> 它既重试读取端口，也会**避开 fetch/浏览器规范的禁用端口**（"bad port"）——否则
+> `listen(0)` 抽到 6000 这类端口时，指向它的 `fetch` 必然失败，且报错里连 URL 都没有，
+> 表现为"偶发红、每次红的用例还不一样"。来龙去脉与排查指引见
+> [docs/运行与配置文档.md §13.1](docs/运行与配置文档.md)。
 
 > 前 5 套**完全离线**（不需要任何凭据、不花 token）；第 6 套 `test:secrets` 是**平台专有**的：
 > 它要在真机上起 `powershell` / `security` / `secret-tool`，所以"哪个平台验证到什么程度"这件事

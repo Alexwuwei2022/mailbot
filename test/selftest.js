@@ -10,6 +10,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { makeTempDir } from './lib/tmp.js';
+import { listenRandom } from './lib/port.js';
+import { failureText, installFetchDiagnostics } from './lib/http.js';
+
+// 让本套件里每一处 fetch 失败时都带上确切 URL 与完整 cause 链（只加证据，不改判定）
+installFetchDiagnostics();
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -69,10 +74,9 @@ function test(name, fn) {
       console.log(`  ✓ ${name}`);
     })
     .catch((err) => {
-      // `fetch` 只说 "fetch failed"，真正原因在 cause 里（详见 fresh-install.js 的同类注释）
-      const cause = err?.cause ? ` ← ${err.cause.code || err.cause.name || ''} ${err.cause.message || err.cause}` : '';
-      failures.push({ name, message: (err?.stack || String(err)) + cause });
-      console.log(`  ✗ ${name}\n      ${err?.message || err}${cause}`);
+      const extra = failureText(err);
+      failures.push({ name, message: (err?.stack || String(err)) + extra });
+      console.log(`  ✗ ${name}\n      ${err?.message || err}${extra}`);
     });
 }
 
@@ -255,6 +259,95 @@ ensureDirs();
 store.loadState({ force: true });
 store.persistState({ prune: false });
 
+/* -------------------------------------------------- 0b. 测试基建：临时端口 */
+
+/**
+ * 回归：`listen(0)` 抽到的端口**必须是 fetch 能用的端口**。
+ *
+ * 背景（2026-10 实测定性）：fetch 规范要求 undici/浏览器在**建立连接之前**就拒绝一批端口
+ * （"bad port"）。本机 Windows 的动态端口范围是 1025–15000，与名单有 10 个交集
+ * （1719/1720/1723/2049/3659/4045/4190/5060/5061/6000）；连续 6000 次 `listen(0)`
+ * 命中 10 次（≈1/600），而一套日历自检要起 23 个临时端口 → 约 1/27 每套会红。
+ * 表现就是"偶发的 `网络错误：fetch failed` / `bad port`，每次红在不同用例上"，
+ * 修复前本机实测 3/60 次（1/20）。
+ */
+await test('测试端口：listen(0) 不得交出 fetch/浏览器的禁用端口', async () => {
+  const http = await import('node:http');
+  const { FORBIDDEN_FETCH_PORTS, isForbiddenFetchPort, listenOn, listenRandom } = await import('./lib/port.js');
+
+  /*
+   * ① 名单必须与 undici 的**真实行为**一致：名单里的端口，fetch 必须报 `bad port`。
+   *    这是"名单不是照抄文档"的唯一证明；Node 侧名单一变，这条会立刻红。
+   *    6679 是**扫全部动态端口**才发现漏掉的那个（照记忆写的初版里没有它）。
+   */
+  for (const p of [6000, 6667, 6679, 10080, 4045, 5060]) {
+    assertEqual(isForbiddenFetchPort(p), true, `${p} 应被判为禁用端口`);
+    const err = await fetch(`http://127.0.0.1:${p}/`).then(
+      () => null,
+      (e) => e,
+    );
+    assert(err, `${p} 上 fetch 本应失败（没失败说明名单与 undici 已经不一致）`);
+    assertEqual(String(err.cause?.message || ''), 'bad port', `${p} 的底层原因应是 bad port`);
+  }
+  assertEqual(isForbiddenFetchPort(0), true, '端口 0 不能被当成"可用地址"交出去');
+  assertEqual(isForbiddenFetchPort(11434), false, '本机常见模型端口（Ollama）不该被误判');
+  assertEqual(isForbiddenFetchPort(8787), false, '默认端口不该被误判');
+  assert(FORBIDDEN_FETCH_PORTS.size >= 70, `禁用端口名单不该少于 fetch 规范的 70 多个（实际 ${FORBIDDEN_FETCH_PORTS.size}）`);
+
+  /*
+   * ② 抽到禁用端口时必须**关掉重抽**。真机上这一档约 1/600，等不来，所以用假服务器
+   *    确定性地构造"第一次抽到 6000、第二次抽到 4045"。
+   */
+  const fake = (ports) => {
+    let calls = 0;
+    return {
+      listen(_port, _host, cb) {
+        calls += 1;
+        setImmediate(cb);
+        return this;
+      },
+      address() {
+        return { port: ports[Math.min(calls - 1, ports.length - 1)] };
+      },
+      once() {
+        return this;
+      },
+      off() {
+        return this;
+      },
+      close(cb) {
+        cb?.();
+        return this;
+      },
+    };
+  };
+  assertEqual(await listenRandom(fake([6000, 4045, 32123])), 32123, '抽到禁用端口时应重抽到可用端口为止');
+  const gaveUp = await listenRandom(fake([6667])).then(
+    () => null,
+    (e) => e,
+  );
+  assert(gaveUp && /禁用端口/.test(gaveUp.message), '反复抽到禁用端口时必须明确报错，而不是交出坏地址');
+
+  // ③ 真服务器上连抽 200 次，一次都不许落在名单里
+  const drawn = new Set();
+  for (let i = 0; i < 200; i += 1) {
+    const s = http.createServer((_req, res) => res.end('ok'));
+    const p = await listenRandom(s);
+    assert(!isForbiddenFetchPort(p), `listenRandom 返回了禁用端口 ${p}`);
+    drawn.add(p);
+    await new Promise((r) => s.close(r));
+  }
+  assert(drawn.size > 150, `200 次应抽到足够多的不同端口（实际 ${drawn.size}）`);
+
+  // ④ 显式指定端口时照办（不做静默替换，否则"端口被悄悄换掉"会成为新的困惑源）
+  const fixed = http.createServer((_req, res) => res.end('ok'));
+  const fixedPort = await listenOn(fixed, 0);
+  assert(fixedPort > 0, 'listenOn 应返回实际端口');
+  await new Promise((r) => fixed.close(r));
+
+  return `名单 ${FORBIDDEN_FETCH_PORTS.size} 个端口与 undici 行为逐个核对一致；重抽逻辑确定性命中；200 次真实抽取无一落在名单里`;
+});
+
 /* -------------------------------------------------- 1. 解析与组装 */
 
 await test('MIME 解析：中文主题、正文、附件识别', async () => {
@@ -326,9 +419,10 @@ await test('大模型客户端：鉴权失败给出明确错误码', async () =>
     res.writeHead(401, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: 'invalid api key' } }));
   });
-  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  // 这个 mock 是用 **fetch** 打的，所以端口不能落在 fetch 的禁用名单里（用 listenRandom 抽）
+  const port = await listenRandom(server);
   try {
-    const bad = new LlmClient({ ...activeConfig.llm, baseUrl: `http://127.0.0.1:${server.address().port}` });
+    const bad = new LlmClient({ ...activeConfig.llm, baseUrl: `http://127.0.0.1:${port}` });
     let code = null;
     try {
       await bad.complete({ system: '', user: 'hi' });

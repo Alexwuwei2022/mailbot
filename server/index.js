@@ -50,6 +50,7 @@ import {
   touchSession,
 } from './lib/session.js';
 import { resolveTls } from './lib/tls.js';
+import { isForbiddenFetchPort } from './lib/http.js';
 import { egressReport } from './lib/privacy.js';
 import { followUpConfig, runFollowUpScan } from './followup.js';
 import { buildTimeline, listProjects, mergeProjects, projectKey } from './timeline.js';
@@ -2291,47 +2292,80 @@ export async function startServer({ rootDir, port, host } = {}) {
   }
   const server = createServer({ rootDir, tls });
 
-  await new Promise((resolve, reject) => {
-    server.once('error', (err) => {
-      if (err?.code === 'EADDRINUSE') {
-        reject(
-          new AppError(
-            `端口 ${listenPort} 已被占用。可能已经有一个邮箱数字人在运行；` +
-              `请打开 http://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${listenPort} 直接使用，` +
-              `或用 --port 指定其它端口。`,
-            { code: 'PORT_IN_USE', status: 500 },
-          ),
-        );
-        return;
-      }
-      if (err?.code === 'EACCES') {
-        reject(new AppError(`没有权限监听端口 ${listenPort}（1024 以下端口通常需要管理员权限）。`, { code: 'PORT_DENIED', status: 500 }));
-        return;
-      }
-      reject(err);
-    });
-    server.listen(listenPort, listenHost, resolve);
-  });
-
   /*
-   * 取实际端口。
+   * 监听 + 取实际端口。
    *
-   * `listen(0)` 时端口由系统分配，理论上回调触发时就已经写进 `address()`；
-   * 但实测（Windows + 连续多次起停）偶发拿到 null / 0，于是返回的 URL 会是
-   * `http://127.0.0.1:0`，下游 fetch 只会报一句莫名其妙的 "bad port"。
-   * 这里等一下再取一次，仍取不到就**明确报错**，而不是交出一个坏 URL。
+   * 三件必须一起做的事（都是实测踩出来的，不是预防性猜想）：
+   *
+   * ① `listen(0)` 时端口由系统分配，理论上回调触发时就已经写进 `address()`；
+   *    但实测（Windows + 连续多次起停）偶发拿到 null / 0，于是返回的 URL 会是
+   *    `http://127.0.0.1:0`。这里等一下再取一次，仍取不到就**明确报错**，
+   *    而不是交出一个坏 URL。
+   * ② 端口还可能落在 fetch/浏览器规范**禁止的端口**里（"bad port"）。那些端口
+   *    连接根本不会被发起，`fetch` 只会回一句 `fetch failed`。系统分配的端口
+   *    落在这类端口上时必须**关掉重挑**，而不是把 URL 交出去。
+   *    （本机实测：Windows 动态端口范围 1025–15000 与禁用名单有 18 个交集，
+   *      `listen(0)` 实测约 1/600~1/1000 命中——详见 `lib/http.js` 里
+   *      FORBIDDEN_FETCH_PORTS 的注释与 docs/运行与配置文档.md §13.1。）
+   * ③ 只要端口是系统分配的（`port === 0`）才重挑；用户**明确指定**的端口一律照办
+   *    （例如经反向代理暴露时那个端口本身无所谓），只把风险写进日志。
    */
-  let addr = server.address();
-  for (let i = 0; i < 20 && (!addr || !addr.port); i += 1) {
-    await new Promise((r) => setTimeout(r, 10));
-    addr = server.address();
-  }
-  if (!addr || !addr.port) {
-    throw new AppError('服务已监听但拿不到端口号（可能是系统资源紧张）：请重试，或改用固定端口', {
-      code: 'PORT_UNRESOLVED',
+  const askEphemeral = listenPort === 0;
+  let actualPort = 0;
+  let redraws = 0;
+  for (let attempt = 0; attempt < (askEphemeral ? 8 : 1); attempt += 1) {
+    await new Promise((resolve, reject) => {
+      server.once('error', (err) => {
+        if (err?.code === 'EADDRINUSE') {
+          reject(
+            new AppError(
+              `端口 ${listenPort} 已被占用。可能已经有一个邮箱数字人在运行；` +
+                `请打开 http://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${listenPort} 直接使用，` +
+                `或用 --port 指定其它端口。`,
+              { code: 'PORT_IN_USE', status: 500 },
+            ),
+          );
+          return;
+        }
+        if (err?.code === 'EACCES') {
+          reject(new AppError(`没有权限监听端口 ${listenPort}（1024 以下端口通常需要管理员权限）。`, { code: 'PORT_DENIED', status: 500 }));
+          return;
+        }
+        reject(err);
+      });
+      server.listen(listenPort, listenHost, resolve);
     });
+
+    let addr = server.address();
+    for (let i = 0; i < 20 && (!addr || !addr.port); i += 1) {
+      await new Promise((r) => setTimeout(r, 10));
+      addr = server.address();
+    }
+    if (!addr || !addr.port) {
+      throw new AppError('服务已监听但拿不到端口号（可能是系统资源紧张）：请重试，或改用固定端口', {
+        code: 'PORT_UNRESOLVED',
+      });
+    }
+    actualPort = addr.port;
+
+    if (!askEphemeral) break;
+    if (!isForbiddenFetchPort(actualPort)) break;
+
+    redraws += 1;
+    log.warn(
+      `系统分配的端口 ${actualPort} 在 fetch/浏览器规范的**禁用端口**名单里（"bad port"）：` +
+        '指向它的 fetch 与浏览器都会直接拒连，换一个端口重新监听。',
+    );
+    await new Promise((r) => server.close(() => r()));
+    actualPort = 0;
   }
-  const actualPort = addr.port;
+  if (!actualPort) {
+    throw new AppError(
+      `连续 ${redraws} 次都被系统分配到 fetch/浏览器的禁用端口：请改用 --port 指定一个端口（如 8787）。`,
+      { code: 'PORT_UNRESOLVED', status: 500 },
+    );
+  }
+  if (askEphemeral && redraws > 0) log.info(`已换过 ${redraws} 次端口，最终使用 ${actualPort}`);
   const scheme = server.__mailbotHttps ? 'https' : 'http';
   const url = `${scheme}://${listenHost === '0.0.0.0' ? '127.0.0.1' : listenHost}:${actualPort}`;
   log.info(`邮箱与日历数字人已启动：${url}`);

@@ -14,6 +14,7 @@
 
 import http from 'node:http';
 import net from 'node:net';
+import { listenOn, listenRandom } from './lib/port.js';
 
 const json = (res, status, body) => {
   const text = JSON.stringify(body);
@@ -264,8 +265,10 @@ export async function startMockGoogle({
     return json(res, 404, { error: { code: 404, message: `未模拟的端点：${req.method} ${pathname}` } });
   });
 
-  await new Promise((resolve) => server.listen(port, '127.0.0.1', resolve));
-  const actualPort = server.address().port;
+  // 端口 0 → 系统分配，走 listenRandom：一来保证不交出 `:0` 这种坏地址，
+  // 二来避开 fetch/浏览器禁用端口（Google 这一路是 `httpRequest` 打的、不受那份名单限制，
+  // 但让所有 mock 走同一条抽端口路径，就不必逐个判断谁会被 fetch 打到）
+  const actualPort = port === 0 ? await listenRandom(server) : await listenOn(server, port);
   return {
     port: actualPort,
     apiBase: `http://127.0.0.1:${actualPort}/calendar/v3`,
@@ -356,8 +359,7 @@ export async function startMockProxy({ auth = '', connectStatus = 0 } = {}) {
     clientSocket.on('error', () => upstream.destroy());
   });
 
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const actualPort = server.address().port;
+  const actualPort = await listenRandom(server);
   return {
     port: actualPort,
     url: `http://127.0.0.1:${actualPort}`,
