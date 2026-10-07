@@ -531,7 +531,7 @@ const checkEqual = (actual, expected, msg) => {
 
 console.log('\n前端渲染自检（最小 DOM + 假 API）\n');
 
-await step('boot()：外壳与导航渲染', async () => {
+await step('boot()：外壳与顶层导航渲染（「跟进」已合并、运行与记录移出顶层）', async () => {
   boot();
   await new Promise((r) => setTimeout(r, 30));
   const html = document.getElementById('root').innerHTML;
@@ -541,11 +541,34 @@ await step('boot()：外壳与导航渲染', async () => {
   check(html.includes('邮件草稿'), '缺少草稿导航');
   check(html.includes('日历'), '缺少日历导航');
   check(html.includes('知识库'), '缺少知识库导航');
-  check(html.includes('运行与记录'), '缺少运行与记录导航');
-  check(html.includes('跟催'), '缺少跟催导航');
-  check(html.includes('时间线'), '缺少时间线导航');
   check(html.includes('开始使用'), '缺少开始使用（配置向导）导航');
   check(html.includes('设置'), '缺少设置导航');
+  /*
+   * 顶层导航的**最终形态**：跟催 / 时间线合并成「跟进」，
+   * 运行与记录从顶层移除（改从设置页进入）。这里按按钮清单逐项断言，
+   * 而不是只看"包含某些字样"——否则漏删一项也测不出来。
+   * 计数徽标是按钮的子节点，比对文案时要先摘掉它。
+   */
+  const navButtons = [...document.querySelectorAll('.nav .nav-btn')];
+  const navLabels = navButtons.map((b) => {
+    const badge = b.querySelector('.nav-badge');
+    const text = badge ? b.textContent.replace(badge.textContent, '') : b.textContent;
+    return text.trim();
+  });
+  checkEqual(
+    navButtons.map((b) => b.dataset.view).join('|'),
+    'overview|drafts|search|calendar|knowledge|followup|setup|settings',
+    '顶层导航的视图 id',
+  );
+  checkEqual(
+    navLabels.join('|'),
+    '邮件总览|邮件草稿|对话查邮件|日历|知识库|跟进|开始使用|设置',
+    '顶层导航清单',
+  );
+  check(navLabels.includes('跟进'), '缺少「跟进」导航');
+  check(!navLabels.includes('跟催'), '「跟催」应已并入「跟进」，不该再占顶层导航');
+  check(!navLabels.includes('时间线'), '「时间线」应已并入「跟进」，不该再占顶层导航');
+  check(!navLabels.includes('运行与记录'), '「运行与记录」应已移入设置页，不该再占顶层导航');
 });
 
 await step('外壳：右上角是「轻效 | Ease & Effect」Logo + 外观模式；页脚为指定文案', async () => {
@@ -3767,6 +3790,332 @@ await step('切换视图：日历页保留会话与结果，不自动重新拉�
   await new Promise((r) => setTimeout(r, 240));
   const afterManual = calls.filter((c) => c === 'GET /api/calendar/insight').length;
   check(afterManual > afterReturn, '点「刷新日历」应重新拉取');
+});
+
+await step('「跟进」合并页：两个页签都能到达，且各页的标志性内容与入口都在', async () => {
+  const followup = await import('../web/views/followup.js');
+  const { api } = await import('../web/api.js');
+  const real = { followups: api.followups, set: api.setFollowUpStatus, projects: api.projects, timeline: api.timeline };
+  const box = document.createElement('div');
+  document.body.append(box);
+  const appStub = { viewStates: {}, navigate() {}, takeNavParams: () => null, refreshCounts() {}, invalidateAll() {}, paintNav() {} };
+  const click = (el) => el.dispatchEvent(new window.Event('click', { bubbles: true }));
+  try {
+    // 跟催侧数据（形状与跟催页自己的测试一致，避免另抄一份而脱节）
+    const fuItems = [
+      { id: 'mine_1', kind: 'mine', title: '周三前把报价发给李总', status: 'open', dueAt: '2020-01-01T00:00:00.000Z', counterparty: 'li@client.com', subject: '报价', since: '2026-10-04T09:00:00.000Z' },
+      { id: 'wait_1', kind: 'waiting', title: '合同条款确认', status: 'open', waitingHours: 51, counterparty: 'a@client.com', subject: '合同', since: '2026-10-04T09:00:00.000Z', replyTrackable: true },
+    ];
+    api.followups = () => Promise.resolve({ ok: true, items: fuItems, all: fuItems, summary: { open: 2, mine: 1, waiting: 1, overdue: 1 }, config: { enabled: true, waitHours: 24 } });
+    api.setFollowUpStatus = () => Promise.resolve({ ok: true, summary: {} });
+    const tlCalls = [];
+    api.projects = () => Promise.resolve({ ok: true, projects: [{ key: 'a', name: '华东区投标', count: 4, aliases: ['华东投标'], sources: { mail: 2, draft: 1, followUp: 1 } }], unclassified: 3 });
+    api.timeline = (project) => {
+      tlCalls.push(project);
+      return Promise.resolve({
+        ok: true,
+        project,
+        calendarNote: '日程来自本程序的操作记录',
+        counts: { mail: 2, calendar: 1 },
+        entries: [{ at: '2026-10-01T09:00:00Z', kind: 'mail', source: '收到的邮件', title: '招标公告', meta: {} }],
+      });
+    };
+
+    followup.renderFollowUp(box, appStub);
+    await new Promise((r) => setTimeout(r, 220));
+
+    const tabs = [...box.querySelectorAll('.followup-tabs .tab')];
+    checkEqual(tabs.length, 2, '合并页应有两个页签');
+    checkEqual(tabs.map((t) => t.textContent.trim()).join('|'), '跟催|时间线', '两个页签的文案');
+    check(tabs[0].classList.contains('active'), '默认应落在「跟催」页签');
+    check(/我承诺的/.test(box.textContent) && /等对方回复/.test(box.textContent), '默认页签应渲染跟催的统计卡');
+    check(/周三前把报价发给李总/.test(box.textContent), '跟催内容应真的渲染出来');
+
+    // 切到「时间线」：要能渲染出项目选择等入口
+    click(tabs[1]);
+    await new Promise((r) => setTimeout(r, 220));
+    check(tlCalls.length >= 1, '切到时间线页签应去取时间线数据');
+    check(/华东区投标/.test(box.textContent), '时间线应渲染项目选择');
+    check(/重命名 \/ 合并/.test(box.textContent), '时间线的重命名/合并入口必须仍可达');
+    const tabs2 = [...box.querySelectorAll('.followup-tabs .tab')];
+    check(tabs2[1].classList.contains('active') && !tabs2[0].classList.contains('active'), '选中态应跟着切换');
+
+    // 切回「跟催」：页签不是单向的，两个视图都必须一直可达
+    click(tabs2[0]);
+    await new Promise((r) => setTimeout(r, 220));
+    check(/我承诺的/.test(box.textContent), '切回跟催应重新渲染跟催内容');
+    check(!/华东区投标/.test(box.textContent), '切回后不该还留着时间线的面板');
+  } finally {
+    api.followups = real.followups;
+    api.setFollowUpStatus = real.set;
+    api.projects = real.projects;
+    api.timeline = real.timeline;
+    box.remove();
+  }
+});
+
+await step('旧链接与页签参数：navigate("timeline") 落到「跟进」的时间线页签（视图不丢）', async () => {
+  const { app } = await import('../web/app.js');
+  // 合并前的 #/timeline：必须还能到达，而不是被当成无效 id 退回总览
+  app.navigate('timeline');
+  await new Promise((r) => setTimeout(r, 220));
+  checkEqual(app.viewId, 'followup', '旧链接应归一到「跟进」');
+  const tabs = [...app.els.main.querySelectorAll('.followup-tabs .tab')];
+  checkEqual(tabs.length, 2, '合并页应有两个页签');
+  const tlTab = tabs.find((t) => (t.dataset.tab || '') === 'timeline');
+  check(tlTab, '页签应有稳定标识（dataset.tab）');
+  check(tlTab.classList.contains('active'), '旧链接 #/timeline 应直接落在「时间线」页签');
+  // 顶层导航不含「运行与记录」，但视图本身仍要可达（从设置页卡片进入）
+  app.navigate('records');
+  await new Promise((r) => setTimeout(r, 160));
+  checkEqual(app.viewId, 'records', '「运行与记录」必须仍能打开');
+  app.navigate('overview');
+  await new Promise((r) => setTimeout(r, 120));
+});
+
+await step('设置页：具名锚点 data-section + options.anchor / 跳转参数两条路都会定位并高亮', async () => {
+  const settingsView = await import('../web/views/settings.js');
+  const mkBox = () => {
+    const box = document.createElement('div');
+    document.body.append(box);
+    return box;
+  };
+
+  // ① 直接传 options.anchor：滚到「外观」并高亮（含首帧"还没渲染出来"的重试）
+  {
+    const box = mkBox();
+    const appStub = { navigate() {}, toast() {}, refreshCounts() {}, paintNav() {}, viewStates: {} };
+    try {
+      settingsView.renderSettings(box, appStub, { anchor: '外观' });
+      check(!box.querySelector('[data-section="外观"]'), '首帧还在加载，此时不该有区块');
+      await new Promise((r) => setTimeout(r, 220));
+      const appearance = box.querySelector('[data-section="外观"]');
+      check(appearance, '每个设置区块都应有具名锚点 data-section');
+      check(appearance.classList.contains('flash-target'), '带锚点进入设置页应高亮目标区块');
+      const flashed = [...box.querySelectorAll('section.block.flash-target')];
+      checkEqual(flashed.length, 1, '只应高亮目标那一块');
+      checkEqual(flashed[0].dataset.section, '外观', '高亮的应是「外观」而不是别的卡片');
+    } finally {
+      box.remove();
+    }
+  }
+
+  // ② 跨视图跳转参数（app.navigate('settings', { anchor }) 的真实路径）
+  {
+    const box = mkBox();
+    const seenKeys = [];
+    const appStub = {
+      navigate() {},
+      toast() {},
+      refreshCounts() {},
+      paintNav() {},
+      viewStates: {},
+      takeNavParams: (key) => {
+        seenKeys.push(key);
+        return key === 'settings' ? { anchor: '备份与恢复' } : null;
+      },
+    };
+    try {
+      settingsView.renderSettings(box, appStub);
+      await new Promise((r) => setTimeout(r, 220));
+      check(seenKeys.includes('settings'), '设置页应向 app 取一次跳转参数');
+      const target = box.querySelector('[data-section="备份与恢复"]');
+      check(target, '应有「备份与恢复」区块');
+      check(target.classList.contains('flash-target'), '跳转参数里的锚点也应定位并高亮');
+    } finally {
+      box.remove();
+    }
+  }
+
+  // ③ 真实链路：app.navigate('settings', { anchor }) → renderView → renderSettings
+  {
+    const { app } = await import('../web/app.js');
+    /*
+     * 带锚点跳转**不能**同时把页面拉回顶部：navigate 是先 renderView（这里已经滚到区块）
+     * 再执行"切页回顶部"的，若不跳过，定位会被自己顶掉（末尾还有一次 400ms 的硬跳 0 兜底）。
+     * 所以这里把 window.scrollTo 换成探针，断言它一次都没被调用。
+     */
+    const scrollCalls = [];
+    const realScrollTo = window.scrollTo;
+    window.scrollTo = (...args) => scrollCalls.push(args);
+    try {
+      app.navigate('settings', { anchor: '备份与恢复' });
+      let hit = false;
+      // 设置页要等配置取回来才渲染出区块，轮询到高亮出现为止（flash 会持续 1.6 秒）
+      for (let i = 0; i < 20 && !hit; i += 1) {
+        await new Promise((r) => setTimeout(r, 60));
+        hit = app.els.main.querySelector('[data-section="备份与恢复"]')?.classList.contains('flash-target') === true;
+      }
+      checkEqual(app.viewId, 'settings', '应已切到设置页');
+      check(hit, 'app.navigate 带的锚点应一路传到设置页，并定位高亮对应区块');
+      checkEqual(scrollCalls.length, 0, '带锚点跳转不该再执行"回顶部"（否则会顶掉定位）');
+    } finally {
+      window.scrollTo = realScrollTo;
+    }
+  }
+});
+
+await step('设置页：关于卡片说「上面的备份与恢复」，点击可定位到该区块', async () => {
+  const settingsView = await import('../web/views/settings.js');
+  const box = document.createElement('div');
+  document.body.append(box);
+  try {
+    settingsView.renderSettings(box, { navigate() {}, toast() {}, refreshCounts() {}, paintNav() {}, viewStates: {} });
+    await new Promise((r) => setTimeout(r, 220));
+
+    const about = [...box.querySelectorAll('section.block')].find((b) => b.querySelector('.block-head h3')?.textContent.trim() === '关于');
+    check(about, '应有「关于」区块');
+    check(/备份请用上面的/.test(about.textContent), `文案应是"上面的「备份与恢复」"（实际「${about.textContent.slice(0, 120)}」）`);
+    check(!/下面的/.test(about.textContent), '不该再有"下面的"（「关于」已经排在末尾了）');
+
+    // 「备份与恢复」四个字必须是可点的（而不是纯文本）
+    const link = [...about.querySelectorAll('button, a')].find((b) => /备份与恢复/.test(b.textContent));
+    check(link, '「备份与恢复」应可点击');
+
+    // 点它 → 用同一套具名锚点滚到「备份与恢复」区块并高亮
+    const target = box.querySelector('[data-section="备份与恢复"]');
+    check(target, '应有「备份与恢复」区块');
+    let scrolled = 0;
+    target.scrollIntoView = () => {
+      scrolled += 1;
+    };
+    link.dispatchEvent(new window.Event('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 40));
+    checkEqual(scrolled, 1, '点击后应滚动到「备份与恢复」区块');
+    check(target.classList.contains('flash-target'), '定位后应短暂高亮该区块');
+  } finally {
+    box.remove();
+  }
+});
+
+await step('开始使用向导：配好后最后一枚是 ✓／完成态，顶部「返回设置」带「外观」锚点', async () => {
+  const setup = await import('../web/views/setup.js');
+  const container = document.createElement('div');
+  document.body.append(container);
+  const navCalls = [];
+  const click = (el) => el.dispatchEvent(new window.Event('click', { bubbles: true }));
+  const idx = (chip) => chip.querySelector('.setup-chip-index').textContent.trim();
+  try {
+    globalThis.__forceResponses = {
+      '/api/health': {
+        ok: true,
+        version: '1.0.0',
+        node: 'v20.0.0',
+        dataDir: 'D:\\data',
+        timeZone: 'Asia/Shanghai',
+        ready: true,
+        fresh: false,
+        nextStepId: null,
+        steps: [
+          { id: 'mailbox', title: '连接邮箱', required: true, done: true, detail: '已配置：u@x.cn' },
+          { id: 'llm', title: '配置大模型', required: true, done: true, detail: '已配置：deepseek-chat' },
+          { id: 'calendar', title: '连接 Google 日历（可选）', required: false, done: false, skipped: true, detail: '未启用' },
+        ],
+      },
+    };
+    setup.renderSetup(container, {
+      viewStates: {},
+      navigate: (view, params) => navCalls.push({ view, params }),
+      paintNav() {},
+      invalidateAll() {},
+      refreshCounts() {},
+      takeNavParams: () => null,
+    });
+    await new Promise((r) => setTimeout(r, 220));
+
+    const chips = [...container.querySelectorAll('.setup-chip')];
+    checkEqual(chips.length, 4, '三步 + 「可以用了」共四枚');
+    const last = chips[3];
+    checkEqual(idx(last), '✓', '配好后最后一枚的索引必须是 ✓（不能是 →）');
+    check(!/setup-chip-index">→/.test(container.innerHTML), '完成态不该再出现 → 索引');
+    check(last.classList.contains('setup-chip-done'), '应是完成态样式 setup-chip-done');
+
+    // 停在这一步 → active（与前三枚同一套逻辑）
+    check(last.classList.contains('setup-chip-active'), '「可以用了」是当前步时应 active');
+    const mailChip = chips.find((c) => /连接邮箱/.test(c.textContent));
+    click(mailChip);
+    await new Promise((r) => setTimeout(r, 60));
+    const last2 = [...container.querySelectorAll('.setup-chip')].at(-1);
+    check(!last2.classList.contains('setup-chip-active'), '不在这一步时不该 active');
+    check(last2.classList.contains('setup-chip-done'), '完成态样式与是否 active 无关');
+    click(last2);
+    await new Promise((r) => setTimeout(r, 60));
+    check([...container.querySelectorAll('.setup-chip')].at(-1).classList.contains('setup-chip-active'), '回到「可以用了」应重新 active');
+
+    // 顶部「返回设置」：从哪来回哪去，并带锚点（设置页据此定位到「外观」卡片）
+    const back = [...container.querySelectorAll('button')].find((b) => b.textContent.trim() === '返回设置');
+    check(back, '开始使用页应有「返回设置」按钮');
+    check(back.closest('.page-head'), '「返回设置」应在页面顶部');
+    click(back);
+    checkEqual(navCalls.length, 1, '点击应只跳转一次');
+    checkEqual(navCalls[0].view, 'settings', '应回到设置页');
+    checkEqual(navCalls[0].params?.anchor, '外观', '应带上「外观」锚点');
+  } finally {
+    delete globalThis.__forceResponses;
+    container.remove();
+  }
+});
+
+await step('运行与记录：顶部「返回设置」带上「运行与记录」锚点', async () => {
+  const records = await import('../web/views/records.js');
+  const container = document.createElement('div');
+  document.body.append(container);
+  const navCalls = [];
+  globalThis.__forceResponses = {
+    '/api/audit': { ok: true, items: [], total: 0, truncated: false, file: 'D:\\data\\audit.jsonl', stats: { total: 0, byGroup: {}, byAction: {}, lastAt: null }, actions: {} },
+    '/api/runs': { ok: true, runs: [] },
+  };
+  try {
+    records.renderRecords(container, { viewStates: {}, navigate: (view, params) => navCalls.push({ view, params }) });
+    await new Promise((r) => setTimeout(r, 180));
+    const back = [...container.querySelectorAll('button')].find((b) => b.textContent.trim() === '返回设置');
+    check(back, '运行与记录页应有「返回设置」按钮');
+    check(back.closest('.page-head'), '「返回设置」应在页面顶部');
+    back.dispatchEvent(new window.Event('click', { bubbles: true }));
+    checkEqual(navCalls.length, 1, '点击应只跳转一次');
+    checkEqual(navCalls[0].view, 'settings', '应回到设置页');
+    checkEqual(navCalls[0].params?.anchor, '运行与记录', '应带上「运行与记录」锚点');
+
+    // 取数失败时也必须退得回去（否则这页没有顶层导航入口，只剩"重试"）
+    const { api } = await import('../web/api.js');
+    const realAudit = api.audit;
+    const failBox = document.createElement('div');
+    document.body.append(failBox);
+    api.audit = () => Promise.reject(new Error('台账读取失败'));
+    try {
+      records.renderRecords(failBox, { viewStates: {}, navigate: (view, params) => navCalls.push({ view, params }) });
+      await new Promise((r) => setTimeout(r, 180));
+      check(/无法加载记录/.test(failBox.textContent), '应显示加载失败');
+      const back2 = [...failBox.querySelectorAll('button')].find((b) => b.textContent.trim() === '返回设置');
+      check(back2, '加载失败时也应有「返回设置」');
+    } finally {
+      api.audit = realAudit;
+      failBox.remove();
+    }
+  } finally {
+    delete globalThis.__forceResponses;
+    container.remove();
+  }
+});
+
+await step('设置页：运行时记录的入口卡片（说明 + 打开按钮）', async () => {
+  const settingsView = await import('../web/views/settings.js');
+  const box = document.createElement('div');
+  document.body.append(box);
+  const navCalls = [];
+  try {
+    settingsView.renderSettings(box, { navigate: (v, p) => navCalls.push({ view: v, params: p }), toast() {}, refreshCounts() {}, paintNav() {}, viewStates: {} });
+    await new Promise((r) => setTimeout(r, 220));
+    const card = box.querySelector('[data-section="运行与记录"]');
+    check(card, '设置页应有「运行与记录」卡片（并带同名锚点）');
+    check(/操作台账|审计/.test(card.textContent), '卡片要说明它是什么（操作台账 / 审计）');
+    const open = [...card.querySelectorAll('button')].find((b) => /运行与记录/.test(b.textContent));
+    check(open, '卡片里应有打开它的按钮');
+    open.dispatchEvent(new window.Event('click', { bubbles: true }));
+    checkEqual(navCalls[0]?.view, 'records', '点按钮应打开「运行与记录」页');
+  } finally {
+    box.remove();
+  }
 });
 
 await step('API 调用路径与后端路由一致', async () => {

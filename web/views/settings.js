@@ -7,12 +7,31 @@ import { api, getToken, setToken } from '../api.js';
  * 且只在渲染时调用，所以不会踩到 TDZ。
  */
 import { themeSwitcher } from '../app.js';
-import { confirmDialog, fmtBytes, fmtFull, h, mount, toast, toastError } from '../dom.js';
+import { confirmDialog, fmtBytes, fmtFull, h, mount, scrollToEl, toast, toastError } from '../dom.js';
 import { renderInto, viewState } from '../view-state.js';
 
 const STATUS_ICON = { ok: '✅', warn: '⚠️', error: '❌', skipped: '➖', running: '⏳' };
 
-export function renderSettings(root, app) {
+/**
+ * @param {HTMLElement} root
+ * @param {object} app
+ * @param {{anchor?: string}} [options] 渲染后要定位到的区块标题（或其前缀）。
+ *   跨视图回来的情况（「开始使用」/「运行与记录」点「返回设置」）走
+ *   `app.navigate('settings', { anchor })` → `app.takeNavParams('settings')`，两条路等价。
+ */
+export function renderSettings(root, app, options = {}) {
+  /*
+   * 具名区块锚点。
+   *
+   * 为什么要锚点：从「开始使用」向导或「运行与记录」返回时，用户要落回**它对应的那张卡片**
+   * （「外观」在设置页倒数第二块、「运行与记录」在末尾），否则得自己在十几块里找。
+   * 用**标题**当锚点而不是序号：区块顺序由 SETTINGS_ORDER 决定，随时会调，
+   * 序号一旦错位就会静默滚到别的卡片上（那比不滚更糟）。
+   *
+   * 注意首帧还在「加载配置中…」，那时没有任何 section.block，找不到就留给下一次 paint。
+   */
+  let pendingAnchor = typeof options?.anchor === 'string' ? options.anchor : (app?.takeNavParams?.('settings')?.anchor || null);
+
   // 状态托管给 app：切走再切回保留未保存的编辑与自检结果
   const { state } = viewState(app, 'settings', () => ({
     loading: true,
@@ -62,6 +81,16 @@ export function renderSettings(root, app) {
   const paint = () => {
     renderInto(container, app, 'settings', paintInner, () => renderSettings(root, app));
     organizeSettings(container);
+    // 区块刚渲染出来才找得到锚点；找到后 pendingAnchor 归零，不再重复滚动
+    pendingAnchor = revealSection(container, pendingAnchor);
+  };
+
+  /**
+   * 「关于」里的快捷跳转（备份与恢复）：与跨视图锚点共用同一套具名区块定位。
+   * 找不到就明说，而不是点了没反应。
+   */
+  const jumpToSection = (anchor) => {
+    if (revealSection(container, anchor)) toast(`没有找到「${anchor}」区块`, 'info');
   };
 
   const paintInner = () => {
@@ -404,6 +433,39 @@ export function renderSettings(root, app) {
           ),
         ),
       ),
+
+      /* ---------------- 运行与记录（入口） ---------------- */
+      /*
+       * 它以前是顶层导航的一项，现在收进设置：这是一页**查阅过去**的东西
+       * （审计台账 / 运行历史），不是每天要点的功能，占顶层位置不划算。
+       */
+      h(
+        'section',
+        { class: 'block' },
+        h(
+          'div',
+          { class: 'block-head' },
+          h('h3', { text: '运行与记录' }),
+          h('span', { class: 'muted small', text: '操作台账（审计）与分析运行历史' }),
+        ),
+        h(
+          'div',
+          { class: 'pad' },
+          h(
+            'p',
+            { class: 'muted small block-lead' },
+            '它回答"之前到底发生了什么"：**操作台账**记录每一次改动外部系统的动作' +
+              '（发邮件、同步草稿、建/删/改日程、清理数据、导入备份），含具体标题与主题，' +
+              '追加在 data/audit.jsonl、永久保留、可筛选、可下载；**运行历史**是每次分析' +
+              '拉取了多少、分析多少、起草多少、成功还是失败。',
+          ),
+          h(
+            'div',
+            { class: 'row-actions mt-2' },
+            h('button', { class: 'btn btn-primary', onclick: () => app.navigate('records') }, '打开「运行与记录」'),
+          ),
+        ),
+      ),
       /* ---------------- 数据去向（隐私） ---------------- */
       h(
         'section',
@@ -569,7 +631,16 @@ export function renderSettings(root, app) {
             { class: 'about-grid' },
             aboutRow('版本', state.meta?.version || '—', '报问题时请附上这个版本号'),
             aboutRow('Node', state.meta?.node || '—', '要求 ≥ 20'),
-            aboutRow('数据目录', state.meta?.dataDir || '—', '所有数据只在这台机器上；备份请用下面的「备份与恢复」'),
+            aboutRow(
+              '数据目录',
+              state.meta?.dataDir || '—',
+              '所有数据只在这台机器上；备份请用上面的',
+              h(
+                'button',
+                { class: 'link-btn', type: 'button', onclick: () => jumpToSection('备份与恢复') },
+                '「备份与恢复」',
+              ),
+            ),
             aboutRow('许可', 'MIT', '可自由使用、修改、分发'),
           ),
           h(
@@ -1653,8 +1724,39 @@ const SETTINGS_ORDER = [
   '备份与恢复',
   '存储与清理',
   '外观',
+  '运行与记录',
   '关于',
 ];
+
+/**
+ * 按具名锚点找到设置区块。
+ *
+ * 精确匹配优先，其次前缀匹配——标题带括号或补充说明（「大模型（OpenAI 兼容协议）」）
+ * 时，用「大模型」也能定位到，与 SETTINGS_ORDER 的排序用的是同一套前缀规则。
+ */
+function findSection(container, anchor) {
+  if (!anchor) return null;
+  const titleOf = (block) => block.dataset?.section || block.querySelector('.block-head h3')?.textContent?.trim() || '';
+  const blocks = [...container.querySelectorAll('section.block')];
+  return blocks.find((b) => titleOf(b) === anchor) || blocks.find((b) => titleOf(b).startsWith(anchor)) || null;
+}
+
+/**
+ * 滚动到具名区块并短暂高亮。
+ *
+ * 复用 `dom.scrollToEl`（内部已处理"最小 DOM 没有 scrollIntoView"与 `flash-target` 高亮），
+ * 所以真实浏览器里落点有视觉反馈——用户能看清自己落在哪一张卡片上。
+ *
+ * @returns {string|null} 还没渲染出来时**原样返回**锚点，留给下一次 paint 再试
+ *   （首帧仍是「加载配置中…」，那时一个 section.block 都没有）。
+ */
+function revealSection(container, anchor) {
+  if (!anchor) return null;
+  const block = findSection(container, anchor);
+  if (!block) return anchor;
+  scrollToEl(block);
+  return null;
+}
 
 /**
  * 分区目录 + 区块顺序。
@@ -1690,6 +1792,12 @@ function organizeSettings(container) {
     if (!title) return;
     const id = `settings-sec-${index}`;
     block.id = id;
+    /*
+     * 具名锚点：除了 `settings-sec-N` 这个**位置** id，再挂一个**语义**锚点，
+     * 让「返回设置」能说清"我要落在哪一块"（用标题而不是序号，
+     * 顺序调整时不会静默滚错卡片）。
+     */
+    block.dataset.section = title;
     items.push({ id, title });
   });
   if (items.length < 4) return;
@@ -1965,14 +2073,19 @@ async function loadSecrets() {
   paint();
 }
 
-/** 「关于」里的一行：标签 / 值 / 说明。 */
-function aboutRow(label, value, hint) {
+/**
+ * 「关于」里的一行：标签 / 值 / 说明。
+ *
+ * 说明用**可变参数**而不是单个字符串：有的说明里要嵌一个可点的按钮
+ * （例如「备份请用上面的「备份与恢复」」）。
+ */
+function aboutRow(label, value, ...hint) {
   return h(
     'div',
     { class: 'about-row' },
     h('span', { class: 'about-label', text: label }),
     h('span', { class: 'about-value', text: String(value) }),
-    h('span', { class: 'muted small about-hint', text: hint }),
+    h('span', { class: 'muted small about-hint' }, ...hint),
   );
 }
 

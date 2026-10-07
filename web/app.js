@@ -11,25 +11,50 @@ import { renderDrafts } from './views/drafts.js';
 import { renderSearch } from './views/search.js';
 import { renderCalendar } from './views/calendar.js';
 import { renderKnowledge } from './views/knowledge.js';
-import { renderFollowUps } from './views/followups.js';
+import { renderFollowUp } from './views/followup.js';
 import { renderLogin } from './views/login.js';
-import { renderTimeline } from './views/timeline.js';
 import { renderRecords } from './views/records.js';
 import { renderSetup } from './views/setup.js';
 import { renderSettings } from './views/settings.js';
 
+/*
+ * 顶层导航。
+ *
+ * 「跟催」与「时间线」合并成一项「跟进」（进页面后用页签切换，见 views/followup.js）；
+ * 「运行与记录」不再占顶层位置，改从「设置 → 运行与记录」卡片进入（nav: false 表示
+ * 只有导航不出按钮，但 navigate / #/records 仍然可用）。
+ *
+ * `label` 与视图 id 保持一对一：路由、导航、标题都从这里来，不要再各写一份清单。
+ */
 const VIEWS = [
   { id: 'overview', label: '邮件总览' },
   { id: 'drafts', label: '邮件草稿' },
   { id: 'search', label: '对话查邮件' },
   { id: 'calendar', label: '日历' },
   { id: 'knowledge', label: '知识库' },
-  { id: 'followups', label: '跟催' },
-  { id: 'timeline', label: '时间线' },
-  { id: 'records', label: '运行与记录' },
+  { id: 'followup', label: '跟进' },
   { id: 'setup', label: '开始使用' },
   { id: 'settings', label: '设置' },
+  { id: 'records', label: '运行与记录', nav: false },
 ];
+
+/**
+ * 合并前的旧入口 → 新入口。
+ *
+ * `#/followups` 与 `#/timeline` 曾经是两个独立菜单项，用户的书签与文档里的链接
+ * 都指向它们。这里做一次映射（落到「跟进」页并指定页签），让老链接继续能用——
+ * 合并菜单不等于把老地址变成 404。
+ */
+const LEGACY_VIEW_ALIAS = {
+  followups: { view: 'followup', tab: 'followups' },
+  timeline: { view: 'followup', tab: 'timeline' },
+};
+
+/** 把（可能是旧的）视图 id 解析成 `{view, tab}`；`tab` 为空表示无需指定页签。 */
+function resolveView(id) {
+  const alias = LEGACY_VIEW_ALIAS[id];
+  return alias ? { ...alias } : { view: id, tab: null };
+}
 
 /** 供测试与调试使用的应用实例。 */
 export { app };
@@ -64,8 +89,14 @@ const app = {
    * 切换视图。
    * @param {string} viewId
    * @param {object} [params] 传给目标视图的一次性参数，由目标视图用 takeNavParams 取走
+   *   （例如 `navigate('settings', { anchor: '外观' })` 让设置页滚到「外观」卡片，
+   *   或 `navigate('followup', { tab: 'timeline' })` 直接落到对应页签）
    */
   navigate(viewId, params) {
+    // 合并前的旧入口（followups / timeline）先归一到「跟进」页并带上页签参数
+    const target = resolveView(viewId);
+    if (target.tab) params = { ...(params || {}), tab: target.tab };
+    viewId = target.view;
     if (!VIEWS.some((v) => v.id === viewId)) viewId = 'overview';
     const sameView = viewId === this.viewId;
     if (params && typeof params === 'object') this.navParams[viewId] = { ...(this.navParams[viewId] || {}), ...params };
@@ -73,10 +104,17 @@ const app = {
     location.hash = `#/${viewId}`;
     this.renderView();
     this.paintNav();
-    // 切换标签页要回到顶部：否则从长列表底部跳到另一页，会停在半空的内容里
-    // （同一页内带着跳转参数重绘时不重置，避免「跳到某封草稿」被顶掉）
+    /*
+     * 切换标签页要回到顶部：否则从长列表底部跳到另一页，会停在半空的内容里
+     * （同一页内带着跳转参数重绘时不重置，避免「跳到某封草稿」被顶掉）。
+     *
+     * 例外：带**锚点**的跳转（`navigate('settings', { anchor })`）已经在 renderView 里
+     * 由目标视图自己滚到指定区块了，这里再回顶部会把刚定位好的位置顶掉
+     * （而且 scrollPageToTop 400ms 后还有一次硬跳 0 的兜底）。
+     */
+    const anchored = !!(params && typeof params === 'object' && params.anchor);
     if (!sameView) {
-      scrollPageToTop();
+      if (!anchored) scrollPageToTop();
       app.syncBackToTop?.();
     }
   },
@@ -96,8 +134,7 @@ const app = {
       search: renderSearch,
       calendar: renderCalendar,
       knowledge: renderKnowledge,
-      followups: renderFollowUps,
-      timeline: renderTimeline,
+      followup: renderFollowUp,
       records: renderRecords,
       setup: renderSetup,
       settings: renderSettings,
@@ -221,13 +258,14 @@ const app = {
       /*
        * 跟催徽标只显示**超期**数（不是未完成总数）：跟催项会慢慢积累，
        * 全算上的话徽标一直挂个数字，久了就没人看了——与「需留意」同样的取舍。
+       * 合并成「跟进」后徽标挂在合并项上（跟催仍是其中默认打开的那个页签）。
        */
       const badge =
         id === 'drafts'
           ? this.counts?.pendingDrafts
           : id === 'overview'
             ? this.counts?.needsReply
-            : id === 'followups'
+            : id === 'followup'
               ? this.counts?.followUpOverdue
               : id === 'setup'
                 ? setupTodo
@@ -851,7 +889,8 @@ function showMailModal(detail, fallback, app, initialTab = 'analysis') {
 export const BRAND = '轻效 | Ease & Effect';
 
 function buildShell(root) {
-  const navButtons = VIEWS.map((v) =>
+  // 只有非 nav:false 的项才生成导航按钮（「运行与记录」从设置页进入，不占顶层）
+  const navButtons = VIEWS.filter((v) => v.nav !== false).map((v) =>
     h('button', { class: 'nav-btn', dataset: { view: v.id }, onclick: () => app.navigate(v.id) }, v.label),
   );
   const progress = h('div', { class: 'progress-bar', hidden: true });
@@ -1050,8 +1089,21 @@ function bootShellAndViews(root) {
     if (id !== app.viewId) app.navigate(id);
   });
 
-  const initial = location.hash.replace(/^#\/?/, '') || 'overview';
-  app.viewId = VIEWS.some((v) => v.id === initial) ? initial : 'overview';
+  /*
+   * 首屏视图来自地址栏。旧链接（#/followups、#/timeline）在这里也解析一次，
+   * 否则 `VIEWS.some(...)` 会把它们判成无效 id 而退回总览——书签就白存了。
+   */
+  const initial = resolveView(location.hash.replace(/^#\/?/, '') || 'overview');
+  app.viewId = VIEWS.some((v) => v.id === initial.view) ? initial.view : 'overview';
+  if (initial.tab) {
+    app.navParams[app.viewId] = { ...(app.navParams[app.viewId] || {}), tab: initial.tab };
+    // 把地址栏改写回新入口，避免刷新一次又走一遍兼容分支
+    try {
+      location.hash = `#/${app.viewId}`;
+    } catch {
+      /* 最小 DOM 环境里 location 可能是只读对象，忽略即可 */
+    }
+  }
   app.paintNav();
   app.renderView();
   app.refreshCounts();

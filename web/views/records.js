@@ -60,6 +60,21 @@ export function renderRecords(root, app) {
 
   /* ------------------------------------------------------------ 视图 */
 
+  /**
+   * 「从哪来回哪去」。
+   *
+   * 这页的入口在**设置**里（不再占顶层导航），所以顶部必须给出口子，
+   * 并带锚点定位回设置页那张「运行与记录」卡片。
+   * 抽成函数是因为加载失败的分支也要给得出——否则出错时只剩"重试"，退不回去。
+   */
+  function backToSettings() {
+    return h(
+      'button',
+      { class: 'btn', onclick: () => app.navigate('settings', { anchor: '运行与记录' }) },
+      '返回设置',
+    );
+  }
+
   function view() {
     if (state.error) {
       return h(
@@ -68,11 +83,32 @@ export function renderRecords(root, app) {
         h('div', { class: 'empty-icon', text: '🧾' }),
         h('h3', { text: '无法加载记录' }),
         h('p', { text: state.error }),
-        h('button', { class: 'btn btn-primary', onclick: () => loadRecords({ force: true }) }, '重试'),
+        h(
+          'div',
+          { class: 'row-actions' },
+          h('button', { class: 'btn btn-primary', onclick: () => loadRecords({ force: true }) }, '重试'),
+          backToSettings(),
+        ),
       );
     }
     if (state.loading && !state.audit) return h('p', { class: 'muted pad', text: '加载中…' });
-    return h('div', {}, auditPanel(), runsPanel());
+    return h(
+      'div',
+      {},
+      h(
+        'section',
+        { class: 'page-head' },
+        h(
+          'div',
+          {},
+          h('h2', { class: 'page-title', text: '运行与记录' }),
+          h('p', { class: 'muted', text: '操作台账（谁改动了外部系统）与历次分析运行的结果，数据只保存在这台机器上。' }),
+        ),
+        h('div', { class: 'head-actions' }, backToSettings()),
+      ),
+      auditPanel(),
+      runsPanel(),
+    );
   }
 
   /* ---------------------------------------------------- 操作记录 */

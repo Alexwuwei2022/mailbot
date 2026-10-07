@@ -63,6 +63,22 @@ export function renderSetup(root, app) {
           h('h2', { class: 'page-title', text: '开始使用' }),
           h('p', { class: 'muted', text: '三步就能用起来。随时可以回「设置」里细调。' }),
         ),
+        /*
+         * 「从哪来回哪去」：这个向导是从**设置 → 外观**里点开的，
+         * 返回时带上锚点，直接落回那张卡片（否则用户回到设置页顶部还得自己找）。
+         */
+        h(
+          'div',
+          { class: 'head-actions' },
+          h(
+            'button',
+            {
+              class: 'btn',
+              onclick: () => app.navigate('settings', { anchor: '外观' }),
+            },
+            '返回设置',
+          ),
+        ),
       ),
       stepIndicator(health, current),
       state.message ? h('div', { class: 'alert alert-info block-lead' }, state.message) : null,
@@ -93,17 +109,25 @@ export function renderSetup(root, app) {
           h('span', {}, s.title, s.id === 'calendar' ? h('span', { class: 'muted small', text: '（可跳过）' }) : null),
         );
       }),
+      /*
+       * 第四枚「可以用了」。
+       *
+       * 它**只在配好之后**才渲染（health.ready 为真），所以它的索引永远是该打勾的：
+       * 早先这里写死了一个 →，结果本机（已配置完成）也显示箭头，看起来像"还没到"。
+       * 前三枚是"完成打勾 / 未完成显示序号"，这一枚没有"未完成"形态，
+       * 因此没有箭头分支——→ 只在真的表示"下一步去哪"时才用。
+       */
       health?.ready
         ? h(
             'button',
             {
-              class: 'setup-chip',
+              class: `setup-chip setup-chip-done ${current === 'done' ? 'setup-chip-active' : ''}`,
               onclick: () => {
                 state.step = 'done';
                 paint();
               },
             },
-            h('span', { class: 'setup-chip-index', text: '→' }),
+            h('span', { class: 'setup-chip-index', text: '✓' }),
             h('span', { text: '可以用了' }),
           )
         : null,
