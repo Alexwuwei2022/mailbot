@@ -640,16 +640,39 @@ export function copyButton(getText, { label = '复制', className = 'btn btn-sma
 export function flash(node, className = 'flash-target') {
   if (!node) return;
   node.classList.add(className);
+  // 与 styles.css 的 `.flash-target` 动画时长（1.6s）是**同一段时间**，改一个必须改另一个：
+  // 这里短了会把动画掐掉，长了会在动画结束后留一个没有视觉效果的 class。
   setTimeout(() => node.classList.remove(className), 1600);
 }
 
-/** 平滑滚动到某个元素并高亮它。 */
-export function scrollToEl(node, { block = 'start' } = {}) {
+/**
+ * 滚动到某个元素并高亮它。
+ *
+ * ## 为什么是**瞬时**滚动，而不是平滑滚动
+ *
+ * 高亮是固定的 1.6s。页面靠后的分区（「运行与记录」「关于」）离顶栏很远，平滑滚动本身
+ * 就可能接近甚至超过 1.6s，于是**高亮在滚到位之前就淡出**——定位反馈偏偏在最需要它的
+ * 时候消失。要对齐得依赖 `scrollend`（Safari 18 之前不支持）或自己估算滚动时长，
+ * 都不如不去做滚动动画：瞬时落位后，那 1.6s 高亮**整段**都发生在目标上。
+ *
+ * 代价是失去平滑动画，这是刻意的取舍：**瞬时滚动可预测，也可以在测试里断言**
+ * （探针能核对传下去的 behavior），而"真实浏览器里的手感"没法在这个项目里自动化验证
+ * （linkedom 里根本没有 scrollIntoView）。也就是说：这条改动**没有在真实浏览器里验过手感**，
+ * 但它的正确性不依赖手感——落点是确定的，高亮时长是确定的。
+ *
+ * 用 `instant` 而不是 `auto`：`auto` 会遵循 CSS 的 `scroll-behavior`，哪天有人给 `html`
+ * 加上 `scroll-behavior: smooth`，平滑滚动就会从这里悄悄回来，而 `instant` 不看 CSS。
+ * 老浏览器不认识 `instant` 会退回 `auto`（当前 CSS 里没有 scroll-behavior，同样是瞬时）。
+ *
+ * 注意：**不做高亮**的滚动（例如设置页目录 chip、跟催页跳列表）仍然是平滑的，
+ * 它们没有"高亮先于落点结束"的问题，滚动动画在那里是有意义的。
+ */
+export function scrollToEl(node, { block = 'start', behavior = 'instant' } = {}) {
   if (!node) return;
   // 先判存在再调用：jsdom/linkedom 这类最小 DOM 没有 scrollIntoView，
   // 而「回退到无参调用」会把 TypeError 再抛一次。
   try {
-    if (typeof node.scrollIntoView === 'function') node.scrollIntoView({ behavior: 'smooth', block });
+    if (typeof node.scrollIntoView === 'function') node.scrollIntoView({ behavior, block });
   } catch {
     /* 不支持平滑滚动时忽略即可，定位本身不依赖它 */
   }

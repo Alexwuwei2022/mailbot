@@ -835,13 +835,16 @@ await step('总览页：「需留意」单列一栏（不给起草按钮，可�
     // 卡片上的「需留意」应能定位到这一栏
     const card = [...app.els.main.querySelectorAll('.stat-card')].find((c) => c.textContent.includes('需留意'));
     let jumped = null;
+    const jumpOpts = [];
     const sec2 = app.els.main.querySelector('[data-section="worth"]');
-    sec2.scrollIntoView = () => {
+    sec2.scrollIntoView = (opts) => {
       jumped = 'worth';
+      jumpOpts.push(opts);
     };
     card.dispatchEvent(new window.Event('click', { bubbles: true }));
     await new Promise((r) => setTimeout(r, 30));
     checkEqual(jumped, 'worth', '点「需留意」卡片应滚动到该分区');
+    checkEqual(jumpOpts[0]?.behavior, 'instant', '定位用瞬时滚动：高亮 1.6s 必须整段落在目标上（平滑滚动可能比它更久）');
 
     // 已闭环分组要覆盖「需留意」里的条目（服务端已并入同一套分组）
     const groups = app.els.main.querySelector('[data-section="task-groups"]');
@@ -874,13 +877,17 @@ await step('总览页：统计卡片可点击（定位 / 跳转 / 筛选），�
   // 1) 「需你处理」→ 定位到对应分区并高亮
   const needCard = cards.find((c) => c.textContent.includes('需你处理'));
   let jumped = null;
+  const jumpOpts = [];
   const needSection = app.els.main.querySelector('[data-section="need"]');
-  needSection.scrollIntoView = () => {
+  needSection.scrollIntoView = (opts) => {
     jumped = 'need';
+    jumpOpts.push(opts);
   };
   needCard.dispatchEvent(new window.Event('click', { bubbles: true }));
   await new Promise((r) => setTimeout(r, 30));
   checkEqual(jumped, 'need', '点「需你处理」应滚动到对应分区');
+  checkEqual(jumpOpts[0]?.behavior, 'instant', '定位用瞬时滚动，block 仍应是 start');
+  checkEqual(jumpOpts[0]?.block, 'start', '落点对齐方式应保持 start');
   check(needSection.classList.contains('flash-target'), '定位后应短暂高亮该分区');
 
   // 2) 「紧急 / 高优先」→ 切换筛选
@@ -4037,18 +4044,58 @@ await step('设置页：关于卡片说「上面的备份与恢复」，点击�
     const link = [...about.querySelectorAll('button, a')].find((b) => /备份与恢复/.test(b.textContent));
     check(link, '「备份与恢复」应可点击');
 
-    // 点它 → 用同一套具名锚点滚到「备份与恢复」区块并高亮
+    // 点它 → 用同一套具名锚点跳（瞬时）到「备份与恢复」区块并高亮
     const target = box.querySelector('[data-section="备份与恢复"]');
     check(target, '应有「备份与恢复」区块');
     let scrolled = 0;
-    target.scrollIntoView = () => {
+    const jumpOpts = [];
+    target.scrollIntoView = (opts) => {
       scrolled += 1;
+      jumpOpts.push(opts);
     };
     link.dispatchEvent(new window.Event('click', { bubbles: true }));
     await new Promise((r) => setTimeout(r, 40));
     checkEqual(scrolled, 1, '点击后应滚动到「备份与恢复」区块');
+    checkEqual(jumpOpts[0]?.behavior, 'instant', '「关于」跳到「备份与恢复」也是瞬时定位');
     check(target.classList.contains('flash-target'), '定位后应短暂高亮该区块');
   } finally {
+    box.remove();
+  }
+});
+
+/**
+ * 交接书点名的那个场景：**跳到设置页靠后的区块**（运行与记录、关于）。
+ *
+ * 为什么单独一条：这是唯一一条能**真正验证**"高亮不会被滚动吃掉"的断言。
+ * linkedom 里没有 scrollIntoView，所以这里把探针装在**元素原型**上——元素是渲染过程中
+ * 才建出来的，没法提前挂在实例上。探针只记录传下去的 behavior/block 与落到哪个分区，
+ * 不改变任何行为；真实浏览器里的"手感"仍然没有（也无法）在这里验证，所以选的是
+ * **可预测的瞬时滚动**：落点与高亮时长都不依赖动画。
+ */
+await step('设置页：跳到靠后区块（运行与记录）用瞬时滚动，高亮整段落在目标上', async () => {
+  const settingsView = await import('../web/views/settings.js');
+  const box = document.createElement('div');
+  document.body.append(box);
+  const proto = Object.getPrototypeOf(box);
+  const hadOwn = Object.prototype.hasOwnProperty.call(proto, 'scrollIntoView');
+  const original = proto.scrollIntoView;
+  const seen = [];
+  proto.scrollIntoView = function probe(opts) {
+    seen.push({ behavior: opts?.behavior ?? null, block: opts?.block ?? null, section: this?.dataset?.section ?? null });
+  };
+  try {
+    settingsView.renderSettings(box, { navigate() {}, toast() {}, refreshCounts() {}, paintNav() {}, viewStates: {} }, { anchor: '运行与记录' });
+    await new Promise((r) => setTimeout(r, 240));
+    checkEqual(seen.length, 1, `带锚点进入应只定位一次（实际 ${seen.length} 次）`);
+    checkEqual(seen[0].behavior, 'instant', '靠后区块必须瞬时定位，否则平滑滚动可能比 1.6s 高亮更久');
+    checkEqual(seen[0].block, 'start', '落点对齐方式应保持 start');
+    checkEqual(seen[0].section, '运行与记录', '定位到的应是锚点指定的那个分区');
+    const flashed = [...box.querySelectorAll('section.block.flash-target')];
+    checkEqual(flashed.length, 1, '只应高亮目标那一块');
+    checkEqual(flashed[0].dataset.section, '运行与记录', '高亮的应是目标分区');
+  } finally {
+    if (hadOwn) proto.scrollIntoView = original;
+    else delete proto.scrollIntoView;
     box.remove();
   }
 });
