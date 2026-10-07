@@ -24,7 +24,7 @@ import {
   secretsReport,
 } from './config/index.js';
 import { LLM_PRESETS, PRESETS } from './config/defaults.js';
-import { AppError, APP_VERSION, hoursAgo, log, safeJson, toErrorPayload } from './lib/util.js';
+import { AppError, APP_VERSION, formatBytes, hoursAgo, log, safeJson, toErrorPayload } from './lib/util.js';
 import { configHealth, runDiagnostics } from './diagnostics.js';
 import {
   checkHost,
@@ -1381,6 +1381,14 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
    *
    * 两类，风险完全不同：孤儿（无任何记录指向，删了不影响任何可查询的历史）与超期原文。
    * 必须显式 `confirm=true`——这是**不可逆**的删除。
+   *
+   * ## 保留天数以**保存过的配置**为准
+   *
+   * 请求体里的 `retentionDays` 只作参考，真正生效的永远是 `config.retention.rawDays`。
+   * 曾经的写法是 `Number(body.retentionDays) || rawRetentionDays()`：于是
+   * "配置里写着 0（永久保留）、只是请求里带了 7"就会**真的按 7 天删原文**——
+   * 用户以为设了永久保留，原文却没了，而这层保护正是保留期功能的全部意义。
+   * 现在配置为 0 时，任何请求都不可能触发按时间删除。
    */
   if (route === 'POST /api/storage/cleanup') {
     const body = await readJsonBody(req);
@@ -1388,9 +1396,45 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       throw new AppError('清理归档是不可逆操作：请传入 confirm=true。', { code: 'CONFIRM_REQUIRED', status: 428 });
     }
     const mode = body.mode === 'retention' ? 'retention' : 'orphans';
-    const retentionDays = mode === 'retention' ? Number(body.retentionDays) || store.rawRetentionDays() : 0;
+    const configuredDays = store.rawRetentionDays();
+    const askedDays = Number(body.retentionDays);
+    const retentionDays = mode === 'retention' ? configuredDays : 0;
     const before = store.storageStats();
     const out = store.cleanupRawArchives({ includeOrphans: body.includeOrphans !== false, retentionDays });
+    // 删除后**立刻**取快照（早于台账写入），这样 before/after 之差就是这次删除的真实效果
+    const after = store.storageStats();
+
+    /*
+     * 结果文案必须如实：删了几个、释放多少字节、data 目录变成多大；
+     * 一个都没删时要说清**为什么**（永久保留 / 没有超期文件 / 全被保护 / 删除失败），
+     * 不能只说一句"已删除 0 个"，让用户以为功能坏了或者以为已经清理过了。
+     */
+    const freed = out.freedBytes;
+    const parts = [];
+    if (out.deletedCount > 0) {
+      parts.push(
+        `已删除 ${out.deletedCount} 个原文文件（孤儿 ${out.orphans} 个、超期 ${out.expired} 个），` +
+          `释放 ${formatBytes(freed)}（精确 ${freed} 字节）；data 目录 ${formatBytes(before.total.bytes)} → ${formatBytes(after.total.bytes)}。` +
+          '删除不可逆，这些邮件的原文/附件已无法在本机查看（邮件还在服务器上时可回连重取）。',
+      );
+    } else if (out.failed > 0) {
+      parts.push(`没有删除任何文件：${out.failed} 个文件删除失败（详见服务端日志与服务端返回的 failures）。`);
+    } else if (out.permanent) {
+      parts.push(
+        `当前为永久保留（归档原文保留天数 = 0），保留期清理不会删除任何原文；本次保留了 ${out.kept} 个原文文件。` +
+          (out.skippedReasons.orphanKept > 0 ? `另有 ${out.skippedReasons.orphanKept} 个孤儿文件按你的要求保留。` : ''),
+      );
+    } else {
+      parts.push(
+        `没有需要清理的文件：扫描到 ${out.kept} 个原文文件，全部在保留期内` +
+          (out.protectedByRecentAnalysis > 0
+            ? `（其中 ${out.protectedByRecentAnalysis} 个已超期，但因仍在保留期内被分析/查看引用而保留）`
+            : '') +
+          '。',
+      );
+    }
+    if (out.failed > 0 && out.deletedCount > 0) parts.push(`另有 ${out.failed} 个文件删除失败。`);
+
     /*
      * 删除原文是**不可逆的数据损失**，与"点一下待办"不同，值得进台账：
      * 事后要能回答"我的邮件原文是什么时候没的"。
@@ -1401,18 +1445,34 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       extra: {
         orphans: out.orphans,
         expired: out.expired,
-        freedBytes: out.bytes,
+        freedBytes: out.freedBytes,
         kept: out.kept,
         failed: out.failed,
+        protectedByRecentAnalysis: out.protectedByRecentAnalysis,
+        protectedBytes: out.protectedBytes,
         rawBefore: before.raw,
+        dataBefore: before.total,
+        dataAfter: after.total,
       },
     });
     return sendJson(res, 200, {
       ok: true,
+      // out 里已含 deletedCount / freedBytes / kept / failed / permanent / skipped / skippedReasons / failures
       ...out,
+      mode,
+      /** 请求体里带来的天数；与生效的 retentionDays 不同时，界面应提示"先保存配置" */
+      requestedRetentionDays: Number.isFinite(askedDays) ? askedDays : null,
+      /** 释放量的人话形式；**只用于展示**，精确数字始终以 freedBytes 为准 */
+      freedText: formatBytes(out.freedBytes),
+      /** 删除不可逆：界面必须写清"删了就不能再查看这些邮件的原文" */
+      irreversible: true,
+      /** 删除前的原文占用（保留字段，兼容旧调用方） */
       before: before.raw,
-      after: store.storageStats(),
-      message: `已删除 ${out.orphans + out.expired} 个归档文件，释放约 ${Math.round((out.bytes / 1024 / 1024) * 10) / 10} MB`,
+      /** 删除前/后的整个 data 目录占用：界面据此说明"当前 data 目录 99 MB" */
+      dataBefore: before.total,
+      dataAfter: after.total,
+      after,
+      message: parts.join(''),
     });
   }
 

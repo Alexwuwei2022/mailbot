@@ -47,9 +47,11 @@ export function renderSettings(root, app, options = {}) {
     /** 定时任务状态（定时器在不在跑、上次结果） */
     schedule: null,
     runningSchedule: false,
-    /** 存储占用（原文/孤儿/简报/台账/状态） */
+    /** 存储占用（原文/孤儿/可回收/简报/台账/状态） */
     storage: null,
     cleaning: false,
+    /** 最近一次清理的**如实结果**（删了几个、释放多少字节、失败几个） */
+    lastCleanup: null,
     /** 备份导出选项与状态 */
     exportSecrets: false,
     exportRaw: false,
@@ -710,6 +712,12 @@ export function renderSettings(root, app, options = {}) {
                 class: 'btn',
                 disabled: state.cleaning,
                 onclick: async (ev) => {
+                  // 先取一次最新占用：确认框里"N 个"必须与此刻磁盘上的实际情况一致
+                  try {
+                    state.storage = await api.storage();
+                  } catch {
+                    /* 取不到就沿用页面上的旧数字 */
+                  }
                   const s = state.storage || {};
                   const ok = await confirmDialog({
                     title: '清理孤儿归档文件？',
@@ -733,18 +741,67 @@ export function renderSettings(root, app, options = {}) {
                 class: 'btn',
                 disabled: state.cleaning,
                 onclick: async (ev) => {
+                  const btn = ev.currentTarget;
                   const days = Number(cfg.retention?.rawDays) || 0;
                   if (days <= 0) {
-                    toast('请先把「归档原文保留天数」设为大于 0 的值并保存（0 表示永久保留）。', 'info', 8000);
+                    toast(
+                      '当前为永久保留（归档原文保留天数 = 0），按保留期清理不会删除任何原文：请先把保留天数设为大于 0 并保存；只想回收空间可以点「清理孤儿文件」。',
+                      'info',
+                      10_000,
+                    );
                     return;
                   }
+                  /*
+                   * 先保存再清理：服务端**只认保存过的配置**（见 /api/storage/cleanup 的注释）。
+                   * 不先保存就会出现"界面按 7 天算、服务端按 0 天算"的分歧，
+                   * 用户看到"什么都没删"只会以为功能坏了。
+                   */
+                  if (hasUnsavedChanges()) {
+                    btn.disabled = true;
+                    try {
+                      await save({ silent: true });
+                      /*
+                       * 配置已变，"可回收多少"必须按**新的**保留天数重算，
+                       * 否则确认框里会写着旧天数算出来的条数（用户会以为数字是错的）。
+                       * 这里只更新数据、不重绘：一重绘这个按钮就换成了新节点，
+                       * 后面的「清理中…」就显示不出来了。
+                       */
+                      try {
+                        state.storage = await api.storage();
+                      } catch {
+                        /* 取不到就用旧数字，确认框仍会写明"按刚才的扫描" */
+                      }
+                    } finally {
+                      btn.disabled = false;
+                    }
+                    toast(`已先保存配置，按保存后的保留 ${days} 天清理`, 'info', 5000);
+                  }
+                  const expired = state.storage?.reclaimable?.expired;
+                  const orphans = state.storage?.reclaimable?.orphans;
                   const ok = await confirmDialog({
                     title: `删除 ${days} 天前的邮件原文？`,
                     message: h(
                       'div',
                       {},
-                      h('p', { text: `将删除超过 ${days} 天的原文归档（含附件）。` }),
-                      h('p', { class: 'muted small', text: '结论（摘要/待办/统计/简报/台账）不受影响；但邮件已被删除或超出服务器保留期时，原文与附件将彻底查不到。' }),
+                      h('p', {
+                        text:
+                          `将删除超过 ${days} 天的原文归档（含附件）。按刚才的扫描：超期 ${expired?.count ?? 0} 个` +
+                          (expired?.bytes ? `（${fmtBytes(expired.bytes)}）` : '') +
+                          (orphans?.count ? `；同时清理 ${orphans.count} 个孤儿文件（没有任何分析记录指向，零风险）` : '') +
+                          '。',
+                      }),
+                      /*
+                       * 不可逆必须说在最显眼的位置：这句是用户点"确认"前唯一会读的警告。
+                       * 界面**不给任何默认勾选的破坏性选项**——真删只有这一个明确按钮 + 二次确认。
+                       */
+                      h('p', {
+                        class: 'error small',
+                        text: '⚠️ 删除不可逆：删了就不能再查看这些邮件的原文，附件也下载不了（邮件已被服务器删除时连回源都拿不回来）。',
+                      }),
+                      h('p', {
+                        class: 'muted small',
+                        text: '结论（摘要/待办/统计/简报/台账）不受影响；已超期但仍在保留期内被分析/查看引用过的原文会自动保留。',
+                      }),
                     ),
                     confirmText: '确认删除',
                     danger: true,
@@ -756,6 +813,14 @@ export function renderSettings(root, app, options = {}) {
               '按保留期清理原文',
             ),
           ),
+          h('p', { class: 'muted small mt-2' }, storageRetentionNote()),
+          h('p', {
+            class: 'error small',
+            text:
+              '⚠️ 删除原文不可逆：删了就不能再查看这些邮件的原文，附件也下载不了；' +
+              '界面不替你预选任何破坏性选项——不点上面的按钮、不做二次确认，什么都不会删。',
+          }),
+          lastCleanupBlock(),
           h(
             'p',
             { class: 'muted small mt-2' },
@@ -2089,19 +2154,41 @@ function aboutRow(label, value, ...hint) {
   );
 }
 
-/** 存储占用明细表（原文 / 孤儿 / 简报 / 台账 / 状态）。 */
+/**
+ * 存储占用明细表（原文 / 孤儿 / 可回收 / 简报 / 台账 / 状态 / data 合计）。
+ *
+ * 「可回收空间」是关键的一项：它回答"现在点清理到底能省多少"。
+ * 数字来自服务端的 `reclaimable`——与真正删除时**共用同一份判据**
+ * （见 `server/store/state.js` 的 `planRawCleanup`），
+ * 所以不会出现"显示 40 MB 可回收、真删只删了 2 MB"这种对不上的事。
+ */
 function storageTable() {
   const s = state.storage;
   if (!s) {
     return h('p', { class: 'muted small' }, '正在读取存储占用…');
   }
   const mb = (b) => `${(Number(b || 0) / 1024 / 1024).toFixed(1)} MB`;
+  const rec = s.reclaimable || { orphans: s.orphan || { count: 0, bytes: 0 }, expired: { count: 0, bytes: 0 }, total: s.orphan || { count: 0, bytes: 0 }, permanent: s.retention?.rawDays === 0 };
   const rows = [
     ['归档原文', `${s.raw.count} 个`, mb(s.raw.bytes), '整封邮件原文（含附件）'],
     ['其中孤儿', `${s.orphan.count} 个`, mb(s.orphan.bytes), s.orphan.count ? '没有任何分析记录指向，可安全清理' : '没有孤儿文件 ✅'],
+    [
+      '可回收空间',
+      `${rec.total.count} 个`,
+      rec.total.bytes ? `约 ${fmtBytes(rec.total.bytes)}` : '0 B',
+      rec.permanent
+        ? '当前为永久保留：保留期清理不会删除任何原文，可回收的只有孤儿文件'
+        : `超期 ${rec.expired.count} 个（${fmtBytes(rec.expired.bytes)}）+ 孤儿 ${rec.orphans.count} 个（${fmtBytes(rec.orphans.bytes)}）；点下面的按钮才会真的删`,
+    ],
     ['简报文件', `${s.reports.count} 个`, mb(s.reports.bytes), 'AI 简报 markdown'],
     ['操作台账', `${s.audit.count} 个`, mb(s.audit.bytes), '永久保留'],
     ['状态文件', `${s.state.count} 个`, mb(s.state.bytes), `${s.analyses} 条分析 · ${s.drafts} 条草稿（上限 ${s.retention.maxAnalyses}）`],
+    [
+      'data 目录合计',
+      s.total ? `${s.total.count} 个文件` : '—',
+      s.total ? mb(s.total.bytes) : '—',
+      '含原文 / 简报 / 台账 / 附件 / 证书；清理原文后这一项应下降',
+    ],
   ];
   return h(
     'div',
@@ -2116,12 +2203,73 @@ function storageTable() {
         h('span', { class: 'muted small storage-hint', text: hint }),
       ),
     ),
+  );
+}
+
+/**
+ * 「保留期」这一句必须把两种情况说清，而不是给一个含糊的 0：
+ * 永久保留时明说"保留期清理不会删除任何原文"（这正是用户当前配置的情形）。
+ */
+function storageRetentionNote() {
+  const s = state.storage;
+  if (!s) return '保留策略读取中…';
+  const rec = s.reclaimable;
+  if (rec?.note) return rec.note;
+  return s.retention.rawDays > 0
+    ? `已设保留 ${s.retention.rawDays} 天（超期原文需点下面的按钮才会清理，不会自动删）`
+    : '当前为永久保留（保留天数 = 0）：保留期清理不会删除任何原文。';
+}
+
+/**
+ * 最近一次清理的**如实结果**。
+ *
+ * 为什么不能只用 toast：toast 几秒就没了，而"到底删了几个、释放了多少、data 目录变成多大"
+ * 是用户点完按钮最想知道、且过后还想再确认一次的事（尤其"其实一个都没删"这种结论）。
+ */
+function lastCleanupBlock() {
+  const r = state.lastCleanup;
+  if (!r) return null;
+  const when = new Date(r.at);
+  const p = (n) => String(n).padStart(2, '0');
+  const stamp = `${p(when.getMonth() + 1)}-${p(when.getDate())} ${p(when.getHours())}:${p(when.getMinutes())}`;
+  const before = r.dataBefore?.bytes ?? r.before?.bytes ?? 0;
+  const after = r.dataAfter?.bytes ?? r.after?.total?.bytes ?? r.after?.raw?.bytes ?? 0;
+  const rows = [
+    ['删除文件', `${r.deletedCount} 个`, '', `孤儿 ${r.orphans} 个 · 超期 ${r.expired} 个`],
+    [
+      '释放空间',
+      `${r.freedText}`,
+      '',
+      // 精确字节数必须给出来：MB 是四舍五入过的，"释放 0.0 MB"和"一个字节都没释放"是两回事
+      `精确 ${Number(r.freedBytes || 0).toLocaleString('en-US')} 字节（= 被删文件大小之和，估算值不算数）`,
+    ],
+    ['data 目录', `${fmtBytes(before)} → ${fmtBytes(after)}`, '', '删除前 → 删除后'],
+    [
+      '保留 / 失败',
+      `${r.kept} / ${r.failed}`,
+      '',
+      r.permanent
+        ? '当前为永久保留，未按保留期删除任何原文'
+        : `超期但因近期分析/查看被保护 ${r.protectedByRecentAnalysis || 0} 个` + (r.failed ? `；${r.failed} 个删除失败（详见服务端日志）` : ''),
+    ],
+  ];
+  return h(
+    'div',
+    { class: 'mt-3' },
+    h('p', { class: 'small', text: `最近一次清理（${stamp}）：${r.message}` }),
     h(
-      'p',
-      { class: 'muted small mt-2' },
-      s.retention.rawDays > 0
-        ? `已设保留 ${s.retention.rawDays} 天（超期原文需点下面的按钮才会清理，不会自动删）`
-        : '原文当前为永久保留；磁盘持续增长时，可设一个保留天数后手动清理。',
+      'div',
+      { class: 'storage-table mt-2' },
+      ...rows.map(([label, value, extra, hint]) =>
+        h(
+          'div',
+          { class: 'storage-row' },
+          h('span', { class: 'storage-label', text: label }),
+          h('span', { class: 'storage-count', text: value }),
+          h('span', { class: 'storage-size', text: extra }),
+          h('span', { class: 'muted small storage-hint', text: hint }),
+        ),
+      ),
     ),
   );
 }
@@ -2136,7 +2284,13 @@ async function loadStorage() {
   paint();
 }
 
-/** 执行一次清理（两种模式），结果如实汇报。 */
+/**
+ * 执行一次清理（两种模式），结果如实汇报。
+ *
+ * 释放量一律用**服务端返回的精确字节数**（`freedBytes`）：
+ * 曾经前端自己把字节数四舍五入成 MB 再报给用户，
+ * 16384 字节就变成了「释放 0.0 MB」——用户合理地以为清理没生效。
+ */
 async function runCleanup(btn, payload) {
   state.cleaning = true;
   const label = btn?.textContent || '';
@@ -2147,11 +2301,12 @@ async function runCleanup(btn, payload) {
   try {
     const out = await api.storageCleanup(payload);
     state.storage = out.after;
-    const freed = `${(Number(out.bytes || 0) / 1024 / 1024).toFixed(1)} MB`;
-    if (out.orphans + out.expired === 0) {
-      toast('没有需要清理的文件', 'info');
+    state.lastCleanup = { ...out, at: Date.now() };
+    if (out.deletedCount === 0) {
+      // 一个都没删时**不能**说"清理完成"：要把原因原样带给用户
+      toast(out.message || '没有需要清理的文件', out.failed ? 'error' : 'info', 12_000);
     } else {
-      toast(`${out.message}（孤儿 ${out.orphans} 个、超期 ${out.expired} 个，释放 ${freed}）`, 'success', 9000);
+      toast(out.message, 'success', 12_000);
     }
     if (out.failed) toast(`有 ${out.failed} 个文件删除失败，详见服务端日志`, 'error', 9000);
   } catch (err) {

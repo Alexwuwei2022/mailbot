@@ -224,6 +224,28 @@ export function stripHtml(html) {
   );
 }
 
+/**
+ * 字节数转人话（与前端 `web/dom.js` 的 `fmtBytes` 同一口径）。
+ *
+ * 只用于**展示**：一律与精确的字节数一起给出，绝不用它替代字节数——
+ * 「释放约 0 MB」正是本程序曾经犯过的错（16384 字节被四舍五入成 0 MB，
+ * 用户以为清理没生效）。
+ */
+export function formatBytes(bytes) {
+  const n0 = Number(bytes);
+  if (!Number.isFinite(n0)) return '—';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let n = Math.abs(n0);
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i += 1;
+  }
+  // B 不给小数（"0.0 B" 很怪），KB 以上给一位小数
+  const text = `${n.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+  return n0 < 0 ? `-${text}` : text;
+}
+
 export function splitEmails(value) {
   if (!value) return [];
   const list = Array.isArray(value) ? value : String(value).split(/[,;]/);

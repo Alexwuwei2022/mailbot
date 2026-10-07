@@ -2746,13 +2746,23 @@ await test('存储：占用体检能认出孤儿归档，清理只删没人引�
    * 造三个归档：
    *   A. 有分析记录指向 → 必须保留
    *   B. 没人指向 → 孤儿，该删
-   *   C. 有分析记录但文件很旧 + 设了保留期 → 该按保留期删
+   *   C. 有分析记录但**文件与分析都过期** + 设了保留期 → 该按保留期删
+   *
+   * A/C 的 analyzedAt 必须跟文件同岁（都是 100 天前）：它代表"100 天前分析过，
+   * 此后程序再没碰过这封邮件"。如果把 analyzedAt 写成此刻，那就变成
+   * "文件很旧、但刚刚被分析过"——按判据（见 `planRawCleanup`）这种原文会被
+   * **主动保护**而不删（宁可漏删，不可误删）。那个安全行为由下面
+   * 「仍被近期分析引用」用例专门覆盖，这里不再重复。
    */
+  const old = Date.now() - 100 * 86_400_000;
   const withOwner = { folder: 'INBOX', uid: 77001, messageId: '<own@x>' };
-  store.upsertAnalyses([{ ...withOwner, type: 'fyi', needsReply: false, analyzedAt: new Date().toISOString(), mail: { subject: '有主的' } }]);
+  store.upsertAnalyses([
+    { ...withOwner, type: 'fyi', needsReply: false, analyzedAt: new Date(old).toISOString(), mail: { subject: '有主的' } },
+  ]);
   const ownedFile = path.join(p.rawDir, store.rawFileName(withOwner.folder, withOwner.uid, withOwner.messageId));
   const orphanFile = path.join(p.rawDir, 'INBOX__77002__deadbeef.eml');
   fs.writeFileSync(ownedFile, 'X'.repeat(2048));
+  fs.utimesSync(ownedFile, new Date(old), new Date(old));
   fs.writeFileSync(orphanFile, 'Y'.repeat(1024));
 
   const stats = store.storageStats();
@@ -2766,9 +2776,7 @@ await test('存储：占用体检能认出孤儿归档，清理只删没人引�
   assertEqual(fs.existsSync(orphanFile), false, '孤儿文件应被删除');
   assertEqual(fs.existsSync(ownedFile), true, '有主的文件绝不能被删（那才是可查询的历史）');
 
-  // 保留期清理：把有主文件的时间改成 100 天前，设 30 天保留 → 该删
-  const old = Date.now() - 100 * 86_400_000;
-  fs.utimesSync(ownedFile, new Date(old), new Date(old));
+  // 保留期清理：文件与分析记录都是 100 天前，设 30 天保留 → 该删
   const out2 = store.cleanupRawArchives({ includeOrphans: true, retentionDays: 30 });
   assertEqual(out2.expired, 1, '超期的有主文件应按保留期删除');
   assertEqual(fs.existsSync(ownedFile), false, '超期文件应被删除');
@@ -2789,6 +2797,364 @@ await test('存储：占用体检能认出孤儿归档，清理只删没人引�
   }
   delete store.getState().analyses['INBOX:77001'];
   store.persistState();
+});
+
+/*
+ * -------------------------------------------------- 19.5 保留期清理：口径与安全
+ *
+ * 这一组用例回答四个"没人验证过"的问题（全部在临时数据目录里做，
+ * `MAILBOT_DATA_DIR` 是本文件开头 `makeTempDir` 出来的临时目录，真实 data/ 一概不碰）：
+ *   ① 保留期真的会删掉旧原文、并且不碰新原文吗？
+ *   ② 报出来的"释放字节数"真的等于被删文件大小之和吗？（不是估算、不是四舍五入）
+ *   ③ rawDays = 0（永久保留）时真的一个都不删吗？
+ *   ④ 仍被近期分析引用的原文会不会被误删？
+ *   ⑤ 清理前后 data 目录占用真的下降吗？
+ */
+
+const RETENTION_DAY = 86_400_000;
+
+/** 造一个归档原文（可指定 mtime 与"分析时间"），返回文件名与字节数。 */
+function makeArchivedMail({ uid, ageDays, bytes, analyzedAgeDays = null, now = Date.now() }) {
+  const p = getPaths();
+  fs.mkdirSync(p.rawDir, { recursive: true });
+  const messageId = `<retention-${uid}@selftest>`;
+  const file = path.join(p.rawDir, store.rawFileName('INBOX', uid, messageId));
+  fs.writeFileSync(file, 'R'.repeat(bytes));
+  const t = new Date(now - ageDays * RETENTION_DAY);
+  fs.utimesSync(file, t, t);
+  if (analyzedAgeDays !== null) {
+    store.upsertAnalyses([
+      {
+        folder: 'INBOX',
+        uid,
+        messageId,
+        type: 'fyi',
+        needsReply: false,
+        analyzedAt: new Date(now - analyzedAgeDays * RETENTION_DAY).toISOString(),
+        mail: { subject: `保留期用例 ${uid}`, date: t.toISOString() },
+      },
+    ]);
+  }
+  return { file, name: path.basename(file), size: bytes, uid, messageId };
+}
+
+/** 当前 raw 目录里所有 .eml 的「文件名 → 字节数」。 */
+function rawSnapshot() {
+  const p = getPaths();
+  const map = new Map();
+  for (const name of fs.readdirSync(p.rawDir)) {
+    if (!name.endsWith('.eml')) continue;
+    map.set(name, fs.statSync(path.join(p.rawDir, name)).size);
+  }
+  return map;
+}
+
+/** 释放量的"第三方"核算：清理前后各取一次快照，把真的消失了的文件大小加起来。 */
+function vanishedBytes(before, after) {
+  let bytes = 0;
+  let count = 0;
+  for (const [name, size] of before) {
+    if (after.has(name)) continue;
+    bytes += size;
+    count += 1;
+  }
+  return { bytes, count };
+}
+
+await test('存储：保留期清理只删超期原文，释放字节数精确等于被删文件之和（含 data 目录实测下降）', async () => {
+  const now = Date.now();
+  /*
+   * 先把此前用例（模拟邮箱扫描等）留下的孤儿清干净：本组用例要断言**精确的个数与字节数**，
+   * 不能把别人留下的文件算进来。这一步只清孤儿（retentionDays=0），不动任何有主原文。
+   */
+  store.cleanupRawArchives({ includeOrphans: true, retentionDays: 0, now });
+  const oldMails = [];
+  const newMails = [];
+  for (let i = 0; i < 5; i += 1) {
+    // 旧邮件：8 天前归档、8 天前分析过
+    oldMails.push(makeArchivedMail({ uid: 61_000 + i, ageDays: 8, bytes: 4096 + i, analyzedAgeDays: 8, now }));
+    // 新邮件：1 天前归档、1 天前分析过
+    newMails.push(makeArchivedMail({ uid: 62_000 + i, ageDays: 1, bytes: 2048 + i, analyzedAgeDays: 1, now }));
+  }
+  const expectedFreed = oldMails.reduce((s, m) => s + m.size, 0);
+
+  const snapBefore = rawSnapshot();
+  const statsBefore = store.storageStats();
+  const out = store.cleanupRawArchives({ includeOrphans: true, retentionDays: 7, now });
+  const snapAfter = rawSnapshot();
+  const statsAfter = store.storageStats();
+
+  // ① 只删旧的 5 个，新的 5 个仍在
+  for (const m of oldMails) assertEqual(fs.existsSync(m.file), false, `8 天前的原文应被删除：${m.name}`);
+  for (const m of newMails) assertEqual(fs.existsSync(m.file), true, `1 天前的原文绝不能被删：${m.name}`);
+  assertEqual(out.expired, 5, `应只按保留期删除 5 个（实际 ${out.expired}）`);
+  assertEqual(out.deletedCount, 5, `删除总数应为 5（实际 ${out.deletedCount}）`);
+
+  // ② 释放字节数**精确**等于被删文件大小之和（不是估算、不是四舍五入到 MB）
+  const vanished = vanishedBytes(snapBefore, snapAfter);
+  assertEqual(out.freedBytes, expectedFreed, `释放字节应等于 5 个旧文件的字节和 ${expectedFreed}（实际 ${out.freedBytes}）`);
+  assertEqual(out.freedBytes, vanished.bytes, '释放字节应等于"真的消失了的文件"的字节和（第三方核算）');
+  assertEqual(out.bytes, out.freedBytes, 'bytes 与 freedBytes 必须永远相等（同一个精确值）');
+  assertEqual(vanished.count, 5, `实际消失的文件应恰好 5 个（实际 ${vanished.count}）`);
+
+  // ③ 账目自洽：删掉的 + 跳过/失败的 = 扫描到的原文总数
+  assertEqual(
+    out.deletedCount + out.skipped,
+    snapBefore.size,
+    `删除数 + 跳过数应等于扫描到的原文总数（${out.deletedCount} + ${out.skipped} ≠ ${snapBefore.size}）`,
+  );
+  assertEqual(out.skipped, out.kept + out.failed, 'skipped 应等于"保留 + 失败"');
+
+  // ④ data 目录占用**实测**下降，且下降量正好是释放的字节数
+  assert(
+    statsAfter.total.bytes < statsBefore.total.bytes,
+    `清理后 data 目录占用应下降（${statsBefore.total.bytes} → ${statsAfter.total.bytes}）`,
+  );
+  assertEqual(
+    statsBefore.total.bytes - statsAfter.total.bytes,
+    out.freedBytes,
+    'data 目录下降的字节数应精确等于报告的释放量（期间没有任何别的写入）',
+  );
+
+  // 收尾：删掉本用例造的分析记录，避免影响后面的用例
+  for (const m of [...oldMails, ...newMails]) delete store.getState().analyses[`INBOX:${m.uid}`];
+  store.persistState();
+});
+
+await test('存储：仍被近期分析引用的原文（文件很旧但刚分析过）绝不被保留期清理删掉', async () => {
+  const now = Date.now();
+  /*
+   * 这是"误删"最真实的形态：原文文件是 8 天前归档的（mtime 很旧），
+   * 但分析记录是今天写的（比如原文读取失败后重新分析、或从备份恢复过 data/）。
+   * 只看 mtime 就会把它删掉——而它恰恰是程序最近还在引用的邮件。
+   */
+  const fresh = makeArchivedMail({ uid: 63_001, ageDays: 8, bytes: 9999, analyzedAgeDays: 0, now });
+  // 对照组：文件旧、分析也旧 → 该删
+  const stale = makeArchivedMail({ uid: 63_002, ageDays: 8, bytes: 512, analyzedAgeDays: 8, now });
+
+  const plan = store.planRawCleanup({ includeOrphans: true, retentionDays: 7, now });
+  const freshPlan = plan.files.find((f) => f.name === fresh.name);
+  const stalePlan = plan.files.find((f) => f.name === stale.name);
+  assert(freshPlan, '规划里应能看到这个文件');
+  assertEqual(freshPlan.decision, 'keep', '文件旧但分析记录在保留期内 → 必须判定为保留');
+  assertEqual(freshPlan.reason, 'recent-analysis', '保留原因应写明是"被近期分析引用"');
+  assertEqual(stalePlan.decision, 'delete', '文件旧、分析也旧 → 该按保留期删除');
+
+  const out = store.cleanupRawArchives({ includeOrphans: true, retentionDays: 7, now });
+  assertEqual(fs.existsSync(fresh.file), true, '被近期分析引用的原文绝不能被删');
+  assertEqual(out.protectedByRecentAnalysis >= 1, true, `应报告"被近期分析保护"的数量（实际 ${out.protectedByRecentAnalysis}）`);
+  assertEqual(out.expired >= 1, true, '对照组的旧文件应被删除');
+  assertEqual(fs.existsSync(stale.file), false, '对照组的旧文件应被删除');
+  assertEqual(out.freedBytes >= 512, true, '释放字节数应包含对照组');
+
+  for (const m of [fresh, stale]) {
+    delete store.getState().analyses[`INBOX:${m.uid}`];
+    try {
+      fs.unlinkSync(m.file);
+    } catch {
+      /* ignore */
+    }
+  }
+  store.persistState();
+});
+
+await test('存储：rawDays=0（永久保留）时一个原文都不删，且返回明确说明', async () => {
+  const now = Date.now();
+  const config = getConfig();
+  const backup = { ...(config.retention || {}) };
+  // 一个 400 天前的原文：任何"按时间删"的实现都会把它删掉
+  const ancient = makeArchivedMail({ uid: 64_001, ageDays: 400, bytes: 8192, analyzedAgeDays: 400, now });
+  // 一个孤儿（没有任何分析记录指向）
+  const p = getPaths();
+  const orphanFile = path.join(p.rawDir, 'INBOX__64999__deadbeef.eml');
+  fs.writeFileSync(orphanFile, 'O'.repeat(777));
+
+  try {
+    config.retention = { ...(config.retention || {}), rawDays: 0 };
+    assertEqual(store.rawRetentionDays(), 0, 'rawDays=0 应被解析成"永久保留"');
+
+    const stats = store.storageStats();
+    assertEqual(stats.reclaimable.permanent, true, '存储体检应标明当前是永久保留');
+    assertEqual(stats.reclaimable.expired.count, 0, '永久保留时"可回收的超期原文"必须是 0');
+    assertIncludes(stats.reclaimable.note, '不会删除任何原文', '体检说明必须明说保留期清理不会删原文');
+
+    const out = store.cleanupRawArchives({ includeOrphans: true, retentionDays: 0, now });
+    assertEqual(out.expired, 0, '永久保留时不得按时间删除任何原文');
+    assertEqual(fs.existsSync(ancient.file), true, '400 天前的原文也必须还在');
+    // 孤儿仍然该清（零风险），但要与"按保留期删"分得清清楚楚
+    assertEqual(out.orphans, 1, '孤儿应被清理');
+    assertEqual(out.freedBytes, 777, '释放字节应精确等于孤儿文件大小');
+    assertEqual(fs.existsSync(ancient.file), true, '清理孤儿不得连带有主的原文一起删');
+
+    // 保留期清理时"一个都不删"的说明（走 HTTP 那一层，见下一个用例）
+    assertEqual(out.permanent, true, '应标明本次是永久保留模式');
+  } finally {
+    config.retention = backup;
+    try {
+      fs.unlinkSync(ancient.file);
+    } catch {
+      /* ignore */
+    }
+    delete store.getState().analyses['INBOX:64001'];
+    store.persistState();
+  }
+});
+
+await test('存储：/api/storage 报出「可回收空间」，判据与真删一致（显示多少就能删多少）', async () => {
+  const now = Date.now();
+  const config = getConfig();
+  const backup = { ...(config.retention || {}) };
+  try {
+    config.retention = { ...(config.retention || {}), rawDays: 7 };
+    const oldOnes = [];
+    for (let i = 0; i < 3; i += 1) oldOnes.push(makeArchivedMail({ uid: 65_000 + i, ageDays: 9, bytes: 3000 + i, analyzedAgeDays: 9, now }));
+    const newOne = makeArchivedMail({ uid: 66_000, ageDays: 1, bytes: 111, analyzedAgeDays: 1, now });
+
+    const stats = store.storageStats();
+    assertEqual(stats.reclaimable.permanent, false, 'rawDays>0 时不该标成永久保留');
+    assertEqual(stats.reclaimable.expired.count, 3, `可回收的超期原文应为 3（实际 ${stats.reclaimable.expired.count}）`);
+    assertEqual(
+      stats.reclaimable.expired.bytes,
+      oldOnes.reduce((s, m) => s + m.size, 0),
+      '可回收字节数应等于这几个文件的大小之和',
+    );
+
+    // 真删一次，结果必须与刚才"承诺"的可回收量**一模一样**
+    const promised = stats.reclaimable.expired;
+    const out = store.cleanupRawArchives({ includeOrphans: true, retentionDays: store.rawRetentionDays(), now });
+    assertEqual(out.expired, promised.count, `实际删除数应与"可回收"承诺一致（承诺 ${promised.count}，实际 ${out.expired}）`);
+    assertEqual(out.freedBytes, promised.bytes, `实际释放字节应与承诺一致（承诺 ${promised.bytes}，实际 ${out.freedBytes}）`);
+    assertEqual(fs.existsSync(newOne.file), true, '保留期内的原文必须还在');
+  } finally {
+    config.retention = backup;
+    for (const uid of [65_000, 65_001, 65_002, 66_000]) delete store.getState().analyses[`INBOX:${uid}`];
+    store.persistState();
+  }
+});
+
+await test('存储：清理接口（HTTP）如实报告释放量，且请求里的保留天数不能绕过配置里的永久保留', async () => {
+  const now = Date.now();
+  const config = getConfig();
+  const backup = { ...(config.retention || {}) };
+  const { url, stop } = await startTestServer({ rootDir: root, port: 0, host: '127.0.0.1' });
+  const auth = { 'x-mailbot-token': config.web.authToken, 'content-type': 'application/json' };
+  try {
+    const olds = [];
+    for (let i = 0; i < 3; i += 1) olds.push(makeArchivedMail({ uid: 67_000 + i, ageDays: 8, bytes: 4096, analyzedAgeDays: 8, now }));
+    const keeper = makeArchivedMail({ uid: 68_000, ageDays: 1, bytes: 2048, analyzedAgeDays: 1, now });
+    /*
+     * 必须落盘：`createServer` 一启动就会 `loadState({ force: true })` 从磁盘重读，
+     * 只写在内存里的分析记录会被丢掉（那样这些原文会被当成"孤儿"）。
+     */
+    store.persistState();
+    const expectedFreed = olds.reduce((s, m) => s + m.size, 0);
+
+    /* ---- 场景 A：配置为永久保留（0），请求却带着 retentionDays=7 ---- */
+    config.retention = { ...(config.retention || {}), rawDays: 0 };
+    const resA = await fetchJson(`${url}/api/storage/cleanup`, {
+      method: 'POST',
+      headers: auth,
+      // includeOrphans:false —— 本用例只考察"保留期"这条路径，孤儿另有用例覆盖
+      body: JSON.stringify({ confirm: true, mode: 'retention', retentionDays: 7, includeOrphans: false }),
+    });
+    assertEqual(resA.status, 200, `清理接口应成功（实际 ${resA.status}）`);
+    assertEqual(resA.body.deletedCount, 0, '配置是永久保留时，请求里的保留天数不得触发删除');
+    assertEqual(resA.body.freedBytes, 0, '永久保留时释放字节必须是 0');
+    assertEqual(resA.body.retentionDays, 0, '生效的保留天数应来自配置（0）');
+    assertEqual(resA.body.requestedRetentionDays, 7, '应如实回显请求里带来的天数，便于界面提示"先保存配置"');
+    assertIncludes(resA.body.message, '永久保留', '文案必须说明为什么一个都没删');
+    for (const m of olds) assertEqual(fs.existsSync(m.file), true, '永久保留时旧原文也不得被删');
+
+    /* ---- 场景 B：配置改成保留 7 天，同样请求 → 该删的删、数字要对得上 ---- */
+    config.retention = { ...(config.retention || {}), rawDays: 7 };
+    const resB = await fetchJson(`${url}/api/storage/cleanup`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ confirm: true, mode: 'retention', retentionDays: 7, includeOrphans: false }),
+    });
+    const b = resB.body;
+    assertEqual(resB.status, 200, `清理接口应成功（实际 ${resB.status}）`);
+    assertEqual(b.deletedCount, 3, `应删除 3 个超期原文（实际 ${b.deletedCount}）`);
+    assertEqual(b.freedBytes, expectedFreed, `释放字节应精确等于 3 个文件之和 ${expectedFreed}（实际 ${b.freedBytes}）`);
+    assertEqual(b.freedText, '12.0 KB', '人话文案应与精确字节一致（12288 字节 = 12.0 KB）');
+    assertIncludes(b.message, '已删除 3 个原文文件', '文案要写出删了几个');
+    assertIncludes(b.message, String(expectedFreed), '文案要写出精确字节数，不能只说"约 0 MB"');
+    assertIncludes(b.message, '不可逆', '文案必须写明删除不可逆');
+    assertEqual(b.dataBefore.bytes - b.dataAfter.bytes, expectedFreed, 'data 目录下降量应精确等于释放字节数');
+    assertEqual(b.irreversible, true, '接口应显式声明这是不可逆操作');
+    for (const m of olds) assertEqual(fs.existsSync(m.file), false, '超期原文应被删除');
+    assertEqual(fs.existsSync(keeper.file), true, '保留期内的原文必须还在');
+
+    /* ---- 场景 C：没有可清理的文件时，说明要明确（不能只说"已删除 0 个"）---- */
+    const resC = await fetchJson(`${url}/api/storage/cleanup`, {
+      method: 'POST',
+      headers: auth,
+      body: JSON.stringify({ confirm: true, mode: 'retention', retentionDays: 7, includeOrphans: false }),
+    });
+    assertEqual(resC.status, 200, `清理接口应成功（实际 ${resC.status}）`);
+    assertEqual(resC.body.deletedCount, 0, '第二次不应再删任何文件');
+    assertIncludes(resC.body.message, '没有需要清理的文件', '没得清理时要给出明确说明');
+    assertIncludes(resC.body.message, '保留期', '说明里要提到保留期，而不是含糊的"成功"');
+  } finally {
+    config.retention = backup;
+    for (const uid of [67_000, 67_001, 67_002, 68_000]) delete store.getState().analyses[`INBOX:${uid}`];
+    store.persistState();
+    await stop();
+  }
+});
+
+await test('存储：删除失败时不谎报释放量（释放字节只算真的删掉的文件）', async () => {
+  const now = Date.now();
+  const p = getPaths();
+  fs.mkdirSync(p.rawDir, { recursive: true });
+  const a = path.join(p.rawDir, 'INBOX__69001__feedface.eml');
+  const b = path.join(p.rawDir, 'INBOX__69002__feedface.eml');
+  fs.writeFileSync(a, 'A'.repeat(512));
+  fs.writeFileSync(b, 'B'.repeat(2048));
+
+  /*
+   * 注入一次"第二个文件删不掉"的故障（真实世界里对应文件被占用 / 权限不足 / 杀软锁文件）。
+   * 直接替换 `fs.unlinkSync`：state.js 与本文件 import 的是**同一个** fs 对象，
+   * 属性在调用时才查表，所以注入会生效；finally 里一定还原，绝不影响其它用例。
+   */
+  const realUnlink = fs.unlinkSync;
+  try {
+    fs.unlinkSync = (target) => {
+      if (String(target).endsWith('INBOX__69002__feedface.eml')) {
+        const err = new Error('EBUSY: resource busy or locked（测试注入）');
+        err.code = 'EBUSY';
+        throw err;
+      }
+      return realUnlink(target);
+    };
+
+    const before = rawSnapshot();
+    const out = store.cleanupRawArchives({ includeOrphans: true, retentionDays: 0, now });
+    const after = rawSnapshot();
+    const vanished = vanishedBytes(before, after);
+
+    assertEqual(out.failed, 1, `应如实报出 1 个删除失败（实际 ${out.failed}）`);
+    assertEqual(out.failures.length, 1, '失败原因要逐条给出，不能吞掉');
+    assertEqual(out.failures[0].name, 'INBOX__69002__feedface.eml', '失败原因要写明是哪个文件');
+    assertEqual(out.deletedCount, vanished.count, '删除数应等于真的消失的文件数');
+    assertEqual(
+      out.freedBytes,
+      vanished.bytes,
+      '释放字节只能算真的删掉的文件——失败的 2048 字节一个都不能计进去',
+    );
+    assertEqual(out.skippedReasons.failed, 1, '跳过原因里要写明有 1 个是删除失败');
+    assertEqual(out.deletedCount + out.skipped, before.size, '账目自洽：删除 + 跳过 = 扫描到的原文总数');
+    assertEqual(fs.existsSync(b), true, '删除失败的文件必须还在（不能假装删掉了）');
+  } finally {
+    fs.unlinkSync = realUnlink;
+    for (const f of [a, b]) {
+      try {
+        fs.unlinkSync(f);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
 });
 
 await test('存储：分析记录上限可配置（旧版本写死 3000）', async () => {

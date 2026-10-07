@@ -279,6 +279,30 @@ const responses = {
       },
     },
   },
+  '/api/storage': {
+    ok: true,
+    raw: { count: 238, bytes: 204_879_462 },
+    orphan: { count: 3, bytes: 512_000 },
+    reports: { count: 12, bytes: 40_000 },
+    audit: { count: 1, bytes: 3_000 },
+    state: { count: 1, bytes: 1_200_000 },
+    total: { count: 255, bytes: 206_500_000 },
+    /*
+     * 用户当前的真实配置就是 rawDays=0（永久保留）。
+     * `note` 由服务端下发，界面必须原样说明"保留期清理不会删除任何原文"。
+     */
+    reclaimable: {
+      orphans: { count: 3, bytes: 512_000 },
+      expired: { count: 0, bytes: 0 },
+      total: { count: 3, bytes: 512_000 },
+      permanent: true,
+      protectedByRecentAnalysis: { count: 0, bytes: 0 },
+      note: '当前为永久保留（归档原文保留天数 = 0），保留期清理不会删除任何原文；可回收的只有 3 个孤儿文件（没有任何分析记录指向，删了不影响任何可查询的历史）。',
+    },
+    analyses: 238,
+    drafts: 5,
+    retention: { maxAnalyses: 3000, rawDays: 0 },
+  },
   '/api/calendar/status': {
     ok: true,
     enabled: true,
@@ -3527,6 +3551,47 @@ await step('设置页：未保存提示与「测试连接先保存」', async ()
   check(made.includes('PUT /api/config'), `应先把表单保存到服务端再测试（实际调用：${made.join('、') || '无'}）`);
   check(made.includes('POST /api/calendar/test'), `应调用测试连接接口（实际调用：${made.join('、') || '无'}）`);
   check(made.indexOf('PUT /api/config') < made.indexOf('POST /api/calendar/test'), '保存必须发生在测试之前');
+});
+
+await step('设置页：存储与清理——「可回收空间」体检项、永久保留说明、不可逆告知', async () => {
+  const settings = await import('../web/views/settings.js');
+  const render = async (storage) => {
+    globalThis.__forceResponses = { '/api/storage': storage };
+    const container = document.createElement('div');
+    settings.renderSettings(container, { navigate() {}, refreshCounts() {}, analyze() {} });
+    await new Promise((r) => setTimeout(r, 120));
+    return container.innerHTML;
+  };
+  try {
+    const html = await render(responses['/api/storage']);
+    check(html.includes('可回收空间'), '存储面板应把「可回收空间」作为体检项显示');
+    check(html.includes('data 目录合计'), '应显示整个 data 目录的占用（用户问的是"省下多少空间"）');
+    check(html.includes('当前为永久保留'), '保留天数为 0 时必须明说当前是永久保留');
+    check(
+      html.includes('保留期清理不会删除任何原文'),
+      '必须明确写出"保留期清理不会删除任何原文"，而不是给一个含糊的 0',
+    );
+    check(html.includes('删除原文不可逆'), '必须写明删除不可逆');
+    check(html.includes('删了就不能再查看这些邮件的原文'), '必须写清删了会怎样（不可回滚性告知）');
+
+    // 设了保留天数时：可回收量要按"超期 + 孤儿"分别说明，并说明有文件被近期引用保护
+    const html2 = await render({
+      ...responses['/api/storage'],
+      reclaimable: {
+        orphans: { count: 3, bytes: 512 * 1024 },
+        expired: { count: 12, bytes: 96 * 1024 * 1024 },
+        total: { count: 15, bytes: 96 * 1024 * 1024 + 512 * 1024 },
+        permanent: false,
+        protectedByRecentAnalysis: { count: 2, bytes: 1024 },
+        note: '按保留 30 天计算：12 个超期原文（100663296 字节）可回收；另有 2 个原文文件虽已超期，但因仍在保留期内被分析/查看引用而保留。',
+      },
+    });
+    check(html2.includes('超期 12 个'), '设了保留期时应显示可回收的超期条数');
+    check(html2.includes('孤儿 3 个'), '设了保留期时应显示可回收的孤儿条数');
+    check(html2.includes('被分析/查看引用而保留'), '应说明有文件因近期引用被保护（这是"不会误删"的界面交代）');
+  } finally {
+    globalThis.__forceResponses = undefined;
+  }
 });
 
 await step('错误提示：Google API 未启用时给出可点击的启用链接', async () => {

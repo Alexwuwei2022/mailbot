@@ -649,42 +649,198 @@ function dirSize(dir, filter = () => true) {
 }
 
 /**
+ * 递归统计目录占用（含子目录）。
+ *
+ * 为什么要它：清理结果必须能回答"整个 data 目录从多大变成多大"。
+ * 只报 `raw/` 是不够的——用户问的是"省下了多少空间"，
+ * 而 `data/` 里还有 reports / attachments / tls / state.json / audit.jsonl。
+ */
+function dirSizeDeep(dir) {
+  let bytes = 0;
+  let count = 0;
+  const walk = (d) => {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(d, { withFileTypes: true });
+    } catch {
+      return; /* 目录不存在或没权限：当作 0，不影响其它统计 */
+    }
+    for (const e of entries) {
+      const full = path.join(d, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      try {
+        bytes += fs.statSync(full).size;
+        count += 1;
+      } catch {
+        /* 刚好被删掉，忽略 */
+      }
+    }
+  };
+  walk(dir);
+  return { bytes, count };
+}
+
+/**
+ * 每份原文对应的「最近活动时间」：指向它的分析记录里最新的 `analyzedAt`
+ * （老记录没有 `analyzedAt` 时退回邮件日期）。
+ *
+ * 这是"仍被近期分析引用"的判据来源，见 `planRawCleanup`。
+ * 返回 `前缀 → 毫秒时间戳`；前缀的含义与 `rawPrefix` 一致，**同时也是"有没有主"的判据**。
+ */
+function analysisActivity() {
+  const map = new Map();
+  for (const a of Object.values(getState().analyses || {})) {
+    if (!a) continue;
+    const pre = rawPrefix(a.folder, a.uid);
+    const t = Date.parse(a.analyzedAt || '') || Date.parse(a.mail?.date || '') || 0;
+    if (!(map.get(pre) >= t)) map.set(pre, t);
+  }
+  return map;
+}
+
+/**
+ * 规划一次原文清理：哪些删、哪些留、各为什么。**只读，不删任何文件。**
+ *
+ * ## 判据（一个 `.eml` 算不算"过期"）
+ *
+ * 取下面两者中**较新**的那个作为它的"年龄"：
+ *   1. 文件自己的 `mtimeMs`（归档/回连重取的时间）；
+ *   2. 指向它的分析记录里最新的 `analyzedAt`（程序最近一次处理这封邮件的时间）。
+ *
+ * **只要其中之一在保留期内，就保留。**
+ *
+ * 为什么不能只看 mtime：时间戳会骗人（手工改过、从备份复制、重新分析时原文读取失败
+ * 但结论已更新、回连重取落在另一个文件名上）。分析记录才是"程序最近还在引用这封邮件"
+ * 的真实证据。判据刻意偏保守：**少删一个只多占几 MB，误删一个就永久失去原文**
+ * （邮件已被服务器删除时连回源都拿不回来）。
+ *
+ * 另外，没有任何分析记录指向的"孤儿"文件仍然照旧处理（`includeOrphans` 控制）：
+ * 它们本来就没有任何界面入口，删了不影响可查询的历史。
+ */
+export function planRawCleanup({ includeOrphans = true, retentionDays = 0, now = Date.now() } = {}) {
+  const p = getPaths();
+  const asked = Number(retentionDays);
+  const days = Number.isFinite(asked) && asked > 0 ? Math.floor(asked) : 0;
+  const cutoff = days > 0 ? now - days * 86_400_000 : null;
+  const owners = analysisActivity();
+  const raw = dirSize(p.rawDir, (n) => n.endsWith('.eml'));
+
+  const files = [];
+  for (const name of raw.names) {
+    if (!name.endsWith('.eml')) continue;
+    const full = path.join(p.rawDir, name);
+    let st = null;
+    try {
+      st = fs.statSync(full);
+    } catch {
+      continue; /* 期间被删掉了 */
+    }
+    /*
+     * 有主 = 有分析记录指向。用前缀匹配（文件名里那段 Message-ID 哈希调用方不一定知道），
+     * 理论上多个前缀可能同时命中（不同文件夹被规范化成同一个安全名），取**最新**的那个：
+     * 宁可判成"有主且很新"而保留，也不要因为取到旧记录而误删。
+     */
+    let ownerAt = null;
+    for (const [pre, t] of owners) {
+      if (!name.startsWith(pre)) continue;
+      if (ownerAt === null || t > ownerAt) ownerAt = t;
+    }
+    const activityAt = Math.max(st.mtimeMs, ownerAt || 0);
+
+    let decision = 'keep';
+    let reason = 'fresh';
+    if (ownerAt === null) {
+      if (includeOrphans) {
+        decision = 'delete';
+        reason = 'orphan';
+      } else {
+        reason = 'orphan-kept';
+      }
+    } else if (cutoff === null) {
+      reason = 'permanent'; /* 永久保留：不按时间删任何有主原文 */
+    } else if (activityAt < cutoff) {
+      decision = 'delete';
+      reason = 'expired';
+    } else if (st.mtimeMs < cutoff) {
+      reason = 'recent-analysis'; /* 文件旧，但分析记录在保留期内 → 保护 */
+    }
+
+    files.push({ name, full, size: st.size, mtimeMs: st.mtimeMs, ownerAt, activityAt, decision, reason });
+  }
+
+  const sum = (list) => ({ count: list.length, bytes: list.reduce((s, f) => s + f.size, 0) });
+  const deleted = files.filter((f) => f.decision === 'delete');
+  const byReason = (why) => sum(files.filter((f) => f.reason === why));
+
+  return {
+    /** 实际生效的保留天数（0 = 永久保留） */
+    retentionDays: days,
+    cutoff,
+    permanent: cutoff === null,
+    files,
+    willDelete: {
+      orphans: byReason('orphan'),
+      expired: byReason('expired'),
+      total: sum(deleted),
+    },
+    kept: sum(files.filter((f) => f.decision === 'keep')),
+    protectedByRecentAnalysis: byReason('recent-analysis'),
+    orphanKept: byReason('orphan-kept'),
+    rawTotal: { count: raw.count, bytes: raw.bytes },
+  };
+}
+
+/**
  * 存储占用体检。
  *
  * `orphan*` 是重点：**没有任何分析记录指向的归档原文**。
  * 它们已经没有任何入口能访问（列表里找不到记录就点不进去），却一直占着磁盘——
  * 因为 `persistState` 的容量收敛只删 `state.json` 里的条目，**从不动原文文件**。
+ *
+ * `reclaimable` 回答"现在点清理能省多少"：判据与真正删除时**共用** `planRawCleanup`，
+ * 否则"显示 40 MB 可回收、真删却只删了 2 MB"这种事迟早会发生。
  */
 export function storageStats() {
   const p = getPaths();
   const s = getState();
-  const prefixes = new Set(Object.values(s.analyses || {}).map((a) => rawPrefix(a.folder, a.uid)));
-  const raw = dirSize(p.rawDir, (n) => n.endsWith('.eml'));
-  let orphanBytes = 0;
-  let orphanCount = 0;
-  for (const name of raw.names) {
-    if (!name.endsWith('.eml')) continue;
-    const owned = [...prefixes].some((pre) => name.startsWith(pre));
-    if (owned) continue;
-    try {
-      orphanBytes += fs.statSync(path.join(p.rawDir, name)).size;
-      orphanCount += 1;
-    } catch {
-      /* ignore */
-    }
-  }
+  const rawDays = rawRetentionDays();
+  const plan = planRawCleanup({ includeOrphans: true, retentionDays: rawDays });
+  // 原文总数直接取规划时那一遍扫描的结果，避免同一目录走两次、也保证与"可回收"口径一致
+  const raw = plan.rawTotal;
   const reports = dirSize(p.reportsDir, (n) => n.endsWith('.md'));
   const audit = dirSize(p.dataDir, (n) => n === 'audit.jsonl');
   const stateFile = dirSize(p.dataDir, (n) => n.startsWith('state.json'));
+  const orphans = plan.willDelete.orphans;
+  const expired = plan.willDelete.expired;
   return {
     raw: { count: raw.count, bytes: raw.bytes },
-    orphan: { count: orphanCount, bytes: orphanBytes },
+    orphan: { count: orphans.count, bytes: orphans.bytes },
     reports: { count: reports.count, bytes: reports.bytes },
     audit: { count: audit.count, bytes: audit.bytes },
     state: { count: stateFile.count, bytes: stateFile.bytes },
+    /** 整个 data 目录（含子目录）的合计占用 */
+    total: dirSizeDeep(p.dataDir),
+    /**
+     * 可回收空间。**保留期天数 = 0 时，expired 必然为 0**，
+     * 界面据此明说"保留期清理不会删除任何原文"，而不是给一个含糊的 0。
+     */
+    reclaimable: {
+      orphans,
+      expired,
+      total: plan.willDelete.total,
+      permanent: rawDays === 0,
+      protectedByRecentAnalysis: plan.protectedByRecentAnalysis,
+      note:
+        rawDays === 0
+          ? `当前为永久保留（归档原文保留天数 = 0），保留期清理不会删除任何原文；可回收的只有 ${orphans.count} 个孤儿文件（没有任何分析记录指向，删了不影响任何可查询的历史）。`
+          : `按保留 ${rawDays} 天计算：${expired.count} 个超期原文（${expired.bytes} 字节）可回收；另有 ${plan.protectedByRecentAnalysis.count} 个原文文件虽已超期，但因仍在保留期内被分析/查看引用而保留。`,
+    },
     analyses: Object.keys(s.analyses || {}).length,
     drafts: (s.drafts || []).length,
-    retention: { maxAnalyses: maxAnalysesLimit(), rawDays: rawRetentionDays() },
+    retention: { maxAnalyses: maxAnalysesLimit(), rawDays },
   };
 }
 
@@ -712,41 +868,68 @@ export function maxAnalysesLimit() {
  *      但邮件已被删除或超出服务器保留期时，就**彻底查不到了**。
  *
  * 只动 `data/raw/*.eml`，绝不碰 `state.json`/`reports`/`audit.jsonl`——那三样才是"历史记录"本身。
+ *
+ * **释放量口径**：`bytes`（= `freedBytes`）是**逐个文件 `stat.size` 累加**得到的精确字节数，
+ * 只统计**确实被 `unlink` 成功**的文件；失败的一个字节都不算进去。
+ * 界面上的 MB/GB 只是它的展示形式，绝不反过来用展示值当结论。
+ * "哪些该删"完全交给 `planRawCleanup`（与 `/api/storage` 的"可回收空间"同一份判据）。
  */
 export function cleanupRawArchives({ includeOrphans = true, retentionDays = 0, now = Date.now() } = {}) {
-  const p = getPaths();
-  const s = getState();
-  const keep = new Set(Object.values(s.analyses || {}).map((a) => rawPrefix(a.folder, a.uid)));
-  const cutoff = retentionDays > 0 ? now - retentionDays * 86_400_000 : null;
-  const raw = dirSize(p.rawDir, (n) => n.endsWith('.eml'));
-  const removed = { orphans: 0, expired: 0, bytes: 0, kept: 0, failed: 0 };
-  for (const name of raw.names) {
-    if (!name.endsWith('.eml')) continue;
-    const full = path.join(p.rawDir, name);
-    const owned = [...keep].some((pre) => name.startsWith(pre));
-    let st = null;
+  const plan = planRawCleanup({ includeOrphans, retentionDays, now });
+  const out = {
+    orphans: 0,
+    expired: 0,
+    bytes: 0,
+    kept: plan.kept.count,
+    failed: 0,
+    /** 被删文件个数（孤儿 + 超期），与界面文案里的"已删除 N 个"一一对应 */
+    deletedCount: 0,
+    /** 精确释放字节数；`bytes` 的别名，名字更直白，两者永远相等 */
+    freedBytes: 0,
+    /** 没删的文件数（保留 + 删除失败），与 deletedCount 相加等于扫描到的原文总数 */
+    skipped: 0,
+    skippedReasons: {
+      /** 仍在保留期内的有主原文 */
+      freshInRetention: 0,
+      /** 永久保留（保留天数 = 0）下不按时间删的有主原文 */
+      permanentRetention: 0,
+      /** 文件已超期，但分析记录在保留期内 → 主动保护 */
+      protectedByRecentAnalysis: plan.protectedByRecentAnalysis.count,
+      /** 孤儿但调用方明确要求保留 */
+      orphanKept: plan.orphanKept.count,
+      /** 删除失败 */
+      failed: 0,
+    },
+    /** 逐条失败原因（供界面/日志如实汇报，不吞掉） */
+    failures: [],
+    /** 文件已超期、但因分析记录仍在保留期内而被**主动保护**的数量与字节 */
+    protectedByRecentAnalysis: plan.protectedByRecentAnalysis.count,
+    protectedBytes: plan.protectedByRecentAnalysis.bytes,
+    retentionDays: plan.retentionDays,
+    permanent: plan.permanent,
+  };
+
+  for (const f of plan.files) {
+    if (f.decision !== 'delete') continue;
     try {
-      st = fs.statSync(full);
-    } catch {
-      continue;
-    }
-    const isOrphan = !owned;
-    const isExpired = cutoff !== null && st.mtimeMs < cutoff;
-    if ((includeOrphans && isOrphan) || (cutoff !== null && isExpired && owned)) {
-      try {
-        fs.unlinkSync(full);
-        if (isOrphan) removed.orphans += 1;
-        else removed.expired += 1;
-        removed.bytes += st.size;
-      } catch (err) {
-        removed.failed += 1;
-        log.warn(`删除归档原文失败（${name}）：${err?.message || err}`);
-      }
-    } else {
-      removed.kept += 1;
+      fs.unlinkSync(f.full);
+      if (f.reason === 'orphan') out.orphans += 1;
+      else out.expired += 1;
+      out.bytes += f.size;
+    } catch (err) {
+      out.failed += 1;
+      out.failures.push({ name: f.name, bytes: f.size, message: err?.message || String(err) });
+      log.warn(`删除归档原文失败（${f.name}）：${err?.message || err}`);
     }
   }
-  return removed;
+
+  out.deletedCount = out.orphans + out.expired;
+  out.freedBytes = out.bytes;
+  out.skippedReasons.freshInRetention = plan.files.filter((f) => f.reason === 'fresh').length;
+  out.skippedReasons.permanentRetention = plan.files.filter((f) => f.reason === 'permanent').length;
+  out.skippedReasons.failed = out.failed;
+  out.skipped = plan.kept.count + out.failed;
+  return out;
 }
 
 /**
@@ -826,25 +1009,20 @@ export function readReportFile(file) {
 
 /* ------------------------------------------------------------ 清理 */
 
-/** 清理超过 days 天的原文归档。 */
+/**
+ * 清理超过 `days` 天的原文归档（返回删除的文件个数）。
+ *
+ * 保留这个旧入口只为兼容，但**判定一律走 `cleanupRawArchives`**：
+ * 早先这里只看 `mtime` 就 `unlink`，既不认"还有分析记录指向"、也不认
+ * "最近的引用"，等于给"误删仍被引用的原文"留了第二个入口。
+ * 现在它与界面上的清理共用同一份判据（含"被近期分析引用则保留"）。
+ */
 export function pruneRawFiles(days = 14) {
   const p = getPaths();
   if (!fs.existsSync(p.rawDir)) return 0;
-  const cutoff = Date.now() - days * 86_400_000;
-  let removed = 0;
-  for (const name of fs.readdirSync(p.rawDir)) {
-    const file = path.join(p.rawDir, name);
-    try {
-      if (fs.statSync(file).mtimeMs < cutoff) {
-        fs.unlinkSync(file);
-        removed += 1;
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  if (removed) log.info(`清理了 ${removed} 个过期邮件归档`);
-  return removed;
+  const out = cleanupRawArchives({ includeOrphans: true, retentionDays: days });
+  if (out.deletedCount) log.info(`清理了 ${out.deletedCount} 个过期邮件归档（释放 ${out.freedBytes} 字节）`);
+  return out.deletedCount;
 }
 
 export function stateSummary() {
