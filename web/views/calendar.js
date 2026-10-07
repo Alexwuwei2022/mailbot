@@ -85,15 +85,18 @@ export function renderCalendar(root, app) {
     }
     if (state.error) {
       /*
-       * 授权类错误（令牌被撤销 / 从未连接）**不能只给「重试」**：
-       * 重试一百次也没用，唯一出路是重新授权。所以这里直接把那个按钮摆出来，
+       * 授权类错误（令牌被撤销 / 从未连接 / **保管库读不出来**）**不能只给「重试」**：
+       * 重试一百次也没用，唯一出路是重新授权（或先修保管库）。所以这里直接把那个按钮摆出来，
        * 并说明最可能的原因（测试状态下 refresh token 只有 7 天）。
        */
+      const vaultBroken = state.errorCode === 'GOOGLE_TOKEN_VAULT_ERROR' || state.errorCode === 'GOOGLE_TOKEN_VAULT_DECODE_FAILED';
       const authBroken =
         state.errorCode === 'OAUTH_REFRESH_REVOKED' ||
         state.errorCode === 'OAUTH_REFRESH_FAILED' ||
         state.errorCode === 'OAUTH_NO_REFRESH_TOKEN' ||
-        state.errorCode === 'GOOGLE_NOT_CONNECTED';
+        state.errorCode === 'GOOGLE_NOT_CONNECTED' ||
+        vaultBroken ||
+        state.errorCode === 'GOOGLE_TOKEN_FILE_CORRUPT';
       mount(
         container,
         h(
@@ -106,9 +109,12 @@ export function renderCalendar(root, app) {
             ? h(
                 'p',
                 { class: 'muted small' },
-                '这是授权过期，不是配置错——代理、OAuth 凭据都不用动。点上面的按钮重新授权一次即可。' +
-                  '最常见的原因是 OAuth 同意屏幕仍处于「测试」发布状态：**测试状态下 refresh token 只有 7 天有效期**，' +
-                  '到期就必须重新授权；把发布状态改为「已发布」即可免去这个周期。',
+                vaultBroken
+                  ? '这不是 Google 那边的问题，而是**本机的令牌保管库读不出来**（换机器/换系统账户后常见）。' +
+                    '可以重新授权一次，或到「设置 → 密钥存储」检查保管库、必要时点「迁回明文」。'
+                  : '这是授权过期，不是配置错——代理、OAuth 凭据都不用动。点上面的按钮重新授权一次即可。' +
+                    '最常见的原因是 OAuth 同意屏幕仍处于「测试」发布状态：**测试状态下 refresh token 只有 7 天有效期**，' +
+                    '到期就必须重新授权；把发布状态改为「已发布」即可免去这个周期。',
               )
             : null,
           h(
@@ -212,6 +218,23 @@ export function renderCalendar(root, app) {
       h(
         'div',
         { class: 'setup-inner' },
+        /*
+         * 令牌存在却读不出来（保管库换了机器/账户解不开、文件被写坏）时，
+         * 界面必须把**原因**说出来，否则用户看到"未连接"只会以为自己从没连过。
+         */
+        status.tokenError
+          ? h(
+              'div',
+              { class: 'alert alert-warn block-lead' },
+              h('div', {}, h('b', { text: '令牌读不出来，日历暂时不可用。' })),
+              h(
+                'div',
+                { class: 'small mt-1' },
+                `错误码 ${status.tokenError.code}：${status.tokenError.message} ` +
+                  '到「设置 → 密钥存储」可以看它现在被放在哪里；必要时点「迁回明文」或重新授权一次。',
+              ),
+            )
+          : null,
         /*
          * 授权失效要走**和"从未授权"不同的话术**：
          * 配置全都是对的，让用户去翻 OAuth 凭据只会白折腾。

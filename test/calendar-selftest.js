@@ -3302,11 +3302,17 @@ await test('HTTP：/api/secrets 能报告密钥在哪，且迁移未确认时一
     for (const item of s.items) {
       assert(item.label, '每项应有名称');
       assert(
-        ['config', 'envFile', 'envReal', 'vault', 'none'].includes(item.location),
+        // fileToken 是 Google 令牌专用的位置：它不在配置里，而是 data/google-token.json
+        ['config', 'envFile', 'envReal', 'vault', 'fileToken', 'none'].includes(item.location),
         `位置取值应可识别（实际 ${item.location}）`,
       );
     }
     assert(typeof s.plaintextCount === 'number', '应给出明文残留数量');
+    // Google 令牌必须单独有一项（本次把它纳入了保管库），且报告能回答"它在哪"
+    const tokenItem = (s.items || []).find((i) => i.key === 'googleToken');
+    assert(tokenItem, '报告里必须单独列出 Google 刷新令牌这一项');
+    assert(typeof tokenItem.inVault === 'boolean' || s.token, '报告要能回答"Google 令牌纳入保管没有"');
+    assert(s.token && typeof s.token.inVault === 'boolean', 's.token.inVault 必须存在（界面据此显示状态）');
 
     // 迁移/迁回都会改配置文件：没有 confirm 必须拒绝（428）
     const noConfirm = await fetch(`${url}/api/secrets/migrate`, {

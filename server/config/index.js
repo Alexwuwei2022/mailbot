@@ -13,18 +13,29 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { AppError, clampNumber, log } from '../lib/util.js';
 import { DEFAULTS } from './defaults.js';
+/*
+ * 令牌存储模块。它只依赖 lib/util.js（不反向依赖本模块），所以这里是静态 import，
+ * 不存在模块环：它需要的东西由下面的 `configure(...)` 在运行时注入。
+ */
+import * as tokenStore from '../calendar/google-token.js';
+import { TOKEN_FILE_NAME } from '../calendar/google-token.js';
 import {
+  applyExternalSecrets,
   applyToConfig,
   autoDecision,
+  clearExternalSecrets,
   clearVault,
+  collectExternalSecrets,
   collectFromConfig,
   decodeVault,
   encodeVault,
+  externalSecretStatus,
   listBackends,
   readVault,
   resetVaultCache,
   resolveMode,
   SECRET_SLOTS,
+  setExternalSecretIO,
   stripFromConfig,
   writeVault,
 } from '../lib/secrets.js';
@@ -454,7 +465,109 @@ export function loadConfig({ rootDir, force = false } = {}) {
 
   cached = finalConfig;
   cachedRoot = root;
+  /*
+   * 令牌存储的接线放在这里（每次加载都执行一次，幂等）：
+   * 模块顶层做不了——`tokenStoreDepsFor` 等常量那时还在 TDZ 里；
+   * 而令牌模块刻意不反向 import 本模块，只能靠注入拿到"取配置/读写保管库"这几件事。
+   */
+  installTokenStoreDeps();
+  tokenStore.configure(tokenStoreDepsFor);
   return finalConfig;
+}
+
+/* ------------------------------------------------------------ Google 令牌存储的接线 */
+
+/**
+ * 令牌存储模块（`server/calendar/google-token.js`）需要几件事：取配置、取路径、
+ * 读/写保管库。它**刻意不 import 本模块**（否则就是 config ↔ calendar 的模块环），
+ * 改由这里注入——`loadConfig()` 每次加载都会接一次线（幂等），
+ * 所以任何真实调用路径上它都已经接好。
+ *
+ * 注意注入的都是**取值即用**的函数（不是 import 时求值），所以即使某次加载
+ * 恰好处在中间状态，也只是那一次拿不到数据，令牌模块会如实报"存储不可用"，
+ * 而不会把"读不出来"当成"没有令牌"。
+ */
+const tokenStoreDepsFor = {
+  getConfig,
+  getRoot: () => cachedRoot || resolveRoot(),
+  resolveMode,
+  dataDirOf,
+  readVault,
+  writeVault,
+  resetVaultCache,
+  encodeVault,
+  decodeVault,
+  listBackends,
+  readDiskVault,
+};
+
+function installTokenStoreDeps() {
+  setExternalSecretIO({
+    googleToken: {
+      /** 迁移时读明文令牌原值（没有就返回 null，不会抛） */
+      read: () => {
+        try {
+          const res = tokenStore.readTokenFile();
+          return res.ok && res.token ? JSON.stringify(res.token) : null;
+        } catch (err) {
+          log.warn(`读取 Google 令牌失败（将跳过该项迁移）：${err?.message || err}`);
+          return null;
+        }
+      },
+      /** 迁回明文：**只在原处没有内容时才写**，绝不用过期副本覆盖仍有效的令牌 */
+      write: (value) => {
+        try {
+          return tokenStore.writeTokenFile(value);
+        } catch (err) {
+          return { ok: false, error: err?.message || String(err), code: err?.code || null };
+        }
+      },
+      /** 迁移成功后清掉明文令牌文件 */
+      clear: () => {
+        try {
+          return tokenStore.removeTokenFile();
+        } catch (err) {
+          return { ok: false, error: err?.message || String(err), code: err?.code || null };
+        }
+      },
+      /** 上报用：令牌现在到底在哪 */
+      verify: () => {
+        try {
+          return tokenStore.tokenStatus();
+        } catch (err) {
+          return { location: 'unknown', error: err?.message || String(err), errorCode: err?.code || null, requiresReauth: true };
+        }
+      },
+      /**
+       * 保管库是否已经掌握这个令牌（= 迁移真的搬过它）。
+       *
+       * 只有为真时「保存配置」才允许把明文令牌搬进保管库并清掉原文件——
+       * 否则就是用一份可能过期的副本替换仍然有效的令牌。
+       */
+      managed: () => {
+        try {
+          return tokenStore.tokenManagedByVault();
+        } catch {
+          return false;
+        }
+      },
+    },
+  });
+}
+
+/**
+ * 从**磁盘上**的 config.json 读 vault 配置。
+ *
+ * 为什么不直接用内存里的 `getConfig().vault`：内存值可能已经被界面改过但还没落盘，
+ * 而"是否已经进入保管库托管"决定了**能不能删掉明文令牌文件**——
+ * 这种判断必须依据已经落盘的事实，宁可保守（没读到就当没托管）。
+ */
+export function readDiskVault() {
+  const config = getConfig();
+  const root = cachedRoot || resolveRoot();
+  const disk = readDiskConfig(pathsFor(config, root).configFile);
+  const mode = disk?.vault?.mode || 'config';
+  return { configured: mode !== 'config', mode };
 }
 
 /**
@@ -582,18 +695,39 @@ export function saveConfig(patch = {}) {
    *      一次保存就把它们抄进保管库（或抄进 config.json）都不对。
    */
   const secretsMode = current.vault?.mode || 'config';
-  if (secretsMode !== 'config') {
+  if (secretsMode !== 'config' && readDiskVault().configured) {
     const resolved = resolveMode(secretsMode);
     // 保存配置时两类环境变量来源都排除：那是用户刻意放在环境里的，不该被"顺手搬走"
     const skip = envProvidedSlots();
     const secrets = collectFromConfig(next, { exclude: skip });
-    if (Object.keys(secrets).length) {
-      const res = writeVault(resolved, { dataDir: dataDirOf(current, root) }, encodeVault(secrets));
+    /*
+     * Google 令牌不在配置里（它在 data/google-token.json），同样按"写成功才抹明文"处理：
+     * `applyExternalSecrets` 只搬"保管库已经掌握"的项，搬完才由 `clearExternalSecrets`
+     * 清掉原文件；任何一步失败都保留原文件（见 google-token.js 的 writeToken 注释）。
+     */
+    const external = collectExternalSecrets({ exclude: skip });
+    const externalValues = { ...external.secrets };
+    const problems = [...external.problems];
+    if (Object.keys(externalValues).length) {
+      const ext = applyExternalSecrets(externalValues);
+      problems.push(...ext.problems);
+      if (!ext.applied) for (const key of Object.keys(externalValues)) delete externalValues[key];
+    }
+    const total = Object.keys(secrets).length + Object.keys(externalValues).length;
+    if (total) {
+      const payload = { ...secrets };
+      for (const key of Object.keys(externalValues)) payload[key] = externalValues[key];
+      const res = writeVault(resolved, { dataDir: dataDirOf(current, root) }, encodeVault(payload));
       if (res.ok) {
         stripFromConfig(next);
+        const cleaned2 = clearExternalSecrets(externalValues);
+        problems.push(...cleaned2.problems);
       } else {
         log.warn(`密钥写不进保管库（${res.error}）；本次仍以明文写入配置文件，密钥没有丢`);
       }
+    }
+    for (const problem of problems) {
+      log.warn(`密钥未能纳入保管库（${problem.key}）：${problem.message}`);
     }
   }
 
@@ -803,7 +937,38 @@ export function secretsReport() {
     items.push({ key: slot.key, label: slot.label, location: locOf(slot.key), set: !!value });
   }
 
-  const plaintext = items.filter((i) => i.set && (i.location === 'config' || i.location === 'envFile' || i.location === 'envReal'));
+  /*
+   * Google 刷新令牌单独列一项（它不在配置里，`locOf` 那套口径回答不了"文件还在不在"）。
+   * 这是"如实报告"的落点：它现在在保管库、还是仍是 600 权限的明文、还是干脆没有，
+   * 以及**是否加密**、**是否需要重新授权**，都必须一句话说清。
+   */
+  const token = externalSecretStatus().googleToken || { location: 'unknown' };
+  const tokenLabel = SECRET_SLOTS.find((s) => s.key === 'googleToken')?.label || 'Google 刷新令牌';
+  /** 报告里统一口径的位置名：保管库 / 明文令牌文件 / 没有 */
+  const tokenLocation = token.location === 'vault' ? 'vault' : token.set ? 'fileToken' : token.location || 'none';
+  const tokenItem = {
+    key: 'googleToken',
+    label: tokenLabel,
+    location: tokenLocation,
+    set: !!token.set,
+    encrypted: !!token.encrypted,
+    external: true,
+    backend: token.backend || null,
+    error: token.error || null,
+    errorCode: token.errorCode || null,
+    requiresReauth: !!token.requiresReauth,
+    plaintextFile: !!token.plaintextFile,
+    note: token.note || null,
+  };
+  items.push(tokenItem);
+
+  const plaintext = items.filter((i) => i.set && (i.location === 'config' || i.location === 'envFile' || i.location === 'envReal' || i.location === 'fileToken'));
+  /*
+   * 关键结论：Google 令牌到底纳入保管没有。
+   * 只看 `location === 'vault'`：`fileToken` 才是"没纳入"，而"纳入了但这次读不出来"
+   * 仍然算已纳入（含糊成"未纳入"会误导用户去搬家，而问题其实在保管库本身）。
+   */
+  const tokenInVault = tokenLocation === 'vault';
   return {
     mode,
     resolved,
@@ -819,19 +984,49 @@ export function secretsReport() {
     lastLoad: vaultStatus(),
     items,
     plaintextCount: plaintext.length,
-    /** 还没纳入保管的敏感文件（如实列出，不含糊） */
-    notCovered: fs.existsSync(path.join(p.dataDir, 'google-token.json'))
-      ? ['Google 刷新令牌仍存在 data/google-token.json（文件权限 600，尚未纳入保管库）']
-      : [],
+    /** Google 刷新令牌的详细口径 */
+    token: {
+      ...tokenItem,
+      rawLocation: token.location || null,
+      label: tokenLabel,
+      key: 'googleToken',
+      /** 是否已纳入保管库（不再有"未纳入"这种含糊说法） */
+      inVault: tokenInVault,
+    },
+    /** 还没纳入保管的敏感项（如实列出；令牌已在保管库时这里必须是空的） */
+    notCovered: notCoveredList({ tokenInVault, token: { ...tokenItem, rawLocation: token.location }, tokenLabel, diskVault: readDiskVault() }),
   };
+}
+
+/** 列出"还没被保管库覆盖"的敏感项。空数组就是"全部覆盖"。 */
+function notCoveredList({ tokenInVault, token, tokenLabel, diskVault }) {
+  if (tokenInVault) return [];
+  if (token.set && token.location === 'fileToken') {
+    const where = `data/${TOKEN_FILE_NAME}（文件权限 600）`;
+    return [
+      diskVault.configured
+        ? `${tokenLabel}仍在 ${where}明文存放（保管库还没搬走它：到「密钥存储」点一次「迁入」即可）`
+        : `${tokenLabel}在 ${where}明文存放（尚未纳入保管库；到「密钥存储」点「迁入」可搬进系统保管）`,
+    ];
+  }
+  if (token.location === 'vault' && token.error) {
+    return [`${tokenLabel}在保管库里，但**读不出来**：${token.errorCode || ''} —— 修好保管库后重试，或重新授权`];
+  }
+  if (token.location === 'fileToken' && token.error) {
+    return [`${tokenLabel}存在但无法使用：${token.errorCode || ''}`];
+  }
+  return [];
 }
 
 /**
  * 把明文密钥迁进保管库。
  *
  * 顺序是刻意的，**任何一步失败都不会留下半个状态**：
- *   ①收集 → ②写保管库 → ③**读回逐项比对** → ④比对通过才动配置文件（清空 + 写 mode + 清 .env 的值）
- * 步骤 ①②③ 失败时配置文件**一个字节都没改**；④之后才真正"搬走"。
+ *   ①收集 → ②写保管库 → ③**读回逐项比对** → ④比对通过才动明文（清空配置 + 删掉明文令牌文件 + 清 .env 的值）
+ * 步骤 ①②③ 失败时明文文件**一个字节都没改**；④之后才真正"搬走"。
+ *
+ * 这一点对 Google 刷新令牌尤其要紧：弄丢它 = 用户必须重新授权一次，
+ * 所以"写失败/读回不一致时绝不抹明文"在这里同样是硬约束（见 google-token.js）。
  */
 export function migrateSecrets({ mode = 'auto' } = {}) {
   const config = getConfig();
@@ -855,13 +1050,20 @@ export function migrateSecrets({ mode = 'auto' } = {}) {
   const fileEnvSlots = envProvidedSlots({ onlyFile: true });
   const realEnvOnly = new Set([...envProvidedSlots()].filter((s) => !fileEnvSlots.has(s)));
   const secrets = collectFromConfig(config, { exclude: realEnvOnly });
-  if (!Object.keys(secrets).length) {
+  // Google 刷新令牌不在配置里，单独收集（读不出来时只记警告、跳过该项，不阻断其它密钥的迁移）
+  const external = collectExternalSecrets();
+  const externalValues = { ...external.secrets };
+  for (const problem of external.problems) log.warn(`读取外部密钥失败（本次不迁移该项）：${problem.key} — ${problem.message}`);
+  const payload = { ...secrets };
+  for (const key of Object.keys(externalValues)) payload[key] = externalValues[key];
+
+  if (!Object.keys(payload).length) {
     throw new AppError('没有可迁移的密钥（授权码 / API Key 都还没填）', { code: 'SECRETS_NOTHING_TO_MIGRATE', status: 400 });
   }
 
   // ② 写入保管库（失败即中止，不动任何文件）
   const dataDir = dataDirOf(config, root);
-  const written = writeVault(resolved, { dataDir }, encodeVault(secrets));
+  const written = writeVault(resolved, { dataDir }, encodeVault(payload));
   if (!written.ok) {
     throw new AppError(`写入保管库失败，未改动任何配置：${written.error}`, { code: 'SECRETS_WRITE_FAILED', status: 500 });
   }
@@ -874,8 +1076,12 @@ export function migrateSecrets({ mode = 'auto' } = {}) {
     throw new AppError(`保管库写进去了却读不回来，已回滚：${readBack.error}`, { code: 'SECRETS_VERIFY_FAILED', status: 500 });
   }
   const decoded = decodeVault(readBack.data);
-  const mismatch = Object.keys(secrets).filter((k) => decoded.secrets?.[k] !== secrets[k]);
+  const mismatch = Object.keys(payload).filter((k) => decoded.secrets?.[k] !== payload[k]);
   if (!decoded.ok || mismatch.length) {
+    /*
+     * 绝不在这里动明文：令牌文件与配置文件都保持原样（`clearVault` 只清保管库里写坏的那份）。
+     * 这也是"宁可不迁也不能弄丢 refresh token"的落点——用户最多重新点一次迁移。
+     */
     clearVault(resolved, { dataDir });
     throw new AppError(`保管库内容校验不一致（${mismatch.join('、') || decoded.error}），已回滚，密钥仍在原处`, {
       code: 'SECRETS_VERIFY_FAILED',
@@ -892,17 +1098,42 @@ export function migrateSecrets({ mode = 'auto' } = {}) {
     // 顺带把 .env 里那些**确实由文件提供**的密钥清空（键名保留，加注释说明为什么是空的）
     const envResult = blankEnvSecrets(root, envFromFile);
     atomicWriteJson(p.configFile, next);
+    /*
+     * 明文令牌文件也在这里清掉。**必须放在保管库读回比对之后**，
+     * 并且只在它确实被搬走（externalValues 里有它）时才删。
+     */
+    const clearedExternal = clearExternalSecrets(externalValues);
+    for (const problem of clearedExternal.problems) {
+      log.warn(`保管库已存好但没能清掉明文令牌（${problem.key}）：${problem.message}——请手动检查 data/${TOKEN_FILE_NAME}`);
+    }
     resetVaultCache();
     cached = null;
     loadConfig({ force: true, rootDir: root });
     onConfigReload?.();
+    const migrated = Object.keys(payload).length;
+    const tokenMoved = Object.keys(externalValues).includes('googleToken');
+    const envCleared = envResult.cleared;
     return {
       ok: true,
       backend: resolved,
-      migrated: Object.keys(secrets).length,
-      items: Object.keys(secrets),
-      envCleared: envResult.cleared,
-      message: `已把 ${Object.keys(secrets).length} 项密钥迁到「${backend.label}」`,
+      migrated,
+      items: Object.keys(payload),
+      envCleared,
+      /** 这次迁移对 Google 令牌做了什么（设置页据此如实汇报，不让用户猜） */
+      token: {
+        key: 'googleToken',
+        moved: tokenMoved,
+        location: tokenMoved ? 'vault' : external.problems.length ? 'unreadable' : 'none',
+        backend: resolved,
+        encrypted: !!backend.encrypted,
+        /** 换成另一台机器 / 另一个系统账户时，密文解不开 → 需要重新授权 */
+        requiresReauthOnOtherMachine: true,
+      },
+      message:
+        `已把 ${migrated} 项密钥迁到「${backend.label}」` +
+        (tokenMoved ? '（含 Google 刷新令牌，data/google-token.json 的明文已清除）' : '') +
+        (envCleared.length ? `，并清空了 .env 里的 ${envCleared.length} 项` : '') +
+        `。换电脑/换系统账户后保管库解不开：邮箱授权码要重填、Google 日历要重新授权一次`,
     };
   } catch (err) {
     // 走到这一步才可能"改了一半"：尽力把配置文件还原，保管库里的副本保留（多一份总比少一份好）
@@ -917,7 +1148,12 @@ export function migrateSecrets({ mode = 'auto' } = {}) {
   }
 }
 
-/** 从保管库搬回明文（"我不想用它了"的退路）。 */
+/**
+ * 从保管库搬回明文（"我不想用它了"的退路）。
+ *
+ * 外部密钥（Google 令牌）要**写回它原来的文件**，而不是塞进 config.json；
+ * 顺序是"先把令牌放回原处、再改配置文件"，这样即使中途出错也丢不了令牌。
+ */
 export function revertSecrets() {
   const config = getConfig();
   const root = cachedRoot || resolveRoot();
@@ -932,22 +1168,81 @@ export function revertSecrets() {
   if (!Object.keys(secrets).length) {
     throw new AppError('保管库里没有密钥，无需迁回', { code: 'SECRETS_EMPTY_VAULT', status: 400 });
   }
-  // 先写回明文（成功后才清保管库，否则"两边都没有"就真丢了）
+
+  /*
+   * 先校验保管库里的 Google 令牌能不能用：坏数据绝不能拿去覆盖磁盘上仍然有效的令牌。
+   * 出错时**整体中止**（配置文件一个字节都不改），而不是"部分迁回"。
+   */
+  const externalValues = {};
+  for (const slot of SECRET_SLOTS) {
+    if (!slot.external || !secrets[slot.key]) continue;
+    const parsed = safeJson(secrets[slot.key]);
+    if (!parsed) {
+      throw new AppError(`保管库里的 ${slot.label} 已损坏（无法解析），不敢覆盖明文令牌；请直接在 Google 侧重新授权`, {
+        code: 'SECRETS_VAULT_TOKEN_CORRUPT',
+        status: 500,
+      });
+    }
+    externalValues[slot.key] = secrets[slot.key];
+  }
+
+  /*
+   * ① 外部密钥（Google 令牌）先写回原处：失败就整体中止，明文与保管库都还在。
+   *    写成"先外部、后配置"，是为了避免"配置文件说已经改回明文，令牌却还在保管库里"的半成品状态。
+   */
+  const backExternal = applyExternalSecrets(externalValues);
+  if (backExternal.problems.length) {
+    throw new AppError(`迁回失败，保管库未清空（密钥没有丢）：${backExternal.problems.map((x) => `${x.key}：${x.message}`).join('；')}`, {
+      code: 'SECRETS_REVERT_EXTERNAL_FAILED',
+      status: 500,
+    });
+  }
+
+  // ② 再写回配置里的明文（成功后才清保管库，否则"两边都没有"就真丢了）
   const next = { ...readDiskConfig(p.configFile) };
   next.vault = { ...(next.vault || {}), mode: 'config' };
   applyToConfig(next, secrets);
-  atomicWriteJson(p.configFile, next);
+  try {
+    atomicWriteJson(p.configFile, next);
+  } catch (err) {
+    /*
+     * 配置写不进去：此时令牌已经回到明文文件、保管库也还在，功能正常。
+     * 但为了不留"配置文件说没托管、实际还托管着"的错位，尽力把保管库恢复回去；
+     * 恢复失败也只是多一份副本，不影响使用（明文仍是权威）。
+     */
+    try {
+      writeVault(resolved, { dataDir }, encodeVault(secrets));
+      resetVaultCache();
+    } catch {
+      /* 尽力而为 */
+    }
+    throw err;
+  }
   clearVault(resolved, { dataDir });
   resetVaultCache();
   cached = null;
   loadConfig({ force: true, rootDir: root });
   onConfigReload?.();
+  const tokenRestored = Object.keys(externalValues).includes('googleToken');
   return {
     ok: true,
     restored: Object.keys(secrets).length,
-    message: `已把 ${Object.keys(secrets).length} 项密钥写回配置文件（明文），并清空了保管库`,
-    warning: '现在密钥又是明文了：请勿把 config.json 放进网盘 / 提交到代码仓库',
+    token: { key: 'googleToken', restored: tokenRestored, location: tokenRestored ? 'file' : 'none' },
+    message:
+      `已把 ${Object.keys(secrets).length} 项密钥写回明文，并清空了保管库` +
+      (tokenRestored ? `（Google 令牌已放回 data/${TOKEN_FILE_NAME}，权限 600）` : ''),
+    warning: '现在密钥又是明文了：请勿把 config.json / data/google-token.json 放进网盘或提交到代码仓库',
   };
+}
+
+/** 解析 JSON，失败返回 null（不抛：调用方要的是"能不能用"这个判断）。 */
+function safeJson(text) {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**

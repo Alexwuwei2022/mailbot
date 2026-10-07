@@ -1287,7 +1287,8 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
     appendAudit('secrets.migrate', {
       target: result.backend,
       source: '设置页',
-      extra: { migrated: result.migrated, envCleared: result.envCleared },
+      // 只记"搬了几项、有没有把 Google 令牌一起搬走"，**绝不记令牌内容**
+      extra: { migrated: result.migrated, envCleared: result.envCleared, googleTokenMoved: !!result.token?.moved },
     });
     return sendJson(res, 200, { ok: true, ...result, status: secretsReport() });
   }
@@ -1299,7 +1300,12 @@ async function handleApi(req, res, url, actualPort, ctx = {}) {
       throw new AppError('迁回会让密钥重新以明文保存：请传入 confirm=true。', { code: 'CONFIRM_REQUIRED', status: 428 });
     }
     const result = revertSecrets();
-    appendAudit('secrets.revert', { target: 'config.json', source: '设置页', extra: { restored: result.restored } });
+    appendAudit('secrets.revert', {
+      target: 'config.json',
+      source: '设置页',
+      // 同样只记"搬回了几项、令牌有没有放回明文文件"
+      extra: { restored: result.restored, googleTokenRestored: !!result.token?.restored },
+    });
     return sendJson(res, 200, { ok: true, ...result, status: secretsReport() });
   }
 

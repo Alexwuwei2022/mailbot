@@ -3,18 +3,20 @@
  *
  * 不引入 googleapis（解包 200MB+），直接调用 Google 的 OAuth2 与 Calendar REST 端点。
  *
- * 令牌保存在 data/google-token.json（已被 .gitignore 覆盖）：
- *   { refreshToken, accessToken, expiresAt, scope, tokenType, email, savedAt }
+ * 令牌**存在哪**由 `server/calendar/google-token.js` 决定（本文件只管 OAuth 流程）：
+ *   - 默认：`data/google-token.json`（权限 600），格式
+ *     `{ refreshToken, accessToken, expiresAt, scope, tokenType, email, savedAt }`
+ *   - 迁入保管库之后：系统钥匙串 / DPAPI（config 作用域，日历是全局单账号），
+ *     明文文件被删掉；读不到时**明确报错**，不会静默假装"未连接"
  * refresh_token 只在首次授权（或带 prompt=consent）时下发，因此**必须落盘**，
  * 否则每次重启都要重新授权。
  */
 
 import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-import { getConfig, getPaths } from '../config/index.js';
+import { getConfig } from '../config/index.js';
 import { AppError, log } from '../lib/util.js';
 import { DEFAULT_TIMEOUT_MS, describeNetworkError, httpRequest, resolveProxyFor } from '../lib/http.js';
+import { clearToken, readToken, tokenStatus, tryReadToken, writeToken } from './google-token.js';
 
 /** 允许通过环境变量覆盖，测试时指向本地模拟服务器。 */
 function oauthBase() {
@@ -43,41 +45,15 @@ const PENDING_TTL_MS = 10 * 60_000;
 
 /* ------------------------------------------------------------ 令牌存取 */
 
-function tokenFile() {
-  return path.join(getPaths().dataDir, 'google-token.json');
-}
-
-export function readToken() {
-  const file = tokenFile();
-  if (!fs.existsSync(file)) return null;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return parsed && typeof parsed === 'object' ? parsed : null;
-  } catch (err) {
-    log.warn(`google-token.json 解析失败：${err.message}`);
-    return null;
-  }
-}
-
-export function writeToken(token) {
-  const file = tokenFile();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(token, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(tmp, file);
-  return token;
-}
-
-export function clearToken() {
-  const file = tokenFile();
-  if (fs.existsSync(file)) {
-    try {
-      fs.unlinkSync(file);
-    } catch (err) {
-      log.warn(`删除令牌文件失败：${err.message}`);
-    }
-  }
-}
+/*
+ * 令牌的**存放**（保管库 / 明文文件）与"读不出来怎么报"都在 google-token.js，
+ * 这里只做转发，保证：
+ *   - 旧数据（只有 data/google-token.json）仍然能被正常读取使用；
+ *   - 保管库不可用 / 令牌文件损坏时**抛可识别的错误**（`GOOGLE_TOKEN_*`），
+ *     上层据此提示"需要重新授权"，而不是静默当成"未连接"。
+ */
+export { readToken, tryReadToken, writeToken, clearToken };
+export { tokenStatus as tokenStorageStatus } from './google-token.js';
 
 /**
  * 记下"这个 refresh token 已经不被 Google 接受了"。
@@ -87,8 +63,9 @@ export function clearToken() {
  *      一边显示"已连接"一边每个请求都失败；
  *   2. 避免每次操作都去撞一次注定失败的刷新（白等一个网络往返）。
  *
- * **不删除 token 文件**：里面的 email/scope 等还能帮用户判断"上次连的是哪个账号"，
+ * **不丢弃令牌本身**：里面的 email/scope 等还能帮用户判断"上次连的是哪个账号"，
  * 而且万一是网络抖动造成的误判，用户重新授权会直接覆盖它。
+ * （令牌现在可能住在保管库里，所以这里是"写回它原来在的地方"，不是"写文件"。）
  */
 export function markTokenRevoked(reason) {
   const token = readToken();
@@ -412,7 +389,14 @@ export async function revoke() {
 
 /** 连接状态（供界面展示）。 */
 export function connectionStatus() {
-  const token = readToken();
+  /*
+   * 读令牌可能失败（保管库换了机器/换了账户解不开、令牌文件被写坏）。
+   * 这里**不抛**（这个函数被日历页与状态接口调用，抛出去整页就白了），
+   * 但也**绝不谎称"未连接"**：把失败如实放进 `tokenError`，界面据此显示
+   * "需要重新授权 / 保管库读不出来"。
+   */
+  const read = tryReadToken();
+  const token = read.ok ? read.token : null;
   const cfg = validateGoogleConfig();
   const { calendar } = getConfig();
   /*
@@ -422,7 +406,7 @@ export function connectionStatus() {
    * **7 天**寿命，用户也可能在账号里撤销授权。这时文件里明明有 token、页面显示「已连接」，
    * 而每个请求都失败——**界面承诺与实际能力对不上**，用户只能困惑。
    *
-   * 刷新失败（invalid_grant）会被 `markTokenRevoked` 记在 token 文件里，这里据此说实话。
+   * 刷新失败（invalid_grant）会被 `markTokenRevoked` 记在令牌里，这里据此说实话。
    */
   const revoked = !!token?.revokedAt;
   return {
@@ -438,6 +422,16 @@ export function connectionStatus() {
     scope: token?.scope || null,
     expiresAt: token?.expiresAt || null,
     savedAt: token?.savedAt || null,
+    /** 令牌读不出来时的可识别错误（保管库不可用 / 文件损坏）；正常时为 null */
+    tokenError: read.ok ? null : { code: read.code, message: read.error },
+    /** 令牌住在哪（供界面与诊断说实话，不需要用户去猜） */
+    tokenStorage: (() => {
+      try {
+        return tokenStatus();
+      } catch {
+        return null;
+      }
+    })(),
     calendarId: calendar.calendarId,
     timeZone: calendar.timeZone,
     /** 访问 Google 用的代理（空表示直连）；界面据此提示「网络不通时该填什么」 */

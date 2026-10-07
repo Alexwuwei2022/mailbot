@@ -31,6 +31,8 @@
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+// 只借一个文件名常量：google-token.js 只依赖 lib/util.js，不反向依赖本模块，不构成环
+import { TOKEN_FILE_NAME } from '../calendar/google-token.js';
 
 /** 钥匙串里的服务名（macOS/Linux 用它定位条目） */
 export const KEYRING_SERVICE = 'mailbot-secrets';
@@ -103,11 +105,127 @@ export const SECRET_SLOTS = [
     },
   },
   /*
-   * Google 刷新令牌（data/google-token.json）不在配置里，但它同样是"别人拿到就能读你日历"
-   * 的凭据。**本批尚未纳入保管**（只在上报状态里如实列出），键名 googleToken。
+   * Google 刷新令牌（`data/google-token.json`）不在配置里，但它同样是"别人拿到就能读你日历"
+   * 的凭据，因此**同样纳入保管**。
+   *
+   * `external` 表示"不落在这个配置对象上，而是另一个文件"，因此它不参与
+   * `collectFromConfig` / `applyToConfig` / `stripFromConfig` 的配置路径：
+   * 那三个函数只管配置；外部文件由 `collectExternalSecrets` / `applyExternalSecrets`
+   * 通过下面注入的 `read` / `write` / `clear` 处理（见 `server/calendar/google-token.js`）。
+   * 保管库里的键名仍是 `googleToken`，值是**令牌文件对象的 JSON 文本**。
    */
-  { key: 'googleToken', label: 'Google 刷新令牌', external: 'google-token.json' },
+  {
+    key: 'googleToken',
+    label: 'Google 刷新令牌',
+    scope: 'config',
+    external: TOKEN_FILE_NAME,
+    read: () => externalTokenIO()?.read() ?? null,
+    write: (value) => externalTokenIO()?.write(value) ?? { ok: false, error: '令牌存储未初始化' },
+    clear: () => externalTokenIO()?.clear() ?? { ok: false, error: '令牌存储未初始化' },
+    verify: () => externalTokenIO()?.verify() ?? { ok: false, error: '令牌存储未初始化' },
+    managed: () => externalTokenIO()?.managed() ?? false,
+  },
 ];
+
+/* ------------------------------------------------------------ 外部密钥（不在配置里的文件） */
+
+/**
+ * 外部密钥槽位的读写实现（如 `data/google-token.json`）。
+ *
+ * 为什么用注入而不是 import：`server/calendar/google-token.js` 需要 `config/index.js`
+ * 里的 `getPaths` / `readVault` 等，反过来 `config/index.js` 又要在这里搬动它——
+ * 静态互相 import 会形成模块环。注入把这条边断成"运行时依赖"。
+ */
+let externalIO = {};
+export function setExternalSecretIO(io) {
+  externalIO = io || {};
+}
+
+function externalTokenIO() {
+  return externalIO.googleToken || null;
+}
+
+function externalSlots() {
+  return SECRET_SLOTS.filter((s) => s.external);
+}
+
+/** 收集外部密钥：返回 `{ [key]: string }`（值是**要写进保管库的字符串**）。 */
+export function collectExternalSecrets({ exclude = new Set() } = {}) {
+  const secrets = {};
+  const problems = [];
+  for (const slot of externalSlots()) {
+    if (exclude.has(slot.key)) continue;
+    let value = null;
+    try {
+      value = slot.read ? slot.read() : null;
+    } catch (err) {
+      problems.push({ key: slot.key, message: err?.message || String(err), code: err?.code || null });
+      continue;
+    }
+    if (value) secrets[slot.key] = value;
+  }
+  return { secrets, problems };
+}
+
+/**
+ * 把外部密钥写回它原来的地方（「保存配置」的搬运路径用）。
+ *
+ * **只搬运"保管库已经说了算"的项**（`slot.managed()`）。原因很简单：外部密钥没有
+ * "配不配置"这个中间态，一旦写回就必须能把原处的明文清掉。若保管库还不掌握它
+ * （比如用户只是迁移过授权码、之后才连的 Google），把它写进去再清掉明文，就等于
+ * 用过期的副本替换仍然有效的令牌——**宁可不搬**。
+ * 真正"第一次纳入保管库"由 `migrateSecrets` 负责（它有读回比对那一整套）。
+ */
+export function applyExternalSecrets(secrets) {
+  let applied = 0;
+  const problems = [];
+  for (const slot of externalSlots()) {
+    const value = secrets?.[slot.key];
+    if (!value) continue;
+    if (slot.managed && !slot.managed()) {
+      problems.push({ key: slot.key, message: '保管库尚未掌握该项，本次未搬运（明文保持原样）' });
+      continue;
+    }
+    try {
+      const res = slot.write ? slot.write(value) : { ok: false, error: '该密钥槽位不支持写回' };
+      if (res?.ok === false) problems.push({ key: slot.key, message: res.error || '写入失败' });
+      else applied += 1;
+    } catch (err) {
+      problems.push({ key: slot.key, message: err?.message || String(err), code: err?.code || null });
+    }
+  }
+  return { applied, problems };
+}
+
+/** 迁移成功后清掉外部明文（**只在保管库读回比对通过之后调用**）。 */
+export function clearExternalSecrets(secrets) {
+  const cleared = [];
+  const problems = [];
+  for (const slot of externalSlots()) {
+    if (!secrets?.[slot.key]) continue;
+    try {
+      const res = slot.clear ? slot.clear() : { ok: true };
+      if (res?.ok === false) problems.push({ key: slot.key, message: res.error || '清理失败' });
+      else cleared.push(slot.key);
+    } catch (err) {
+      problems.push({ key: slot.key, message: err?.message || String(err), code: err?.code || null });
+    }
+  }
+  return { cleared, problems };
+}
+
+/** 外部密钥的现状（给上报用；实现失败时返回 null，由上报层如实说明）。 */
+export function externalSecretStatus() {
+  const out = {};
+  for (const slot of externalSlots()) {
+    try {
+      out[slot.key] = slot.verify ? slot.verify() : null;
+    } catch (err) {
+      out[slot.key] = { error: err?.message || String(err), errorCode: err?.code || null };
+    }
+  }
+  return out;
+}
 
 /** 需要保管的配置键（用于判断"某个字段算不算密钥"） */
 export const SECRET_KEYS = new Set(SECRET_SLOTS.map((s) => s.key));

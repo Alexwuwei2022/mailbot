@@ -3565,6 +3565,374 @@ await test('密钥保管：不搬运来自环境变量的密钥（用户刻意�
   }
 });
 
+/* -------------------------------------------------- 21b. Google 令牌纳入保管库 */
+
+/**
+ * 这一组测的是**最怕出错**的一件事：把 `data/google-token.json` 里的 refresh token
+ * 搬进保管库。弄丢它 = 用户必须重新授权一次，所以"写失败/读回不一致时绝不抹明文"
+ * 是硬约束，测试断言写得比实现还严（宁可少验一项，也不放宽这几条）。
+ *
+ * 全程离线：假后端只做"字符串进、字符串出"，不发任何网络请求，也不碰真实 data/。
+ */
+
+/**
+ * 临时造一个"明文的 Google 令牌文件"，并同步内存里的令牌对象。
+ *
+ * 开头那行 `loadConfig` 是**必须**的：`readToken()`/`writeToken()` 需要配置模块
+ * 注入的依赖（取路径、读写保管库），而这个注入发生在 `loadConfig()` 里。
+ * 真实运行时 `server/index.js` 启动就会加载配置，测试里得自己保证。
+ */
+function seedPlainToken(auth, overrides = {}) {
+  loadConfig({ rootDir: root, force: true });
+  const p = getPaths();
+  const token = {
+    refreshToken: 'test-refresh-token',
+    accessToken: 'test-access-token',
+    expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+    scope: 'https://www.googleapis.com/auth/calendar.events',
+    tokenType: 'Bearer',
+    email: 'tester@example.com',
+    savedAt: new Date().toISOString(),
+    ...overrides,
+  };
+  auth.writeToken(token);
+  assert(fs.existsSync(path.join(p.dataDir, 'google-token.json')), '前置条件：应写入明文令牌文件');
+  return token;
+}
+
+await test('Google 令牌：往返一致、明文被清掉、报告如实说"已在保管库"', async () => {
+  const auth = await import('../server/calendar/google-auth.js');
+  const tokenVault = await import('../server/calendar/google-token.js');
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const tokenFile = path.join(p.dataDir, 'google-token.json');
+  const hadTokenFile = fs.existsSync(tokenFile);
+  try {
+    installFakeVault();
+    const seeded = seedPlainToken(auth);
+
+    // 迁移前：老数据（只有明文文件）必须是能读的 —— 不能因为"纳入保管库"就让老用户掉线
+    assertEqual(auth.readToken().refreshToken, seeded.refreshToken, '迁移前明文读法必须仍然可用');
+    assertEqual(secretsReport().token.inVault, false, '迁移前应为"未纳入保管库"');
+
+    const out = migrateSecrets({ mode: 'faketest' });
+    assert(out.items.includes('googleToken'), `迁移清单应包含 Google 令牌（实际 ${out.items.join(',')}）`);
+    assertEqual(out.token.moved, true, '迁移结果应说明令牌被搬走了');
+    assertEqual(out.token.location, 'vault', '令牌应改在保管库里');
+    assertEqual(out.token.encrypted, true, '加密后端应如实标为已加密');
+    assertEqual(out.token.requiresReauthOnOtherMachine, true, '换机器需要重新授权这件事必须报出来');
+
+    // ① 往返：读出来与写进去一致
+    const back = auth.readToken();
+    assertEqual(back.refreshToken, seeded.refreshToken, '保管库返回的 refresh_token 必须与原值一致');
+    assertEqual(back.accessToken, seeded.accessToken, 'access_token 也应一致（整份令牌一起搬）');
+    assertEqual(back.email, seeded.email, '邮箱等辅助信息不应丢');
+
+    // ② 明文文件已被清掉
+    assertEqual(fs.existsSync(tokenFile), false, '迁移成功后 data/google-token.json 必须被删除');
+
+    // ③ 保管库里存的确实是这个令牌（不是空写）
+    const decoded = decodeVault(
+      readVault('faketest', { dataDir: p.dataDir, force: true }).data,
+    );
+    assert(decoded.ok, '保管库内容应可解析');
+    assert(
+      JSON.parse(decoded.secrets.googleToken).refreshToken === seeded.refreshToken,
+      '保管库里的 googleToken 应就是那份令牌',
+    );
+
+    // ④ 挪进保管库之后，令牌仍然"写在原处"：refresh_token 不会因为换了存放地而丢
+    auth.writeToken({ ...auth.readToken(), accessToken: 'rotated-access', expiresAt: new Date(Date.now() - 60_000).toISOString() });
+    assertEqual(auth.readToken().refreshToken, seeded.refreshToken, '换存放地后刷新令牌必须仍在（且在保管库里）');
+    assertEqual(auth.readToken().accessToken, 'rotated-access', '新的 access_token 也必须写进去');
+    assertEqual(fs.existsSync(tokenFile), false, '写入后也不应退回明文文件');
+    assertEqual(auth.connectionStatus().connected, true, '写入后连接状态仍应是已连接');
+
+    // ⑤ 报告：不再说"未纳入"，并且位置就是保管库
+    const report = secretsReport();
+    assertEqual(report.token.inVault, true, '报告必须说令牌已纳入保管库');
+    assertEqual(report.token.location, 'vault', '位置应是保管库');
+    assertEqual(report.token.encrypted, true, '应如实标注已加密');
+    assertEqual(report.token.plaintextFile, false, '明文文件已不在，报告不能说还在');
+    assert(
+      !report.notCovered.some((x) => x.includes('Google')),
+      `不应再有"Google 令牌未纳入"这一条（实际 ${report.notCovered.join('；')}）`,
+    );
+    const item = report.items.find((i) => i.key === 'googleToken');
+    assert(item, '报告里必须单独列出 Google 令牌这一项');
+    assertEqual(item.location, 'vault', '这一项的位置应是保管库');
+    assertEqual(item.encrypted, true, '这一项应标为加密');
+    assert(tokenVault.tokenStatus().location === 'vault', 'tokenStatus 也应指向保管库');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    if (!hadTokenFile) fs.rmSync(tokenFile, { force: true });
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('Google 令牌：保管库写失败 / 读回不一致时，明文文件必须原样还在（宁可少迁也不能丢）', async () => {
+  const auth = await import('../server/calendar/google-auth.js');
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const tokenFile = path.join(p.dataDir, 'google-token.json');
+  const hadTokenFile = fs.existsSync(tokenFile);
+  try {
+    // ① 写失败
+    installFakeVault({ failWrite: true });
+    const seeded = seedPlainToken(auth);
+    const rawBefore = fs.readFileSync(tokenFile, 'utf8');
+    let code = null;
+    try {
+      migrateSecrets({ mode: 'faketest' });
+    } catch (err) {
+      code = err.code;
+    }
+    assertEqual(code, 'SECRETS_WRITE_FAILED', '写失败要明确报错');
+    assert(fs.existsSync(tokenFile), '写失败时明文令牌文件**必须还在**');
+    assertEqual(fs.readFileSync(tokenFile, 'utf8'), rawBefore, '写失败时明文内容必须一字未改');
+    assertEqual(auth.readToken().refreshToken, seeded.refreshToken, '写失败后日历必须仍能用（读明文）');
+    assertEqual(secretsReport().token.inVault, false, '写失败时不能谎称已纳入保管库');
+
+    // ② 写进去但读回来不一致（"搬过去打不开"）
+    const store = installFakeVault({ mangle: true });
+    code = null;
+    try {
+      migrateSecrets({ mode: 'faketest' });
+    } catch (err) {
+      code = err.code;
+    }
+    assertEqual(code, 'SECRETS_VERIFY_FAILED', '读回不一致必须报校验失败');
+    assertEqual(store.clears, 1, '应把写坏的内容清掉（回滚）');
+    assert(fs.existsSync(tokenFile), '校验不一致时明文令牌文件**必须还在**');
+    assertEqual(fs.readFileSync(tokenFile, 'utf8'), rawBefore, '校验不一致时明文内容必须一字未改');
+    assertEqual(auth.readToken().refreshToken, seeded.refreshToken, '校验失败后日历必须仍能用（读明文）');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    if (!hadTokenFile) fs.rmSync(tokenFile, { force: true });
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('Google 令牌：迁回明文会把它放回原处（0600），且日历照常读取', async () => {
+  const auth = await import('../server/calendar/google-auth.js');
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const tokenFile = path.join(p.dataDir, 'google-token.json');
+  const hadTokenFile = fs.existsSync(tokenFile);
+  try {
+    installFakeVault();
+    const seeded = seedPlainToken(auth);
+    migrateSecrets({ mode: 'faketest' });
+    assertEqual(fs.existsSync(tokenFile), false, '前置条件：迁移后明文应已清除');
+
+    const out = revertSecrets();
+    assert(fs.existsSync(tokenFile), '迁回后明文令牌文件应被放回原处');
+    const onDisk = JSON.parse(fs.readFileSync(tokenFile, 'utf8'));
+    assertEqual(onDisk.refreshToken, seeded.refreshToken, '放回的必须是原令牌');
+    assertEqual(out.token.restored, true, '迁回结果应说明令牌被放回');
+    assertEqual(out.token.location, 'file', '位置应回到明文文件');
+    assertEqual(auth.readToken().refreshToken, seeded.refreshToken, '迁回后读取路径照常可用');
+    assertEqual(secretsReport().token.inVault, false, '迁回后报告应说"不在保管库"');
+    assert(
+      secretsReport().notCovered.some((x) => x.includes('Google')),
+      '迁回后应如实列出"Google 令牌仍是明文"',
+    );
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    if (!hadTokenFile) fs.rmSync(tokenFile, { force: true });
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('Google 令牌：兼容旧数据（没跑过迁移、只有明文文件时读取路径照常）', async () => {
+  const auth = await import('../server/calendar/google-auth.js');
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const tokenFile = path.join(p.dataDir, 'google-token.json');
+  const hadTokenFile = fs.existsSync(tokenFile);
+  try {
+    loadConfig({ rootDir: root, force: true });
+    // 默认 vault.mode = 'config'（老用户升级后的状态：没有任何保管库）
+    assertEqual(getConfig().vault?.mode || 'config', 'config', '前置条件：未启用保管库');
+    const token = {
+      refreshToken: 'legacy-refresh',
+      accessToken: 'legacy-access',
+      expiresAt: new Date(Date.now() + 3600_000).toISOString(),
+      scope: 'x',
+      savedAt: new Date().toISOString(),
+    };
+    fs.writeFileSync(tokenFile, `${JSON.stringify(token, null, 2)}\n`, 'utf8');
+
+    const read = auth.readToken();
+    assert(read, '旧明文令牌必须仍能被读到（不能因为纳入保管库就让老用户掉线）');
+    assertEqual(read.refreshToken, 'legacy-refresh', 'refresh_token 应一致');
+    assertEqual(await auth.getAccessToken(), 'legacy-access', '未过期时应直接给出 access_token（走旧读取路径）');
+    assertEqual(auth.connectionStatus().connected, true, '连接状态应仍是"已连接"');
+    assertEqual(secretsReport().token.location, 'fileToken', '报告应如实说它还在明文文件里');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    if (!hadTokenFile) fs.rmSync(tokenFile, { force: true });
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('Google 令牌：保管库读不出来时给可识别的明确错误，绝不静默当成"未连接"', async () => {
+  const auth = await import('../server/calendar/google-auth.js');
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const tokenFile = path.join(p.dataDir, 'google-token.json');
+  const hadTokenFile = fs.existsSync(tokenFile);
+  try {
+    loadConfig({ rootDir: root, force: true });
+    installFakeVault();
+    const seeded = seedPlainToken(auth);
+    migrateSecrets({ mode: 'faketest' });
+    assertEqual(fs.existsSync(tokenFile), false, '前置条件：令牌只在保管库里');
+
+    // 保管库变成"解不开"（换机器/换系统账户就是这个现象），并且**没有**明文可退
+    __setBackendForTest('faketest', {
+      id: 'faketest',
+      label: '测试保管库',
+      encrypted: true,
+      detail: '仅测试用',
+      available: () => true,
+      read: () => ({ ok: false, code: 'FAKE_READ_FAIL', message: '测试：读失败' }),
+      write: () => ({ ok: false, code: 'FAKE_WRITE_FAIL', message: '测试：写失败' }),
+      clear: () => ({ ok: true }),
+    });
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+
+    let code = null;
+    let message = '';
+    try {
+      auth.readToken();
+    } catch (err) {
+      code = err.code;
+      message = err.message;
+    }
+    assert(code, '保管库读不出来时**必须抛错**，不能返回 null（那就是静默掉线）');
+    assertEqual(code, 'GOOGLE_TOKEN_VAULT_ERROR', '错误码应可识别');
+    assert(
+      /保管库|读不出来/.test(message),
+      `错误信息要说明白是保管库的问题（实际：${message.slice(0, 60)}）`,
+    );
+    assert(!message.includes(seeded.refreshToken), '错误信息里**绝不能出现令牌内容**');
+
+    // 日历接口这条路也要给出可识别的错误，而不是"未连接"
+    let apiCode = null;
+    try {
+      await auth.getAccessToken();
+    } catch (err) {
+      apiCode = err.code;
+    }
+    assertEqual(apiCode, 'GOOGLE_TOKEN_VAULT_ERROR', '取 access_token 时应透出同一个错误码');
+
+    const status = auth.connectionStatus();
+    assertEqual(status.connected, false, '读不出来时不能显示已连接');
+    assertEqual(status.needsReauth, false, '这不是授权过期，不该说"需要重新授权"');
+    assert(status.tokenError, '状态里必须带上可识别的错误（前端据此提示）');
+    assertEqual(status.tokenError.code, 'GOOGLE_TOKEN_VAULT_ERROR', '状态里的错误码应一致');
+
+    const report = secretsReport();
+    assertEqual(report.token.location, 'vault', '令牌确实在保管库里（不是"不存在"）');
+    assertEqual(report.token.inVault, true, '它仍然算"已纳入保管库"');
+    assertEqual(report.token.requiresReauth, true, '报告必须明说"需要重新授权/修保管库"，而不是含糊过去');
+    assertEqual(report.token.errorCode, 'GOOGLE_TOKEN_VAULT_ERROR', '报告里的错误码应可识别');
+    assert(report.token.error, '报告里必须带上读不出来的原因');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    if (!hadTokenFile) fs.rmSync(tokenFile, { force: true });
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
+await test('Google 令牌：报告如实标注位置（明文 / 加密保管库 / 未加密降级）', async () => {
+  const auth = await import('../server/calendar/google-auth.js');
+  const { getBackend } = await import('../server/lib/secrets.js');
+  const p = getPaths();
+  const diskBefore = fs.readFileSync(p.configFile, 'utf8');
+  const tokenFile = path.join(p.dataDir, 'google-token.json');
+  const hadTokenFile = fs.existsSync(tokenFile);
+  try {
+    // ① 没有任何令牌：报告要说"没有"，不能说"在保管库"
+    fs.rmSync(tokenFile, { force: true });
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+    const none = secretsReport();
+    assertEqual(none.token.location, 'none', '没有令牌时应报 none');
+    assertEqual(none.token.set, false, '没有令牌时 set 应为 false');
+
+    // ② 只有明文文件：报告要说清楚它还在明文里
+    installFakeVault();
+    seedPlainToken(auth);
+    const plain = secretsReport();
+    assertEqual(plain.token.location, 'fileToken', '应报告"明文在 data/google-token.json"');
+    assertEqual(plain.token.encrypted, false, '未纳入保管库时必须标为未加密');
+    assertEqual(plain.token.inVault, false, '不能谎称已纳入');
+    assert(plain.notCovered.some((x) => x.includes('Google')), '应列出"Google 令牌仍是明文"');
+    assert(plain.plaintextCount >= 1, '明文令牌应计入明文数量');
+
+    // ③ 迁进加密保管库：报告要说"在保管库、已加密"，且不再有"未纳入"
+    migrateSecrets({ mode: 'faketest' });
+    const vaulted = secretsReport();
+    assertEqual(vaulted.token.location, 'vault', '应报告在保管库');
+    assertEqual(vaulted.token.encrypted, true, '应报告已加密');
+    assertEqual(vaulted.token.inVault, true, '应报告已纳入');
+    assertEqual(vaulted.notCovered.length, 0, '已纳入后不该再有"未纳入"清单');
+
+    // ④ 降级到未加密的 file 后端：必须**可见地**标成未加密，而不是含糊过去
+    const plainStore = { text: null };
+    __setBackendForTest('fakeplain', {
+      id: 'fakeplain',
+      label: '测试用未加密后端',
+      encrypted: false,
+      detail: '仅测试用（模拟 file 降级）',
+      available: () => true,
+      read: () => ({ ok: true, value: plainStore.text }),
+      write: (_dataDir, text) => {
+        // 必须真的存下来：这个槽位要能"写进去读回来一致"才算迁移成功（假的会走回滚分支）
+        plainStore.text = text;
+        return { ok: true };
+      },
+      clear: () => {
+        plainStore.text = null;
+        return { ok: true };
+      },
+    });
+    resetVaultCache();
+    seedPlainToken(auth, { refreshToken: 'test-refresh-token-2' });
+    migrateSecrets({ mode: 'fakeplain' });
+    const degraded = secretsReport();
+    assertEqual(degraded.token.location, 'vault', '降级后端里也算已纳入保管');
+    assertEqual(degraded.token.encrypted, false, '未加密后端必须如实标注"未加密"');
+    assertEqual(getBackend('fakeplain').encrypted, false, '前置条件：这个测试后端确实不加密');
+    assertEqual(degraded.token.plaintextFile, false, '明文文件仍应被清掉（只是搬到了一个未加密文件里）');
+  } finally {
+    fs.writeFileSync(p.configFile, diskBefore, 'utf8');
+    if (!hadTokenFile) fs.rmSync(tokenFile, { force: true });
+    __setBackendForTest(null);
+    resetVaultCache();
+    resetConfigCache();
+    loadConfig({ rootDir: root, force: true });
+  }
+});
+
 /* -------------------------------------------------- 22. 跟催（follow-up） */
 
 await test('跟催：等对方回复靠线程匹配本地推导（回执不算、已回不算、未到时间不算）', async () => {

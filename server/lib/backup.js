@@ -22,6 +22,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { APP_NAME, APP_VERSION, AppError, log } from './util.js';
 import { getConfig, getPaths, loadConfig } from '../config/index.js';
+// 令牌可能住在保管库里，导出时必须走统一读取路径（只看文件会漏掉它）
+import { TOKEN_FILE_NAME, readToken } from '../calendar/google-token.js';
 import { resetTransportPools } from '../mail/smtp.js';
 import { STATE_VERSION } from '../store/state.js';
 import { createZip, isSafeEntryName, readZip } from './zip.js';
@@ -172,8 +174,23 @@ export function buildBackup({ includeSecrets = false, includeRaw = false, now = 
   if (includeSecrets) {
     const envFile = path.join(p.rootDir, '.env');
     if (fs.existsSync(envFile)) entries.push({ name: '.env', data: fs.readFileSync(envFile) });
-    const tokenFile = path.join(p.dataDir, 'google-token.json');
-    if (fs.existsSync(tokenFile)) entries.push({ name: 'google-token.json', data: fs.readFileSync(tokenFile) });
+    /*
+     * Google 令牌可能住在保管库里（明文文件已被清掉），所以这里必须走**统一的读取路径**：
+     * 只看 `google-token.json` 会在"令牌已纳入保管库"的用户身上导出出一个不含令牌的包，
+     * 而用户勾了"包含密钥"，会以为已经带上了。
+     * 读不出来（保管库换机解不开）时如实记一条警告，不假装包里没有这个东西。
+     */
+    const tokenFile = path.join(p.dataDir, TOKEN_FILE_NAME);
+    let tokenJson = null;
+    try {
+      const token = readToken();
+      if (token) tokenJson = `${JSON.stringify(token, null, 2)}\n`;
+    } catch (err) {
+      // 只记"读失败"，**绝不把异常对象里的令牌内容拼进消息**（错误信息会进日志与界面）
+      warnings.push(`Google 令牌读取失败，本次备份未包含它：${err?.code || ''} ${err?.message || ''}`.trim());
+    }
+    if (!tokenJson && fs.existsSync(tokenFile)) tokenJson = fs.readFileSync(tokenFile, 'utf8');
+    if (tokenJson) entries.push({ name: TOKEN_FILE_NAME, data: tokenJson });
   }
 
   let schemaVersion = null;

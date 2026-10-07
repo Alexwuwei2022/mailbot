@@ -1928,17 +1928,28 @@ function organizeSettings(container) {
 /**
  * 密钥存储面板。
  *
- * 三件事必须一眼看清，否则用户会一直猜：
- *   ①现在每个密钥**到底存在哪**（明文配置文件 / .env / 保管库）；
+ * 四件事必须一眼看清，否则用户会一直猜：
+ *   ①现在每个密钥**到底存在哪**（明文配置文件 / .env / 保管库 / 明文令牌文件）；
  *   ②保管库是**加密的**还是降级成了未加密文件；
- *   ③换成另一台电脑会发生什么。
+ *   ③**Google 刷新令牌**纳入保管没有、加密没有、需不需要重新授权；
+ *   ④换成另一台电脑会发生什么。
  */
 function secretsPanel() {
   const s = state.secrets;
   const backendLabel = s.currentBackend?.label || s.resolved || '—';
-  const plain = (s.items || []).filter((i) => i.set && (i.location === 'config' || i.location === 'envFile' || i.location === 'envReal'));
+  const plain = (s.items || []).filter((i) => i.set && (i.location === 'config' || i.location === 'envFile' || i.location === 'envReal' || i.location === 'fileToken'));
   const inVault = (s.items || []).filter((i) => i.location === 'vault');
-  const locText = { config: '明文在 config.json', envFile: '明文在 .env', envReal: '来自环境变量', vault: '系统保管库', none: '未设置' };
+  const locText = {
+    config: '明文在 config.json',
+    envFile: '明文在 .env',
+    envReal: '来自环境变量',
+    vault: '系统保管库',
+    /** Google 令牌不在配置里，它单独在一个 600 权限的文件里 */
+    fileToken: '明文在 data/google-token.json',
+    none: '未设置',
+  };
+  const token = s.token || null;
+  const tokenBackend = (s.backends || []).find((b) => b.id === (token?.backend || s.resolved));
 
   const options = (s.backends || []).filter((b) => b.available);
 
@@ -1974,23 +1985,80 @@ function secretsPanel() {
           'div',
           { class: 'storage-row' },
           h('span', { class: 'storage-label', text: i.label }),
-          h('span', { class: `tag ${i.location === 'vault' ? 'tag-ok' : i.set ? 'tag-warn' : ''}`, text: locText[i.location] || i.location }),
-          h('span', { class: 'muted small storage-hint', text: i.set ? '' : '（空）' }),
+          h(
+            'span',
+            {
+              class: `tag ${i.location === 'vault' ? 'tag-ok' : i.set || i.error ? 'tag-warn' : ''}`,
+              text: i.error && !i.set ? '读不出来' : locText[i.location] || i.location,
+            },
+          ),
+          h(
+            'span',
+            { class: 'muted small storage-hint' },
+            i.external
+              ? i.error
+                ? `⚠️ ${i.error}`
+                : i.set
+                  ? i.location === 'vault'
+                    ? `已纳入保管库${i.encrypted ? '（加密）' : '（**未加密**：降级到本地文件）'}`
+                    : '尚未纳入保管库（明文 600 权限）'
+                  : '（未连接）'
+              : i.set
+                ? ''
+                : '（空）',
+          ),
         ),
       ),
     ),
 
+    /*
+     * Google 令牌单独一段说清楚：它是本次新纳入保管库的那一项，
+     * 而且"搬走"之后还牵涉"换机器要重新授权"，含糊过去用户一定会踩坑。
+     */
+    token
+      ? h(
+          'div',
+          { class: 'alert alert-info block-lead mt-2' },
+          h('div', {}, h('b', { text: 'Google 刷新令牌' })),
+          h(
+            'div',
+            { class: 'small mt-1' },
+            token.inVault && token.error
+              ? `已纳入保管库（${token.backend || s.resolved}），但**这次读不出来**：${token.errorCode}。` +
+                '日历暂时不可用；修好保管库后再试，或在日历页重新连接一次 Google。'
+              : token.inVault
+                ? `已纳入保管库（${tokenBackend?.label || token.backend || s.resolved}${token.encrypted ? '，加密保存' : '，**未加密**'}）。` +
+                  'data/google-token.json 的明文已清除，日历功能不受影响。'
+                : token.location === 'fileToken'
+                  ? `目前是明文存放在 data/google-token.json（权限 600），**尚未纳入保管库**。` +
+                    '点下面的「迁入」会把它一起搬进系统保管，并清掉那个明文文件。'
+                  : token.location === 'none' && !token.set
+                    ? '还没有 Google 令牌（未连接日历）。连接后按当前方式保存：' +
+                      (s.mode === 'config' ? '明文存 data/google-token.json（权限 600）。' : '直接进系统保管库。')
+                    : `令牌存在但读不出来（${token.errorCode || '未知原因'}）——需要在日历页重新连接一次 Google。`,
+          ),
+          token.inVault
+            ? h(
+                'div',
+                { class: 'small mt-2' },
+                '⚠️ **换电脑 / 重装系统 / 换 Windows 账户后**，保管库解不开 → 需要重新点一次「连接 Google 日历」授权' +
+                  '（这不会影响别的密钥，也不影响 Google 那边的账号设置）。',
+              )
+            : null,
+        )
+      : null,
+
     h(
       'p',
       { class: 'muted small mt-2' },
-      '**威胁模型（不夸大）**：搬进保管库能防的是"`config.json` / `.env` 被拷走、被网盘同步、进了备份包、被人翻到"——' +
+      '**威胁模型（不夸大）**：搬进保管库能防的是"`config.json` / `.env` / `google-token.json` 被拷走、被网盘同步、进了备份包、被人翻到"——' +
         '文件里不再有密钥，密文只有**这台机器的这个用户**能解开。它**防不住**以你的身份运行的恶意程序、' +
         '你离开时没锁屏的电脑。',
     ),
     h(
       'p',
       { class: 'muted small' },
-      '**换电脑/重装系统**：保管库里的密钥解不开（这是它的设计目标），需要在「开始使用」或设置里重新填一次授权码。' +
+      '**换电脑/重装系统**：保管库里的密钥解不开（这是它的设计目标），需要重新填授权码、并重新连接一次 Google 日历。' +
         '导出的备份包**不含**保管库内容，所以别指望用它搬密钥。',
     ),
     (s.notCovered || []).length
@@ -2063,17 +2131,21 @@ function secretsPanel() {
 async function migrateSecrets(btn, mode) {
   const s = state.secrets;
   const backend = (s.backends || []).find((b) => b.id === mode);
+  const tokenPlain = s.token?.set && !s.token?.inVault;
   const ok = await confirmDialog({
     title: `把密钥迁到「${backend?.label || mode}」？`,
     message: h(
       'div',
       {},
       h('p', { class: 'small', text: '程序会：①把当前所有密钥写进保管库；②读回来逐项比对；③比对通过后，才把 config.json 与 .env 里的明文清空。' }),
+      tokenPlain
+        ? h('p', { class: 'small', text: '**Google 刷新令牌**也会一起搬：同样先写进保管库并读回比对，**比对通过后才删掉** data/google-token.json 的明文（比对不通过就一个字都不动，令牌绝不会丢）。' })
+        : null,
       h('p', { class: 'small', text: '任何一步失败都会回滚，密钥不会丢。' }),
       backend && !backend.encrypted
         ? h('p', { class: 'error small', text: '⚠️ 这个后端**不加密**：只是把密钥挪进单独一个 600 权限的文件。' })
         : null,
-      h('p', { class: 'muted small', text: `换电脑后需要重新填写授权码（${backend?.detail || ''}）。` }),
+      h('p', { class: 'muted small', text: `换电脑后需要重新填写授权码（${backend?.detail || ''}）${tokenPlain ? '，并重新连接一次 Google 日历' : ''}。` }),
     ),
     confirmText: '确认迁移',
   });
@@ -2086,6 +2158,20 @@ async function migrateSecrets(btn, mode) {
     const out = await api.secretsMigrate(mode);
     state.secrets = out.status;
     toast(out.message || '已迁移', 'success', 8000);
+    /*
+     * 迁移对 Google 令牌做了什么，必须单独说一句：用户点这一下最关心的就是
+     * "我的日历会不会掉线"，含糊过去只会让他去日历页自己试。
+     */
+    if (out.token?.moved) {
+      toast(
+        `Google 刷新令牌已搬进「${out.token.backend}」${out.token.encrypted ? '（加密）' : '（**未加密**：只是换了个 600 权限的文件）'}，` +
+          'data/google-token.json 的明文已清除。换电脑/换系统账户后需要重新连接一次 Google 日历。',
+        out.token.encrypted ? 'info' : 'error',
+        12000,
+      );
+    } else if (out.token?.location === 'unreadable') {
+      toast('Google 令牌没能迁移（读取失败），明文文件保持原样、日历不受影响；其它密钥已迁移。', 'error', 12000);
+    }
     state.config = null;
     invalidate(app, 'settings');
   } catch (err) {
@@ -2098,13 +2184,17 @@ async function migrateSecrets(btn, mode) {
 }
 
 async function revertSecrets(btn) {
+  const s = state.secrets;
   const ok = await confirmDialog({
     title: '把密钥迁回明文？',
     message: h(
       'div',
       {},
       h('p', { class: 'small', text: '密钥会重新写进 `config.json`（明文），保管库里的副本会被清空。' }),
-      h('p', { class: 'small', text: '之后**不要**把 config.json 放进网盘或提交到代码仓库。' }),
+      s?.token?.inVault
+        ? h('p', { class: 'small', text: '**Google 刷新令牌**会写回 data/google-token.json（权限 600）——它是先写回原处、成功后才清保管库，所以中途出错也不会丢令牌。' })
+        : null,
+      h('p', { class: 'small', text: '之后**不要**把 config.json / google-token.json 放进网盘或提交到代码仓库。' }),
     ),
     confirmText: '确认迁回',
     danger: true,
