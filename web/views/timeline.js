@@ -11,6 +11,12 @@
  * 2. **日程只来自本程序的操作留痕**（我在这里建/改过的日程）。
  *    别人在 Google 日历上直接建的不在这里——界面顶部如实说明，
  *    不能让用户以为这就是全部日程。
+ *
+ * ## 嵌入模式（`{ embedded: true }`）
+ *
+ * 被「跟进」合并页当成一个页签渲染时用嵌入模式：**不渲染自己的大标题**
+ * （页签条上已经写着「跟催 ／ 时间线」）。描述与「刷新」按钮照旧。
+ * 不传这个选项时行为与以前**完全一致**。
  */
 
 import { api } from '../api.js';
@@ -26,7 +32,7 @@ const KIND_META = {
   calendar: { label: '日程', icon: '📅' },
 };
 
-export function renderTimeline(root, app) {
+export function renderTimeline(root, app, { embedded = false } = {}) {
   const { state } = viewState(app, 'timeline', () => ({
     loading: true,
     projects: [],
@@ -39,7 +45,7 @@ export function renderTimeline(root, app) {
 
   const container = h('div', { class: 'view view-timeline' });
   mount(root, container);
-  const paint = () => renderInto(container, app, 'timeline', paintInner, () => renderTimeline(root, app));
+  const paint = () => renderInto(container, app, 'timeline', paintInner, () => renderTimeline(root, app, { embedded }));
 
   function paintInner() {
     mount(container, view());
@@ -62,7 +68,8 @@ export function renderTimeline(root, app) {
         h(
           'div',
           {},
-          h('h2', { class: 'page-title', text: '时间线' }),
+          // 嵌入到「跟进」页时收掉大标题：页签条已经说了这是哪一页（见文件头）
+          embedded ? null : h('h2', { class: 'page-title', text: '时间线' }),
           h('p', { class: 'muted', text: '同一件事的邮件、我发出的回复、跟催与日程，按时间串成一条线。' }),
         ),
         h(

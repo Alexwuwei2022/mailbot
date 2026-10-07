@@ -89,9 +89,14 @@ export function renderFollowUp(root, app) {
       ),
       panel,
     );
-    // 只渲染当前页签：两个视图各自会取数，同时渲染等于白白多打一倍接口
-    if (state.tab === 'timeline') renderTimeline(panel, app);
-    else renderFollowUps(panel, app);
+    /*
+     * 只渲染当前页签：两个视图各自会取数，同时渲染等于白白多打一倍接口。
+     * `embedded: true` 让子视图收起自己的大标题——页签条上已经写着「跟催 ／ 时间线」，
+     * 再来一个同级标题就是同一句话说两遍（子视图的内部逻辑一个字没动，
+     * 只是多了一个可选的渲染开关；不传时它们的行为与以前完全一致）。
+     */
+    if (state.tab === 'timeline') renderTimeline(panel, app, { embedded: true });
+    else renderFollowUps(panel, app, { embedded: true });
   };
 
   paint();

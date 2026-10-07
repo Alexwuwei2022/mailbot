@@ -4001,6 +4001,63 @@ await step('「跟进」页签编进地址：#/followup/<tab>、旧地址、后�
   }
 });
 
+await step('「跟进」合并页：子视图的大标题收起来（同一级标题不该说两遍），描述与按钮保留', async () => {
+  const { app } = await import('../web/app.js');
+  const { api } = await import('../web/api.js');
+  const real = { followups: api.followups, projects: api.projects, timeline: api.timeline };
+  api.followups = () =>
+    Promise.resolve({ ok: true, items: [], all: [], summary: { open: 0, mine: 0, waiting: 0 }, config: { enabled: true, waitHours: 24 } });
+  api.projects = () => Promise.resolve({ ok: true, projects: [{ key: 'a', name: '华东区投标', count: 1, aliases: [], sources: {} }], unclassified: 0 });
+  api.timeline = () => Promise.resolve({ ok: true, project: '华东区投标', calendarNote: '', counts: { mail: 1 }, entries: [] });
+  const realHash = location.hash;
+  try {
+    /*
+     * 先把这个页签的状态清掉，从干净状态渲染：上面那条「旧链接」用例在没有桩的情况下
+     * 进过时间线，而视图的 state.error **一旦置上就不会被后来的成功清掉**（另见交回说明），
+     * 那样这一条就会在"整页是错误框"的情况下假通过——那等于什么都没验证。
+     */
+    if (app.viewStates) {
+      delete app.viewStates.timeline;
+      delete app.viewStates.followups;
+    }
+    app.navigate('followup', { tab: 'followups' });
+    await new Promise((r) => setTimeout(r, 260));
+    const main = app.els.main;
+    check(!/加载失败/.test(main.textContent), `面板应正常渲染（实际：${main.textContent.slice(0, 80)}）`);
+    checkEqual(main.querySelectorAll('.followup-tabs').length, 1, '应有页签条');
+    checkEqual(main.querySelectorAll('.followup-panel h2').length, 0, '跟催面板里不该再有同级大标题（页签条已经是标题）');
+    check(/我答应过别人什么/.test(main.textContent), '描述应保留：它是信息，不是重复的标题');
+    check(/立即扫描/.test(main.textContent), '操作按钮「立即扫描」应保留');
+
+    app.navigate('followup', { tab: 'timeline' });
+    await new Promise((r) => setTimeout(r, 260));
+    check(!/加载失败/.test(main.textContent), `时间线面板应正常渲染（实际：${main.textContent.slice(0, 80)}）`);
+    checkEqual(main.querySelectorAll('.followup-panel h2').length, 0, '时间线面板里同样不该有自己的大标题');
+    check(/同一件事的邮件/.test(main.textContent), '时间线的描述应保留');
+    check(/刷新/.test(main.textContent), '「刷新」按钮应保留');
+
+    // 不传 embedded（当成独立页面渲染）时，行为必须与以前完全一致
+    const box = document.createElement('div');
+    document.body.append(box);
+    try {
+      const followupsView = await import('../web/views/followups.js');
+      followupsView.renderFollowUps(box, { viewStates: {}, takeNavParams: () => null, refreshCounts() {}, invalidateAll() {}, paintNav() {} });
+      await new Promise((r) => setTimeout(r, 200));
+      const title = box.querySelector('.page-title');
+      check(title && title.textContent === '跟催', '不传 embedded 时大标题仍在（默认行为一个字没改）');
+    } finally {
+      box.remove();
+    }
+  } finally {
+    api.followups = real.followups;
+    api.projects = real.projects;
+    api.timeline = real.timeline;
+    location.hash = realHash;
+    app.navigate('overview');
+    await new Promise((r) => setTimeout(r, 160));
+  }
+});
+
 await step('设置页：具名锚点 data-section + options.anchor / 跳转参数两条路都会定位并高亮', async () => {
   const settingsView = await import('../web/views/settings.js');
   const mkBox = () => {

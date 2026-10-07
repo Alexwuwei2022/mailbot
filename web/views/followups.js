@@ -17,6 +17,13 @@
  * ## 状态语义与「需要你处理」完全一致
  *
  * 已处理 / 稍后提醒 / 忽略——复用同一套按钮与含义，不另发明一套词。
+ *
+ * ## 嵌入模式（`{ embedded: true }`）
+ *
+ * 这一页被「跟进」合并页当成一个页签渲染时用嵌入模式：**不渲染自己的大标题**
+ * （页签条上已经写着「跟催 ／ 时间线」，再来一个同级标题就是同一句话说两遍）。
+ * 描述与操作按钮照旧——它们是信息与功能，不是重复的标题。
+ * 不传这个选项时行为与以前**完全一致**（本页仍可被当成独立页面渲染）。
  */
 
 import { api } from '../api.js';
@@ -25,7 +32,7 @@ import { invalidateAll, markLoaded, renderInto, viewState } from '../view-state.
 
 const STATUS_LABEL = { open: '进行中', done: '已完成', snoozed: '稍后提醒', ignored: '已忽略' };
 
-export function renderFollowUps(root, app) {
+export function renderFollowUps(root, app, { embedded = false } = {}) {
   const { state } = viewState(app, 'followups', () => ({
     loading: true,
     items: [],
@@ -45,7 +52,7 @@ export function renderFollowUps(root, app) {
    * 不做挂载。直接传 `view` 会让页面一片空白（view() 只是"返回"节点），
    * 这个坑我踩过一次。
    */
-  const paint = () => renderInto(container, app, 'followups', paintInner, () => renderFollowUps(root, app));
+  const paint = () => renderInto(container, app, 'followups', paintInner, () => renderFollowUps(root, app, { embedded }));
 
   function paintInner() {
     mount(container, view());
@@ -73,7 +80,8 @@ export function renderFollowUps(root, app) {
         h(
           'div',
           {},
-          h('h2', { class: 'page-title', text: '跟催' }),
+          // 嵌入到「跟进」页时收掉大标题：页签条已经说了这是哪一页（见文件头）
+          embedded ? null : h('h2', { class: 'page-title', text: '跟催' }),
           h('p', { class: 'muted', text: '我答应过别人什么、我在等谁回话——这两件事都在我发出的邮件里，收件箱看不到。' }),
         ),
         h(
