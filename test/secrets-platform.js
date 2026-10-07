@@ -43,7 +43,12 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { makeTempDir } from './lib/tmp.js';
-import { createSearchListGuard } from './lib/keychain-searchlist.mjs';
+import {
+  createSearchListGuard,
+  parseSearchList,
+  canonKeychainPath,
+  searchListRestriction,
+} from './lib/keychain-searchlist.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
@@ -797,6 +802,71 @@ await test('搜索列表守卫（离线仿真）：记下 → 设为唯一 → �
     return { state, run };
   };
 
+  /*
+   * ⓪ 先单独把**解析**钉住：整条前置条件（"列表里有哪些项"）都建立在它上面，
+   *    解析一旦丢项或造项，后面所有断言都会变成假证据——而这类错在 CI 日志里长得和"真的多一项"一样。
+   */
+  assertEqual(
+    parseSearchList('    "/a.keychain-db"\n    "/b.keychain"\n').join('|'),
+    '/a.keychain-db|/b.keychain',
+    '每行一个带引号的路径：应逐条解析（CI run 37626605652 的原始输出就是这个格式，确实是两项）',
+  );
+  assertEqual(
+    parseSearchList('"/a.keychain" "/b.keychain"\n').join('|'),
+    '/a.keychain|/b.keychain',
+    '同一行里有两个带引号的路径：必须都收下——原实现每行只取第一个，会**静默丢项**，让"只有它"这类断言假通过',
+  );
+  assertEqual(parseSearchList('/a.keychain\n').join('|'), '/a.keychain', '没有引号的行按整行取（不同 macOS 版本格式不完全一样）');
+  assertEqual(parseSearchList('').length, 0, '空输出应解析成空列表（"读不出来"必须能区别于"读出来是空的"）');
+  assertEqual(parseSearchList('  \n\n\t\n').length, 0, '只有空白与空行时应解析成空列表，不许凑出幽灵项');
+
+  /*
+   * ⓪' "搜索列表有没有把临时钥匙串钉住"的判定：用**真实世界的几种形态**离线跑一遍。
+   *
+   * 为什么非要在离线跑：这段判定只在 macOS 上执行，本机（Windows）根本跑不到，而它正是本轮改动的
+   * 核心——从"长度必须是 1"放宽成"排第一位 + 登录钥匙串不在场"。**放宽错了方向就是用假绿掩盖真失败**，
+   * 所以两个方向都要有断言盯着：该放行的实测形态必须放行，该拦下的危险形态必须拦下。
+   */
+  const SYS_KC = '/Library/Keychains/System.keychain';
+  const LOGIN_KC = '/Users/test/Library/Keychains/login.keychain-db';
+  const TEMP_KC = '/tmp/mailbot-test.keychain-db';
+
+  const ciShape = searchListRestriction({
+    // CI 实测形态：`security` 回显的临时钥匙串**不带** `-db`，而且系统钥匙串仍在列表里
+    list: ['/tmp/mailbot-test.keychain', SYS_KC],
+    target: TEMP_KC,
+    loginKeychain: LOGIN_KC,
+  });
+  assert(ciShape.ok, `CI 实测形态（临时钥匙串在第一位 + 只读的系统钥匙串在场）必须放行；实际问题=${JSON.stringify(ciShape.problems)}`);
+
+  const loginFirst = searchListRestriction({ list: [LOGIN_KC, TEMP_KC], target: TEMP_KC, loginKeychain: LOGIN_KC });
+  assertEqual(loginFirst.ok, false, '上一轮出事的形态（登录钥匙串排在临时钥匙串前面）必须被拦下');
+  assertEqual(loginFirst.problems.length, 2, '这种形态有两个问题：目标不在第一位 + 登录钥匙串在场（两条都要报出来，不能只报一条）');
+
+  const loginPresent = searchListRestriction({ list: [TEMP_KC, LOGIN_KC], target: TEMP_KC, loginKeychain: LOGIN_KC });
+  assertEqual(loginPresent.ok, false, '即使目标排在第一位，登录钥匙串在场也必须被拦下（它里面的同名旧条目会抢先被读到）');
+
+  const otherFirst = searchListRestriction({ list: ['/tmp/other.keychain', SYS_KC], target: TEMP_KC, loginKeychain: LOGIN_KC });
+  assertEqual(otherFirst.ok, false, '第一位是**别的**钥匙串时必须拦下（不许因为"列表非空"就放行）');
+
+  assertEqual(searchListRestriction({ list: [], target: TEMP_KC }).ok, false, '空列表必须拦下：不带钥匙串参数的读无从定位');
+  assert(searchListRestriction({ list: [TEMP_KC], target: TEMP_KC }).ok, '列表里只有目标钥匙串时当然要放行');
+
+  /*
+   * ⚠️ 离线兜不住的一处，如实说明："/var 与 /private/var 是同一个目录"这件事只有 macOS 上成立
+   *（Windows 上这两个路径不存在，realpath 解析不出来，只能走原样兜底分支）。
+   * 所以"符号链接前缀"那一处等价只在 macOS CI 上真正生效；这里验的是"-db 后缀等价"与两条判定规则本身。
+   */
+  assertEqual(
+    canonKeychainPath('/tmp/mailbot-test.keychain-db'),
+    canonKeychainPath('/tmp/mailbot-test.keychain'),
+    '同一个钥匙串的两种落盘写法（带 / 不带 -db）必须判成同一条路径',
+  );
+  assert(
+    canonKeychainPath('/tmp/a.keychain') !== canonKeychainPath('/tmp/b.keychain'),
+    '不同的钥匙串不许被判成同一个（宁可漏判也不能把两个钥匙串混为一谈）',
+  );
+
   // ① 正常路径
   const good = fakeSecurity();
   const guard = createSearchListGuard({ run: good.run });
@@ -840,12 +910,12 @@ await test('搜索列表守卫（离线仿真）：记下 → 设为唯一 → �
   assertIncludes(blocked, 'snapshot', '没记下原始列表就想改搜索列表，必须被直接拦住');
   assertEqual(guard3.restore().skipped, true, '没动过就不该执行还原命令（空操作）');
 
-  return '离线仿真通过：解析带引号（含空格）的路径、设为唯一、逐项还原、还原失效会被 ok=false + 原值/现值暴露（真机结论仍由 macOS CI 给出）';
+  return '离线仿真通过：解析（含"同行两个引号路径不许丢项"）、钉住判定（CI 实测形态放行 / 登录钥匙串在场或不在首位一律拦下）、设为唯一、逐项还原、还原失效会被 ok=false + 原值/现值暴露（真机结论仍由 macOS CI 给出）';
 });
 
 /* -------------------------------------------------- B2. macOS：钥匙串真跑（临时钥匙串 + 搜索列表） */
 
-await test('macOS 钥匙串：临时钥匙串 + 搜索列表只含它的真跑往返（结束严格还原并核对；登录钥匙串一个字节都不碰）', async () => {
+await test('macOS 钥匙串：临时钥匙串 + 搜索列表把它排在第一位的真跑往返（结束严格还原并核对；登录钥匙串一个字节都不碰）', async () => {
   if (process.platform !== 'darwin') {
     return { skip: `macOS 钥匙串只在 darwin 上存在（本机是 ${process.platform}，该能力在本平台确实不存在）` };
   }
@@ -889,12 +959,15 @@ await test('macOS 钥匙串：临时钥匙串 + 搜索列表只含它的真跑�
     const files = fs.readdirSync(kcDir).filter((f) => f.startsWith('mailbot-test.keychain'));
     assertEqual(files.length, 1, `应正好建出一个临时钥匙串文件（实际：${files.join('、') || '无'}）`);
     kc = path.join(kcDir, files[0]);
+    // 落盘名与路径都打出来：`security` 回显的路径可能带 `/private` 前缀、名字可能带或不带 `-db`
+    // （CI 实测），这两处差异都会影响"这条路径是不是同一个钥匙串"的判断，先留证据再判断
+    console.log(`      临时钥匙串：建出文件=${files[0]}；测试用路径=${kc}`);
 
     const unlocked = sec(['unlock-keychain', '-p', pw, kc]);
     assertEqual(unlocked.status, 0, `临时钥匙串应能解锁：${evidenceText(unlocked)}`);
 
     /*
-     * ③ 把搜索列表**设为只包含临时钥匙串**——这是让"读"也落到它的**唯一可靠**办法。
+     * ③ 把临时钥匙串放到搜索列表**第一位**——这是让"读"也落到它的**唯一可靠**办法。
      *
      * 为什么不是给读命令加参数：`find-generic-password` 没有"指定钥匙串"的选项
      * （上一轮 CI 的 `find-generic-password: illegal option -- k` 就是证据），它末尾那个
@@ -905,18 +978,45 @@ await test('macOS 钥匙串：临时钥匙串 + 搜索列表只含它的真跑�
      * 用例内部还会**断言**"最终搜索列表已还原"（见本用例收尾那段）。
      * 守卫逻辑单独成模块（test/lib/keychain-searchlist.mjs），本机可用假 security 离线仿真它。
      *
-     * 刻意**不**保留系统钥匙串：本用例只读/写自己建的临时钥匙串，不需要任何别的钥匙串。
-     * 若 CI 证明 `security` 自身非要有系统钥匙串才肯工作，再按**实测结论**调整（不是靠猜）。
+     * 刻意**不**保留登录钥匙串：本用例只读/写自己建的临时钥匙串，不需要它。系统钥匙串留不留由
+     * macOS 自己决定（见下面那条实测说明）。
      */
     const restrict = guard.restrictTo(kc);
-    assert(restrict.ok, `把搜索列表设为只含临时钥匙串应成功：${evidenceText(restrict.res)}`);
+    assert(restrict.ok, `把临时钥匙串放到搜索列表第一位应成功：${evidenceText(restrict.res)}`);
     const nowList = guard.read();
-    assert(
-      nowList.list.length === 1 && nowList.list[0] === kc,
-      `前置条件：搜索列表此刻应当**只有**临时钥匙串；原样输出=${evidenceText(nowList.res)}`,
-    );
     // 之后所有失败证据里都会带上"当时生效的搜索列表"（读就是靠它定位的）
     activeSearchList = nowList.list;
+    console.log(`      钉住后的搜索列表（${nowList.list.length} 项，读按此顺序找）：${nowList.list.join(' | ')}`);
+
+    /*
+     * 前置条件断言的是**实质**，不是"列表长度等于 1"：
+     *
+     *   ① 临时钥匙串必须排**第一位**——读是按这个顺序找的，第一位的条目不可能被别的钥匙串抢先；
+     *   ② 用户的**登录钥匙串必须不在列表里**——上一轮"裸路径读到登录钥匙串里的同名旧条目"
+     *      真因就是它在列表里。系统钥匙串（`/Library/Keychains/System.keychain`）在场是允许的：
+     *      root 属主，本用例写不进去，也放不了我们的条目。
+     *
+     * 为什么从"**只有**临时钥匙串"放宽到这里，以及为什么这不是"为了让红变绿而降低标准"：
+     * CI run 37626605652 的原始输出是
+     *   `status=0 stdout="…/mailbot-test.keychain" ⏎ "…/System.keychain"`
+     * —— `security list-keychains -s <临时钥匙串>` 之后 macOS 仍会列出系统钥匙串，
+     * "长度必须是 1"这条要求与 macOS 的实际行为不符，是**断言写错了**，不是隔离被破坏。
+     * 而"读到底落在哪个钥匙串"这件事**不靠这条前置条件下结论**：紧接着的**真读校验**
+     * （写探测条目 → 用后端同款读法原样读回）才是裁判，它一个字都没放宽（探测值还改成了每次唯一，
+     * 免得别处同名旧条目的旧值恰好蒙对）。前置条件放宽 + 真读校验照旧，才是"验在点子上"。
+     *
+     * 判定逻辑抽在 `searchListRestriction()` 里（test/lib/keychain-searchlist.mjs），
+     * 因为本机是 Windows、macOS 分支跑不到——抽出来之后，用**真实世界的两种列表形态**在离线仿真
+     * 用例里各跑一遍：`[临时, 系统]` 必须放行、`[登录, 临时]` 必须拦下。凭"读代码觉得对"不算验证。
+     */
+    const loginKc = defaultKeychainPath();
+    const restriction = searchListRestriction({ list: nowList.list, target: kc, loginKeychain: loginKc });
+    assert(
+      restriction.ok,
+      `前置条件：搜索列表必须把临时钥匙串钉在第一位、且不含登录钥匙串；问题=${restriction.problems.join('；') || '（无）'}；` +
+        `期望首项=${kc}（规范化后 ${canonKeychainPath(kc)}）；实际整份列表=${JSON.stringify(nowList.list)}；` +
+        `原样输出=${evidenceText(nowList.res)}`,
+    );
 
     /*
      * ④ 标准做法：`security set-key-partition-list`。
@@ -949,20 +1049,33 @@ await test('macOS 钥匙串：临时钥匙串 + 搜索列表只含它的真跑�
      * ⑥ 真读校验（**替代**上一轮那个"要不要用 -k"的隔离探测——`-k` 根本不存在，探测没有意义）：
      *    往临时钥匙串写一条探测条目，再用**后端那种不带钥匙串参数的读法**把它读回来。
      *
-     *    这条要证明的正是我们实际依赖的机制："搜索列表 = 只含临时钥匙串"之后，读确实落到它里面，
+     *    这条要证明的正是我们实际依赖的机制："搜索列表把临时钥匙串排第一"之后，读确实落到它里面，
      *    而且能非交互解密（分区/ACL 那一步真的起了作用）。读不回来就在这里红，不必等到真跑里再猜。
+     *
+     *    **这条是全用例的裁判，一个字都不放宽**（上面 ③ 的前置条件放宽了，正是为了让这条说了算）。
+     *    探测值每次唯一：万一别处有同名旧条目、而读又抢在临时钥匙串之前命中了它，旧值也不会等于
+     *    本次的新值，蒙不过去。
      */
     const probeName = 'mailbot-searchlist-probe';
-    const probeWrite = sec(['add-generic-password', '-U', '-s', probeName, '-a', 'mailbot', '-w', 'probe', kc]);
+    const probeValue = `probe-${process.pid}-${Date.now()}`;
+    const probeWrite = sec(['add-generic-password', '-U', '-s', probeName, '-a', 'mailbot', '-w', probeValue, kc]);
     assertEqual(probeWrite.status, 0, `搜索列表真读校验：往临时钥匙串写探测条目应成功：${evidenceText(probeWrite)}`);
     const probeRead = sec(['find-generic-password', '-s', probeName, '-a', 'mailbot', '-w']);
     assertEqual(
-      probeRead.status === 0 && probeRead.stdout === 'probe',
+      probeRead.status === 0 && probeRead.stdout === probeValue,
       true,
-      `搜索列表真读校验：不带钥匙串参数的读必须能读回刚写进临时钥匙串的值；原始证据=${evidenceText(probeRead)}`,
+      `搜索列表真读校验：不带钥匙串参数的读必须把刚写进临时钥匙串的值原样读回（这才证明读落在临时钥匙串上）；` +
+        `期望=${JSON.stringify(probeValue)}；原始证据=${evidenceText(probeRead)}`,
     );
     const probeDel = sec(['delete-generic-password', '-s', probeName, '-a', 'mailbot', kc]);
     assertEqual(probeDel.status, 0, `搜索列表真读校验：探测条目应能删掉（不留痕迹）：${evidenceText(probeDel)}`);
+    // 删完必须真的查不到：否则残留会在下一次运行时变成"同名旧条目"，把这个用例的前提悄悄污染掉
+    const probeGone = sec(['find-generic-password', '-s', probeName, '-a', 'mailbot', '-w']);
+    assertEqual(
+      probeGone.status === 0,
+      false,
+      `搜索列表真读校验：探测条目删掉后必须查不到（残留会污染下一次运行）：${evidenceText(probeGone)}`,
+    );
 
     // ⑦ 真跑整条往返：写 → 读回 → 明文检查 → 清除（用户实际点的那条路）
     detail = await realBackendRoundtrip({
@@ -1054,7 +1167,7 @@ await test('macOS 钥匙串：临时钥匙串 + 搜索列表只含它的真跑�
   }
   if (cleanupError) throw cleanupError;
   if (mainError) throw mainError;
-  return `${detail}（临时钥匙串 ${path.basename(kc || kcName)}；隔离方式=搜索列表只含临时钥匙串，结束时已核对还原；登录钥匙串未触碰）`;
+  return `${detail}（临时钥匙串 ${path.basename(kc || kcName)}；隔离方式=搜索列表把临时钥匙串排在第一位且不含登录钥匙串，并已由"写探测值→同款读法读回"证实读确实落在它上面；结束时已核对还原；登录钥匙串未触碰）`;
 });
 
 /* -------------------------------------------------- B3. Linux：libsecret */
