@@ -1014,10 +1014,12 @@ mailbot/
 ├── test/
 │   ├── mocks.js                模拟 IMAP / SMTP / 大模型（真实协议）
 │   ├── mocks-google.js         模拟 Google Calendar / OAuth（真实 REST 语义）
-│   ├── selftest.js             123 项邮件侧自检（含 ZIP/备份/跟催/同账号 IMAP 串行化）
+│   ├── selftest.js             129 项邮件侧自检（含 ZIP/备份/跟催/同账号 IMAP 串行化）
 │   ├── calendar-selftest.js    104 项日历侧自检（含备份/体检/安全/跟催接口/结论范围策略）
 │   ├── smoke-e2e.js            端到端：真实 HTTP + 模拟邮箱
-│   └── ui-render.js            前端渲染自检
+│   ├── ui-render.js            前端渲染自检
+│   └── secrets-platform.js     平台密钥保管：真机跑 DPAPI / 钥匙串 / libsecret 往返 + 降级可见性
+│       lib/libsecret-roundtrip.mjs  在真 D-Bus 会话里跑 libsecret 往返的子进程
 └── data/                       运行时生成（已 gitignore）
     ├── config.json             非密钥配置
     ├── state.json              分析结论 / 草稿 / 日历会话
@@ -1033,13 +1035,19 @@ mailbot/
 全部测试**离线运行**，使用真实 IMAP/SMTP 协议驱动的本地模拟服务器，不连真实邮箱、不发真实邮件：
 
 ```powershell
-npm test              # 全部：邮件单元 + 日历单元 + 全新安装 + 端到端 + 前端渲染
+npm test              # 全部：邮件单元 + 日历单元 + 全新安装 + 端到端 + 前端渲染 + 平台密钥保管
 npm run test:unit     # 129 项：解析/组装/模型/分类/起草/IMAP/SMTP/引擎/发送/签名/详情/配置/HTTP/ZIP/备份/密钥保管（含 Google 令牌）/同账号串行化
 npm run test:calendar # 104 项：时区换算/OAuth/REST CRUD/对话建日程/邮件转日程/日程分析/检索回补/结论范围策略/代理转发/备份与体检与密钥接口
 npm run test:fresh    # 14 项：全新机器首启（空数据目录 + 清空环境变量 + 首次上手判定 + start.cmd 格式 + .env 自动生成）
 npm run test:e2e      # 端到端：真实 HTTP 服务 + 模拟邮箱，走完整 Web 路径
 npm run test:ui       # 前端：十个页面渲染（含配置向导、合并后的「跟进」两页签与控制台锚点定位）+ 品牌外壳 + 跳转 + API 调用路径（需 linkedom）
+npm run test:secrets  # 平台密钥保管：真机跑 DPAPI / macOS 钥匙串 / Linux libsecret 的写→读→校验→清除，外加"降级必须可见"（不支持的平台显式跳过并打印原因）
 ```
+
+> 前 5 套**完全离线**（不需要任何凭据、不花 token）；第 6 套 `test:secrets` 是**平台专有**的：
+> 它要在真机上起 `powershell` / `security` / `secret-tool`，所以"哪个平台验证到什么程度"这件事
+> 由它给出证据，见 [docs/运行与配置文档.md §5.6](docs/运行与配置文档.md) 的诚实清单。
+> 平台不支持时它是**显式跳过 + 打印原因**，不会静默变成"通过"。
 
 日历部分的测试**完全离线**：`test/mocks-google.js` 是一个本地 HTTP 服务器，
 按 Google Calendar REST v3 的真实语义实现（含事件时间窗口过滤、204/404 行为、令牌刷新与撤销），
@@ -1050,7 +1058,11 @@ npm run test:ui       # 前端：十个页面渲染（含配置向导、合并�
 因为**全部测试都离线**，CI 里**不需要邮箱授权码、不需要 Google 令牌、不花一毛 token**——
 这是它敢在公开仓库上跑的前提。`.github/workflows/ci.yml` 会在每次 push / PR 时：
 
-- 在 **Windows + Ubuntu × Node 20/22** 矩阵上 `npm ci` + `npm test`（跨平台才能暴露路径分隔符/大小写/换行符问题）；
+- 在 **Windows + Ubuntu + macOS × Node 20/22** 矩阵上 `npm ci` + `npm test`（跨平台才能暴露路径分隔符/大小写/换行符问题；
+  **密钥保管后端更是平台专有的**——Windows DPAPI / macOS 钥匙串 / Linux Secret Service，所以矩阵里必须有 macOS，
+  否则"在别人机器上密钥存哪、能不能用"就只能靠读代码推断）；
+- 在 Linux 上尽力把 `libsecret-tools` + `gnome-keyring` 装上，让 libsecret 用例**真跑**；
+  装不上/起不来时用例**显式跳过并打印原因**（这一步 `continue-on-error`，绝不让 CI 因为装不上测试工具而变红）；
 - 跑一道**防泄漏闸门**：一旦发现 `data/`、`.env`、令牌、`.eml` 或 `audit.jsonl` 被提交就**直接失败**。
 
 > `.gitignore` 把这四类东西**整目录/整类**排除（早期是逐文件列举，因此漏掉过 `data/google-token.json`

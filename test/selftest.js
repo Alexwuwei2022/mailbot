@@ -3346,9 +3346,11 @@ await test('备份：导出默认抹掉密钥、可选用包含；导入保留�
 
 /**
  * 用一个**假后端**测保管逻辑：真实后端要起子进程（DPAPI 走 PowerShell、
- * 钥匙串走 security），在受限环境和 CI 上都不该依赖它。
+ * 钥匙串走 security），放在这套离线自检里会让"逻辑对不对"和"这台机器有没有钥匙串"
+ * 混在一起，出问题时分不清是谁的锅。
  * 真假后端之间的边界就是"字符串进、字符串出"，所以假后端足以覆盖全部业务逻辑；
- * 真实 DPAPI 的往返在开发机上单独验过（见文档）。
+ * **真机往返由专门的套件负责**：`test/secrets-platform.js`（Windows DPAPI / macOS 钥匙串 /
+ * Linux libsecret，逐个做"写入 → 读回 → 校验 → 清除"，并覆盖"降级必须可见"）。
  */
 function installFakeVault({ failWrite = false, failRead = false, mangle = false } = {}) {
   const store = { text: null, writes: 0, clears: 0 };

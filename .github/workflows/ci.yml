@@ -1,12 +1,14 @@
 # 持续集成：每次 push / PR 都在**干净机器**上跑一遍全部测试。
 #
 # 为什么这个项目适合上 CI：
-#   5 个测试套件**完全离线**——mock IMAP / SMTP / 大模型 / Google，加上临时数据目录，
+#   6 个测试套件里前 5 个**完全离线**——mock IMAP / SMTP / 大模型 / Google，加上临时数据目录，
 #   所以 CI 里**不需要邮箱授权码、不需要 Google 令牌、不花一毛 token**。
-#   本地跑要 1~2 分钟、5 套命令，很容易漏跑一套；交给 CI 就不会漏。
+#   本地跑要 1~2 分钟、6 套命令，很容易漏跑一套；交给 CI 就不会漏。
 #
-# 覆盖矩阵刻意选了 Windows + Linux：本项目主要在 Windows 上开发，
-# 但路径分隔符、大小写、换行符这类问题只有跨平台跑才暴露得出来。
+# 矩阵覆盖三平台：本项目主要在 Windows 上开发，但路径分隔符、大小写、换行符这类问题
+# 只有跨平台跑才暴露得出来；**密钥保管后端更是平台专有的**（Windows DPAPI / macOS 钥匙串 /
+# Linux Secret Service），"交付给别人用"就必须证明这三个后端在各自平台上真能往返，
+# 而不是靠读代码推断——所以 macOS 必须在矩阵里。
 
 name: CI
 
@@ -25,18 +27,19 @@ jobs:
   test:
     name: test (${{ matrix.os }} / node ${{ matrix.node }}${{ matrix.tz && format(' / TZ={0}', matrix.tz) || '' }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        # 三个 os × 两个 Node = 6 个组合（macOS 自动与 20/22 组合，不用手写两行）
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        node: ['20', '22']
+        # 这一维只有一个空值，看着多余，其实是**故意的**：
+        # 下面 include 里那条 TZ=America/New_York 靠"覆盖 tz"来生成一个**额外的**组合；
+        # 若没有这一维，include 会把 tz 直接**合并进**已存在的 ubuntu/20 组合，
+        # 反而把"ubuntu 20 + 系统时区"这次运行顶掉。空值时 Node 用系统时区（ubuntu 是 UTC）。
+        tz: ['']
         include:
-          - os: ubuntu-latest
-            node: '20'
-          - os: windows-latest
-            node: '20'
-          # 顺手验一下更新的 LTS，防止将来升级 Node 时才炸
-          - os: ubuntu-latest
-            node: '22'
           # ---------------------------------------------------------------
           # 进程时区 ≠ 配置时区（Asia/Shanghai）的守卫。
           #
@@ -50,7 +53,7 @@ jobs:
             node: '20'
             tz: America/New_York
     env:
-      # 空值时 Node 用系统时区（ubuntu 是 UTC、windows 是 runner 本地时区）
+      # 空值时 Node 用系统时区（ubuntu 是 UTC、windows/macOS 是 runner 本地时区）
       TZ: ${{ matrix.tz }}
 
     steps:
@@ -65,19 +68,41 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      # 一条命令跑完 5 套：单元 / 日历 / 全新安装 / 端到端冒烟 / 前端渲染
+      # ---------------------------------------------------------------
+      # Linux：尽量让 libsecret（Secret Service）**真的可用**，
+      # 这样 test/secrets-platform.js 里的 libsecret 用例就是**真跑**而不是命令级验证。
+      #
+      # 关键：这一步**必须容错**（continue-on-error + 每条命令 || true）。
+      # 装不上 / 起不来时测试会**显式跳过并打印原因**，绝不能让 CI 因为"装不上测试工具"变红。
+      # 只装测试工具，不给项目引入任何依赖。
+      # ---------------------------------------------------------------
+      - name: 准备 Linux Secret Service（失败也不影响结论）
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq libsecret-tools gnome-keyring || true
+          sudo apt-get install -y -qq dbus dbus-x11 dbus-user-session || true
+          echo "secret-tool: $(command -v secret-tool || echo 未安装)"
+          echo "dbus-run-session: $(command -v dbus-run-session || echo 未安装)"
+          echo "gnome-keyring-daemon: $(command -v gnome-keyring-daemon || echo 未安装)"
+
+      # 一条命令跑完 6 套：单元 / 日历 / 全新安装 / 端到端冒烟 / 前端渲染 / 平台密钥保管
       - name: 运行全部测试
         run: npm test
 
       # ---------------------------------------------------------------
       # 防泄漏闸门：一旦有人不小心把 data/ 之类的运行数据提交进来，
       # 这里会直接失败——比事后重写历史便宜得多。
+      #
+      # 额外盯一眼"测试自己生成的假可执行文件/临时钥匙串"有没有被误提交
+      # （它们都落在系统临时目录，理论上不会，但闸门本来就是为了兜住"理论上不会"）。
       # ---------------------------------------------------------------
       - name: 检查是否误提交了运行数据或凭据
         shell: bash
         run: |
           set -e
-          bad=$(git ls-files | grep -E '^(data/|\.env$)|google-token\.json|audit\.jsonl|\.eml$|secrets\.(json|dpapi)' || true)
+          bad=$(git ls-files | grep -E '^(data/|\.env$)|google-token\.json|audit\.jsonl|\.eml$|secrets\.(json|dpapi)|keychain-db$|secret-tool$' || true)
           if [ -n "$bad" ]; then
             echo "::error::仓库里出现了不应提交的运行数据/凭据："
             echo "$bad"

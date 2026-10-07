@@ -319,14 +319,33 @@ const dpapiBackend = {
 
 /* ------------------------------------------------------------------ 后端：macOS 钥匙串 */
 
+/**
+ * 测试专用：把钥匙串后端**钉到一个临时钥匙串**上（命令末尾显式带上它）。
+ *
+ * 为什么需要这么个钩子：真机用例必须用临时钥匙串，绝不能碰用户的登录钥匙串。
+ * 而"把临时钥匙串设成默认钥匙串 / 改搜索列表"动的是**全局机器状态**——
+ * 进程要是被强杀，用户机器的默认钥匙串就被换走了。钉住之后每条命令只认这一个
+ * 钥匙串文件，默认值与搜索列表一个字都不用动，登录钥匙串压根不在搜索范围内。
+ *
+ * **生产路径不受影响**：没钉住时（默认 null）命令里不带钥匙串参数，与以前一字不差。
+ */
+let keychainPath = null;
+export function __setKeychainPathForTest(file) {
+  keychainPath = file ? String(file) : null;
+}
+
 const keychainBackend = {
   id: 'keychain',
   label: 'macOS 钥匙串',
   encrypted: true,
   detail: '由系统钥匙串保管；换机器需要重新填授权码',
   available: () => process.platform === 'darwin' && which('security'),
+  /** 拼钥匙串参数：`security` 的钥匙串是位置参数，钉住时追加在末尾 */
+  args(list) {
+    return keychainPath ? [...list, keychainPath] : list;
+  },
   read() {
-    const res = run('security', ['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w']);
+    const res = run('security', this.args(['find-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w']));
     // 44 = errSecItemNotFound：没存过，不算错误
     if (!res.ok && (res.status === 44 || /could not be found/i.test(res.message))) return { ok: true, value: null };
     if (!res.ok) return { ok: false, code: 'KEYCHAIN_READ_FAILED', message: res.message };
@@ -338,12 +357,12 @@ const keychainBackend = {
      * 也就是说写入的一瞬间它在本机进程参数里可见——本机单用户场景可接受，
      * 但这点在文档里如实写明，不假装没有。
      */
-    const res = run('security', ['add-generic-password', '-U', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w', plaintext]);
+    const res = run('security', this.args(['add-generic-password', '-U', '-s', KEYRING_SERVICE, '-a', 'mailbot', '-w', plaintext]));
     if (!res.ok) return { ok: false, code: 'KEYCHAIN_WRITE_FAILED', message: res.message };
     return { ok: true };
   },
   clear() {
-    const res = run('security', ['delete-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot']);
+    const res = run('security', this.args(['delete-generic-password', '-s', KEYRING_SERVICE, '-a', 'mailbot']));
     if (!res.ok && !/could not be found/i.test(res.message)) {
       return { ok: false, code: 'KEYCHAIN_CLEAR_FAILED', message: res.message };
     }
